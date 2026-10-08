@@ -41,14 +41,19 @@ pub fn erase_circle(scene: &mut Scene, center: DVec2, radius: f64) -> bool {
 
     let mut changed = false;
     for id in candidate_ids {
-        let Some(path) = scene.element(id).map(|element| element.path.clone()) else {
+        let Some((path, color)) = scene
+            .element(id)
+            .map(|element| (element.path.clone(), element.color))
+        else {
             continue;
         };
         if let Some(remaining) = clip_path_outside_circle(&path, center, radius) {
             changed = true;
             scene.remove_element(id);
+            // Surviving pieces of an erased element keep its color — erasing part of a
+            // red stroke shouldn't turn the rest of it white.
             for piece in remaining {
-                scene.add_element(piece);
+                scene.add_element_with_color(piece, color);
             }
         }
     }
@@ -267,6 +272,18 @@ mod tests {
         spans.sort_by(|a, b| a.0.total_cmp(&b.0));
         assert!(spans[0].1 < 4.5, "first piece should stop before the gap");
         assert!(spans[1].0 > 5.5, "second piece should start after the gap");
+    }
+
+    #[test]
+    fn surviving_pieces_keep_the_original_color() {
+        let mut scene = Scene::new();
+        let red = [0.9, 0.2, 0.2];
+        scene.add_element_with_color(horizontal_line(0.0, 10.0, 0.0), red);
+
+        erase_circle(&mut scene, DVec2::new(5.0, 0.0), 1.0);
+
+        assert_eq!(scene.len(), 2);
+        assert!(scene.all_elements().all(|e| e.color == red));
     }
 
     #[test]

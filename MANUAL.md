@@ -42,6 +42,8 @@ that's the one built-in command whose argument has a fixed, known vocabulary.
 | `:new` | `:new` | Same as `:clear` — there's no concept of multiple open boards yet. |
 | `:tool` | `:tool <name>` | Switches the active tool by name (see the Tools table below). |
 | `:delete` | `:delete` | Deletes whatever the active tool currently has selected (works with `select`, `select-rect`, `select-lasso`; errors "nothing selected" with any other tool, or none). |
+| `:color` | `:color <name\|#hex\|picker>` | Sets the color the pen and shape tools draw their *next* element in (a drawn element's color never changes after the fact), or toggles the interactive color picker — see Color below. |
+| `:grid` | `:grid <show\|hide\|bigger\|smaller\|number>` | Shows/hides the reference grid, or changes its spacing — `bigger`/`smaller` scale it by 1.5x each press; a bare number sets an exact board-space spacing. Runtime only, not saved to the config file. |
 | `:undo` | `:undo` | Steps back one edit. |
 | `:redo` | `:redo` | Re-applies an edit just undone. |
 | `:help` | `:help` | Lists every command and its usage hint, one line, in the command bar. |
@@ -80,6 +82,22 @@ selection, same as clicking empty space with `select`.
 
 Any of `select`/`select-rect`/`select-lasso`'s current selection can be removed with
 `:delete` (key `d`).
+
+## Color
+
+Every stroke/shape remembers the color it was drawn in. `:color <name>` accepts a small
+built-in palette (white, black, red, green, blue, yellow, orange, purple, cyan, magenta,
+gray/grey — case-insensitive); `:color #rrggbb` (or bare `rrggbb`) accepts any hex color.
+Whatever's set applies to the *next* thing you draw with the pen or a shape tool —
+already-drawn elements keep their own color, including through a move or a partial erase
+split.
+
+`:color picker` toggles an interactive picker (the classic saturation/value square + hue
+strip) floating over the board — drag in it to pick a color live, same as typing `:color
+#hex` but visual. It's the one piece of UI in this app that's actually interactive (the
+command bar itself is purely for typing/reading); while it's open, clicks on the canvas go
+to the picker instead of the active tool, and Escape closes the picker rather than
+quitting the app.
 
 ## Keybindings
 
@@ -124,13 +142,20 @@ refusing to start. Two sections:
 
 - `[keybindings]` — see above.
 - `[theme]` — `board_color`, `grid_color`, `stroke_color`, each an `[r, g, b]` array of
-  0.0-1.0 floats. Fixed for the process's lifetime (no live reload).
+  0.0-1.0 floats. Fixed for the process's lifetime (no live reload). `stroke_color` only
+  affects UI overlays now (selection boxes, the eraser cursor) — board content uses
+  whatever color it was drawn in, set via `:color`, not this theme value.
+
+Grid visibility/spacing (`:grid`) and the current drawing color (`:color`) are
+runtime-only, not part of this file — they reset to their defaults (grid shown, spacing
+100, color white) every time the app starts.
 
 ## File format
 
 `.bbd` files: the scene, serialized with `serde`/`bincode`, then `zstd`-compressed into a
 single blob. Versioned — a file written by a future incompatible version is rejected with
-a clear error rather than misread.
+a clear error rather than misread. Version 2 (current) added per-element color; a
+version-1 file predates that and is rejected the same way, not migrated.
 
 ## What's not here yet
 

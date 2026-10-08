@@ -20,6 +20,10 @@ a `Tool` is given a `ToolContext` (camera + scene only), not `&mut App` — tool
 the whole app, so tool dispatch never runs into the whole-self borrow conflict `Command`
 dispatch has to work around with `std::mem::take`.
 
+`ToolContext` also carries `color` (the current drawing color, set by `:color`) — the pen
+and shape tools read it at `on_pointer_down` and hold it in their own state for the rest
+of the gesture, since `Tool::preview` has no `ctx` to re-read it from.
+
 The tool registry lives in `blueboard-app/src/tools.rs`.
 
 The tool registry switches tools via `:tool <name>` (a [[Command_registry]] command) or a

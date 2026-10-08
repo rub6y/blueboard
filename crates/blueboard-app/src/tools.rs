@@ -55,6 +55,12 @@ pub struct ToolContext<'a> {
     pub camera: &'a Camera,
     pub scene: &'a mut Scene,
     pub viewport: DVec2,
+    /// The color whatever's drawn next should use — `App::current_color`, set by
+    /// `:color`. A tool that commits an element reads this at `on_pointer_down` (not
+    /// `on_pointer_up`) and holds onto it in its own state for the rest of the gesture,
+    /// since `:color` could change mid-drag and `Tool::preview` has no `ctx` to re-read it
+    /// from — see `PenTool`/`ShapeTool`'s own `color` fields.
+    pub color: [f32; 3],
 }
 
 impl ToolContext<'_> {
@@ -156,6 +162,10 @@ pub struct PenTool {
     last_sample_screen: DVec2,
     /// Running exponential moving average of the cursor position while drawing.
     smoothed_cursor: DVec2,
+    /// The color this stroke is being drawn in — read from `ctx.color` at pointer-down
+    /// and held here for the rest of the gesture, since `preview` has no `ctx` to read it
+    /// from directly (see `ToolContext::color`'s doc comment).
+    color: [f32; 3],
 }
 
 impl Tool for PenTool {
@@ -165,6 +175,7 @@ impl Tool for PenTool {
 
     fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
         self.drawing = true;
+        self.color = ctx.color;
         self.smoothed_cursor = screen_pos;
         self.last_sample_screen = screen_pos;
         self.current_stroke.clear();
@@ -189,7 +200,7 @@ impl Tool for PenTool {
             let accuracy = PEN_FIT_TOLERANCE_PX / ctx.camera.zoom;
             let raw_points = self.current_stroke.len();
             if let Some(path) = fit_stroke(&self.current_stroke, accuracy) {
-                let id = ctx.scene.add_element(path);
+                let id = ctx.scene.add_element_with_color(path, self.color);
                 log::info!("stroke {id} committed from {raw_points} raw samples");
             } else {
                 log::warn!("fit_stroke returned None for {raw_points} raw samples");
@@ -200,7 +211,10 @@ impl Tool for PenTool {
 
     fn preview(&self) -> ScenePreview<'_> {
         if self.drawing && self.current_stroke.len() >= 2 {
-            ScenePreview::RawPoints(&self.current_stroke)
+            ScenePreview::RawPoints {
+                points: &self.current_stroke,
+                color: self.color,
+            }
         } else {
             ScenePreview::None
         }
@@ -221,6 +235,9 @@ pub struct ShapeTool {
     tool_name: &'static str,
     start: Option<DVec2>,
     current: Option<BezPath>,
+    /// The color this shape is being drawn in — same "captured at pointer-down, since
+    /// `preview` has no `ctx`" reasoning as `PenTool::color`.
+    color: [f32; 3],
 }
 
 impl ShapeTool {
@@ -230,6 +247,7 @@ impl ShapeTool {
             tool_name: "rect",
             start: None,
             current: None,
+            color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
         }
     }
 
@@ -239,6 +257,7 @@ impl ShapeTool {
             tool_name: "ellipse",
             start: None,
             current: None,
+            color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
         }
     }
 
@@ -248,6 +267,7 @@ impl ShapeTool {
             tool_name: "line",
             start: None,
             current: None,
+            color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
         }
     }
 
@@ -277,6 +297,7 @@ impl Tool for ShapeTool {
     fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
         let board = ctx.screen_to_board(screen_pos);
         self.start = Some(board);
+        self.color = ctx.color;
         self.current = Some(self.build_path(board, board));
     }
 
@@ -295,14 +316,18 @@ impl Tool for ShapeTool {
         // distance, not bounding-box area, since a perfectly horizontal/vertical *line*
         // legitimately has zero height/width and shouldn't be rejected for it.
         if (board - start).length() > f64::EPSILON {
-            ctx.scene.add_element(self.build_path(start, board));
+            ctx.scene
+                .add_element_with_color(self.build_path(start, board), self.color);
         }
         self.current = None;
     }
 
     fn preview(&self) -> ScenePreview<'_> {
         match &self.current {
-            Some(path) => ScenePreview::Path(path),
+            Some(path) => ScenePreview::Path {
+                path,
+                color: self.color,
+            },
             None => ScenePreview::None,
         }
     }
@@ -738,7 +763,13 @@ impl Tool for SelectLassoTool {
 
     fn preview(&self) -> ScenePreview<'_> {
         if self.drawing && self.loop_points.len() >= 2 {
-            return ScenePreview::RawPoints(&self.loop_points);
+            // Not board content being drawn — the loop itself never becomes an element —
+            // so this ignores `ctx.color` and stays the fixed default, the same reasoning
+            // `GroupSelection::preview`'s UI-only boxes already follow.
+            return ScenePreview::RawPoints {
+                points: &self.loop_points,
+                color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+            };
         }
         self.group.preview()
     }

@@ -18,12 +18,18 @@ use crate::scene::Scene;
 
 /// On-disk format version. Bump this whenever `SceneDocument`'s shape changes in a way
 /// that would misread an older file; `load` refuses to read anything else.
-const FORMAT_VERSION: u32 = 1;
+///
+/// Bumped to 2 for per-element color (`ElementDocument::color`) — a version-1 file has no
+/// such field, so per this format's existing strict-version stance, it's rejected outright
+/// rather than migrated (no default-color backfill code to maintain and potentially get
+/// wrong).
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct ElementDocument {
     id: u64,
     path: BezPath,
+    color: [f32; 3],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,6 +88,7 @@ pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), SaveError> {
         .map(|element| ElementDocument {
             id: element.id,
             path: element.path.clone(),
+            color: element.color,
         })
         .collect();
     // Sorted by id so the same scene always serializes to the same bytes — `Scene`
@@ -114,7 +121,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Scene, LoadError> {
 
     let mut scene = Scene::new();
     for element in document.elements {
-        scene.insert_loaded_element(element.id, element.path);
+        scene.insert_loaded_element(element.id, element.path, element.color);
     }
     Ok(scene)
 }
@@ -148,7 +155,7 @@ mod tests {
     fn save_then_load_round_trips_scene() {
         let mut scene = Scene::new();
         scene.add_element(sample_path(0.0));
-        scene.add_element(sample_path(10.0));
+        scene.add_element_with_color(sample_path(10.0), [0.9, 0.2, 0.2]);
 
         let path = temp_bbd_path("round-trips-scene");
         save(&scene, &path).expect("save should succeed");
@@ -158,14 +165,14 @@ mod tests {
         assert_eq!(loaded.len(), scene.len());
         let mut original: Vec<_> = scene
             .all_elements()
-            .map(|e| (e.id, e.path.clone()))
+            .map(|e| (e.id, e.path.clone(), e.color))
             .collect();
         let mut round_tripped: Vec<_> = loaded
             .all_elements()
-            .map(|e| (e.id, e.path.clone()))
+            .map(|e| (e.id, e.path.clone(), e.color))
             .collect();
-        original.sort_by_key(|(id, _)| *id);
-        round_tripped.sort_by_key(|(id, _)| *id);
+        original.sort_by_key(|(id, _, _)| *id);
+        round_tripped.sort_by_key(|(id, _, _)| *id);
         assert_eq!(original, round_tripped);
     }
 

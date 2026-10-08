@@ -57,6 +57,25 @@ impl Default for ThemeColors {
     }
 }
 
+/// What to draw the reference grid as this frame — owned by `blueboard-app`'s `App` (the
+/// `:grid` command mutates it directly) and passed into [`Renderer::render`] each call,
+/// same as everything else about a frame. Board-space, same units as everything else
+/// (`STROKE_WIDTH`, element paths, ...), not screen pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct GridSettings {
+    pub visible: bool,
+    pub spacing: f32,
+}
+
+impl Default for GridSettings {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            spacing: 100.0,
+        }
+    }
+}
+
 /// Mirrors `ThemeUniform` in `shader.wgsl`: two `vec4`s, not `vec3`s, since WGSL pads a
 /// bare `vec3<f32>` to 16 bytes in a uniform block anyway — using `vec4` on both sides
 /// keeps the Rust and WGSL layouts matching without relying on padding rules.
@@ -111,12 +130,19 @@ pub enum CommandBarContent<'a> {
 /// way a committed element is.
 pub enum ScenePreview<'a> {
     None,
-    /// Raw, not-yet-curve-fitted board-space pointer samples — drawn as a thin line
-    /// strip, deliberately distinct from how a committed stroke renders.
-    RawPoints(&'a [DVec2]),
-    /// An exact path (e.g. a shape tool's in-progress rectangle/ellipse/line) — drawn
-    /// tessellated, identically to a committed element.
-    Path(&'a kurbo::BezPath),
+    /// Raw, not-yet-curve-fitted board-space pointer samples, in the color they'll commit
+    /// in — drawn as a thin line strip, deliberately distinct from how a committed stroke
+    /// renders.
+    RawPoints {
+        points: &'a [DVec2],
+        color: [f32; 3],
+    },
+    /// An exact path (e.g. a shape tool's in-progress rectangle/ellipse/line), in the
+    /// color it'll commit in — drawn tessellated, identically to a committed element.
+    Path {
+        path: &'a kurbo::BezPath,
+        color: [f32; 3],
+    },
     /// The selection tool's selected-element indicator: a board-space bounding box, drawn
     /// as a plain outline (not tessellated like `Path`) so it reads as "this is marked,"
     /// not as content on the board.
@@ -133,6 +159,22 @@ pub enum ScenePreview<'a> {
     /// rather than borrowed since these are recomputed fresh each frame (a group drag
     /// moves every box), not references into the tool's own stored state.
     MultiSelection(Vec<kurbo::Rect>),
+}
+
+/// Everything [`Renderer::render`] needs to draw one frame, bundled so the method takes
+/// one argument instead of an ever-growing positional list.
+pub struct Frame<'a> {
+    pub camera: &'a Camera,
+    pub scene: &'a Scene,
+    pub preview: ScenePreview<'a>,
+    pub command_bar: CommandBarContent<'a>,
+    pub active_tool_name: &'a str,
+    pub grid: GridSettings,
+    /// `Some(color)` shows the color picker this frame, editing `color` in place; `None`
+    /// keeps it closed. Only while open does real pointer/keyboard input reach egui at
+    /// all — see `Renderer::egui_pending_events`.
+    pub color_picker: Option<&'a mut [f32; 3]>,
+    pub scale_factor: f32,
 }
 
 #[repr(C)]
@@ -153,28 +195,73 @@ impl Vertex {
     }
 }
 
-/// A static reference grid in board space, just to make camera pan/zoom visible.
-fn generate_grid_lines(extent: f32, spacing: f32) -> Vec<Vertex> {
+/// Per-element colored content: committed strokes/shapes and their live preview — see
+/// `shader.wgsl`'s `vs_colored`/`fs_colored`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ColorVertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
+
+impl ColorVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ColorVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+/// Hard cap on grid lines generated per axis, regardless of configured spacing or zoom —
+/// without this, a very small `GridSettings::spacing` combined with being zoomed far out
+/// (the visible board-space extent can be enormous at `MIN_ZOOM`) could generate an
+/// unreasonable vertex count every single frame. The effective spacing widens past this
+/// cap instead of refusing to draw, so the grid stays visible (just coarser) rather than
+/// disappearing.
+const MAX_GRID_LINES_PER_AXIS: f64 = 500.0;
+
+/// The reference grid, covering exactly `[min, max]` (board-space) at `spacing` — called
+/// fresh every frame with the camera's current visible extent (the same `board_min`/
+/// `board_max` viewport culling already computes), rather than a fixed-size buffer built
+/// once at startup, so the grid covers whatever's visible at any zoom/pan rather than
+/// only ever back to the start. Lines are snapped to spacing-aligned world positions
+/// (`floor`, not the raw `min`) so the grid doesn't visibly "swim" relative to board
+/// content while panning between frames.
+fn generate_grid_lines(min: DVec2, max: DVec2, spacing: f32) -> Vec<Vertex> {
+    if spacing <= 0.0 {
+        return Vec::new();
+    }
+    let width = (max.x - min.x).max(0.0);
+    let height = (max.y - min.y).max(0.0);
+    let spacing = (spacing as f64)
+        .max(width / MAX_GRID_LINES_PER_AXIS)
+        .max(height / MAX_GRID_LINES_PER_AXIS);
+
     let mut verts = Vec::new();
 
-    let mut x = -extent;
-    while x <= extent {
+    let mut x = (min.x / spacing).floor() * spacing;
+    while x <= max.x {
         verts.push(Vertex {
-            position: [x, -extent],
+            position: [x as f32, min.y as f32],
         });
         verts.push(Vertex {
-            position: [x, extent],
+            position: [x as f32, max.y as f32],
         });
         x += spacing;
     }
 
-    let mut y = -extent;
-    while y <= extent {
+    let mut y = (min.y / spacing).floor() * spacing;
+    while y <= max.y {
         verts.push(Vertex {
-            position: [-extent, y],
+            position: [min.x as f32, y as f32],
         });
         verts.push(Vertex {
-            position: [extent, y],
+            position: [max.x as f32, y as f32],
         });
         y += spacing;
     }
@@ -223,11 +310,17 @@ fn kurbo_path_to_lyon(path: &kurbo::BezPath) -> LyonPath {
     builder.build()
 }
 
-/// Tessellate one stroke's outline into triangles, appending them (as a flat,
-/// non-indexed vertex list, matching the grid pipeline's draw call) to `out`. `tolerance`
-/// is in the same board-space units as `path` — callers are responsible for converting a
-/// screen-space pixel tolerance by dividing by zoom (see [`STROKE_TESSELLATION_TOLERANCE_PX`]).
-fn tessellate_stroke(path: &kurbo::BezPath, width: f32, tolerance: f32, out: &mut Vec<Vertex>) {
+/// Tessellate one stroke's outline into triangles, in `color`, appending them (as a flat,
+/// non-indexed vertex list) to `out`. `tolerance` is in the same board-space units as
+/// `path` — callers are responsible for converting a screen-space pixel tolerance by
+/// dividing by zoom (see [`STROKE_TESSELLATION_TOLERANCE_PX`]).
+fn tessellate_colored_stroke(
+    path: &kurbo::BezPath,
+    color: [f32; 3],
+    width: f32,
+    tolerance: f32,
+    out: &mut Vec<ColorVertex>,
+) {
     let lyon_path = kurbo_path_to_lyon(path);
     let options = StrokeOptions::default()
         .with_line_width(width)
@@ -236,13 +329,14 @@ fn tessellate_stroke(path: &kurbo::BezPath, width: f32, tolerance: f32, out: &mu
         .with_start_cap(lyon::tessellation::LineCap::Round)
         .with_end_cap(lyon::tessellation::LineCap::Round);
 
-    let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
+    let mut buffers: VertexBuffers<ColorVertex, u32> = VertexBuffers::new();
     let mut tessellator = StrokeTessellator::new();
     let result = tessellator.tessellate_path(
         &lyon_path,
         &options,
-        &mut BuffersBuilder::new(&mut buffers, |vertex: StrokeVertex| Vertex {
+        &mut BuffersBuilder::new(&mut buffers, |vertex: StrokeVertex| ColorVertex {
             position: vertex.position().to_array(),
+            color,
         }),
     );
 
@@ -263,17 +357,19 @@ fn tessellate_stroke(path: &kurbo::BezPath, width: f32, tolerance: f32, out: &mu
 }
 
 /// Build a single live-preview line strip (as a `LineList`, one segment per consecutive
-/// pair) from the raw, not-yet-fitted points of a stroke still being drawn.
-fn preview_line_vertices(points: &[DVec2]) -> Vec<Vertex> {
+/// pair), in `color`, from the raw, not-yet-fitted points of a stroke still being drawn.
+fn colored_preview_line_vertices(points: &[DVec2], color: [f32; 3]) -> Vec<ColorVertex> {
     points
         .windows(2)
         .flat_map(|pair| {
             [
-                Vertex {
+                ColorVertex {
                     position: [pair[0].x as f32, pair[0].y as f32],
+                    color,
                 },
-                Vertex {
+                ColorVertex {
                     position: [pair[1].x as f32, pair[1].y as f32],
+                    color,
                 },
             ]
         })
@@ -323,6 +419,22 @@ fn erase_cursor_vertices(center: DVec2, radius: f64) -> Vec<Vertex> {
         .collect()
 }
 
+fn color_to_color32(color: [f32; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
+fn color32_to_color(color: egui::Color32) -> [f32; 3] {
+    [
+        color.r() as f32 / 255.0,
+        color.g() as f32 / 255.0,
+        color.b() as f32 / 255.0,
+    ]
+}
+
 /// The offscreen multisampled color target every pipeline renders into; `render()`
 /// resolves it down into the swapchain's single-sample texture each frame.
 fn create_msaa_view(
@@ -365,6 +477,8 @@ fn run_command_bar_ui(
     scale_factor: f32,
     content: &CommandBarContent<'_>,
     active_tool_name: &str,
+    events: Vec<egui::Event>,
+    mut color_picker: Option<&mut [f32; 3]>,
 ) -> egui::FullOutput {
     let screen_size_points = egui::vec2(
         viewport_size.0 as f32 / scale_factor,
@@ -375,6 +489,7 @@ fn run_command_bar_ui(
             egui::Pos2::ZERO,
             screen_size_points,
         )),
+        events,
         ..Default::default()
     };
 
@@ -434,6 +549,24 @@ fn run_command_bar_ui(
                     });
                 });
             });
+
+        // The one interactive piece of UI this module owns — see
+        // `Renderer::egui_pending_events`'s doc comment: real input is forwarded here
+        // only while this is open.
+        if let Some(color) = color_picker.as_deref_mut() {
+            let mut color32 = color_to_color32(*color);
+            egui::Window::new("Color")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    egui::color_picker::color_picker_color32(
+                        ui,
+                        &mut color32,
+                        egui::color_picker::Alpha::Opaque,
+                    );
+                });
+            *color = color32_to_color(color32);
+        }
     })
 }
 
@@ -445,15 +578,26 @@ pub struct Renderer {
     msaa_view: wgpu::TextureView,
     board_clear_color: wgpu::Color,
     grid_pipeline: wgpu::RenderPipeline,
-    stroke_pipeline: wgpu::RenderPipeline,
+    /// Uniform theme-colored `LineList` — the UI-only overlays (selection boxes, the
+    /// eraser cursor), not board content.
     preview_pipeline: wgpu::RenderPipeline,
+    /// Per-vertex colored `TriangleList` — committed strokes/shapes and the shape tools'
+    /// live preview.
+    colored_stroke_pipeline: wgpu::RenderPipeline,
+    /// Per-vertex colored `LineList` — the pen's raw, not-yet-tessellated live preview.
+    colored_preview_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     theme_bind_group: wgpu::BindGroup,
-    grid_vertex_buffer: wgpu::Buffer,
-    grid_vertex_count: u32,
     egui_ctx: egui::Context,
     egui_renderer: egui_wgpu::Renderer,
+    /// Real pointer/keyboard events forwarded from `blueboard-app`'s winit handling,
+    /// queued here and drained into egui's `RawInput` on the next `render()` call — only
+    /// pushed while the color picker is open, since that's the one piece of UI that
+    /// actually needs to be interactive (every other use of egui here, the command bar,
+    /// is pure display; `blueboard-app` owns all real input handling otherwise — see
+    /// this module's doc comment).
+    egui_pending_events: Vec<egui::Event>,
 }
 
 impl Renderer {
@@ -593,19 +737,23 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        // The grid, committed strokes, and the in-progress stroke preview all share the
-        // same vertex layout, pipeline layout, and vertex shader — only the fragment
-        // entry point (color) and primitive topology (lines vs. triangles) differ, so one
-        // helper builds all three pipelines instead of repeating ~25 lines three times.
-        let build_pipeline = |label: &str, topology: wgpu::PrimitiveTopology, fs_entry: &str| {
+        // Every pipeline here shares a pipeline layout (camera + theme bind groups,
+        // whether or not a given fragment shader actually reads the theme uniform) — only
+        // the vertex layout/shader entry point, primitive topology, and fragment entry
+        // point differ, so one helper builds all four instead of repeating ~25 lines each.
+        let build_pipeline = |label: &str,
+                              vs_entry: &str,
+                              vertex_layout: wgpu::VertexBufferLayout<'static>,
+                              topology: wgpu::PrimitiveTopology,
+                              fs_entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(vs_entry),
                     compilation_options: Default::default(),
-                    buffers: &[Some(Vertex::layout())],
+                    buffers: &[Some(vertex_layout)],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -634,26 +782,32 @@ impl Renderer {
 
         let grid_pipeline = build_pipeline(
             "grid pipeline",
+            "vs_main",
+            Vertex::layout(),
             wgpu::PrimitiveTopology::LineList,
             "fs_grid",
         );
-        let stroke_pipeline = build_pipeline(
-            "stroke pipeline",
-            wgpu::PrimitiveTopology::TriangleList,
-            "fs_stroke",
-        );
         let preview_pipeline = build_pipeline(
             "stroke preview pipeline",
+            "vs_main",
+            Vertex::layout(),
             wgpu::PrimitiveTopology::LineList,
             "fs_stroke",
         );
-
-        let grid_vertices = generate_grid_lines(2000.0, 100.0);
-        let grid_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("grid vertices"),
-            contents: bytemuck::cast_slice(&grid_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let colored_stroke_pipeline = build_pipeline(
+            "colored stroke pipeline",
+            "vs_colored",
+            ColorVertex::layout(),
+            wgpu::PrimitiveTopology::TriangleList,
+            "fs_colored",
+        );
+        let colored_preview_pipeline = build_pipeline(
+            "colored preview pipeline",
+            "vs_colored",
+            ColorVertex::layout(),
+            wgpu::PrimitiveTopology::LineList,
+            "fs_colored",
+        );
 
         let msaa_view = create_msaa_view(&device, &config);
 
@@ -677,16 +831,24 @@ impl Renderer {
                 a: 1.0,
             },
             grid_pipeline,
-            stroke_pipeline,
             preview_pipeline,
+            colored_stroke_pipeline,
+            colored_preview_pipeline,
             camera_buffer,
             camera_bind_group,
             theme_bind_group,
-            grid_vertex_buffer,
-            grid_vertex_count: grid_vertices.len() as u32,
             egui_ctx,
             egui_renderer,
+            egui_pending_events: Vec::new(),
         }
+    }
+
+    /// Queues a real pointer/keyboard event for egui to see on the next `render()` call —
+    /// `blueboard-app` calls this while the color picker is open, so its "traditional"
+    /// drag-to-pick widget is actually interactive. See `egui_pending_events`'s doc
+    /// comment on why this is the one exception to egui not owning input.
+    pub fn push_egui_event(&mut self, event: egui::Event) {
+        self.egui_pending_events.push(event);
     }
 
     pub fn resize(&mut self, new_size: (u32, u32)) {
@@ -702,13 +864,17 @@ impl Renderer {
 
     /// Upload a vertex list as a fresh GPU buffer and return it with its vertex count (0
     /// vertices still returns a valid, zero-size-safe buffer — `wgpu` requires buffers be
-    /// non-empty, so an empty input gets a single padding vertex that's never drawn).
-    fn upload_vertices(&self, label: &str, vertices: &[Vertex]) -> (wgpu::Buffer, u32) {
+    /// non-empty, so an empty input gets a single zeroed padding vertex that's never
+    /// drawn). Generic over vertex type since `Vertex` and `ColorVertex` both get this
+    /// same per-frame dynamic-buffer treatment.
+    fn upload_vertices<V: bytemuck::Pod + bytemuck::Zeroable>(
+        &self,
+        label: &str,
+        vertices: &[V],
+    ) -> (wgpu::Buffer, u32) {
         let padded;
         let vertices = if vertices.is_empty() {
-            padded = [Vertex {
-                position: [0.0, 0.0],
-            }];
+            padded = [V::zeroed()];
             &padded[..]
         } else {
             vertices
@@ -725,16 +891,21 @@ impl Renderer {
 
     /// Render one frame: the grid, every element in `scene` intersecting the camera's
     /// current viewport, the active tool's live `preview` if any, and the `:`-command bar
-    /// on top.
-    pub fn render(
-        &mut self,
-        camera: &Camera,
-        scene: &Scene,
-        preview: ScenePreview<'_>,
-        command_bar: CommandBarContent<'_>,
-        active_tool_name: &str,
-        scale_factor: f32,
-    ) -> RenderOutcome {
+    /// on top. Takes a [`Frame`] rather than its own ever-growing argument list — plain
+    /// positional params worked while this was camera/scene/preview, but kept growing one
+    /// at a time (the command bar, the active tool's name, grid settings, the color
+    /// picker...) until clippy's `too_many_arguments` finally said so.
+    pub fn render(&mut self, frame: Frame<'_>) -> RenderOutcome {
+        let Frame {
+            camera,
+            scene,
+            preview,
+            command_bar,
+            active_tool_name,
+            grid,
+            color_picker,
+            scale_factor,
+        } = frame;
         // `get_current_texture` returns an enum rather than a `Result` as of wgpu 30 — the
         // "try again next frame" cases (Timeout/Occluded) and the "reconfigure first" cases
         // (Outdated/Lost) are both expected conditions, not necessarily program errors.
@@ -763,10 +934,20 @@ impl Renderer {
         );
 
         // Viewport culling (PLAN.md Phase 2): only strokes whose bounding box intersects
-        // the visible board-space rectangle get tessellated at all.
+        // the visible board-space rectangle get tessellated at all. The same board
+        // min/max also bounds the grid (below) — regenerated fresh every frame to exactly
+        // this extent, which is what makes it look infinite: it always covers whatever's
+        // visible, at any zoom or pan, rather than only ever back to a fixed start size.
         let viewport_f64 = DVec2::new(self.config.width as f64, self.config.height as f64);
         let board_min = camera.screen_to_board(DVec2::ZERO, viewport_f64);
         let board_max = camera.screen_to_board(viewport_f64, viewport_f64);
+
+        let grid_vertices = if grid.visible {
+            generate_grid_lines(board_min, board_max, grid.spacing)
+        } else {
+            Vec::new()
+        };
+        let (grid_buffer, grid_count) = self.upload_vertices("grid vertices", &grid_vertices);
 
         // Screen-space tolerance -> board-space: tighter flattening the further zoomed in,
         // per planning/math.tex §3, instead of a fixed board-space tolerance that would
@@ -774,9 +955,19 @@ impl Renderer {
         let tessellation_tolerance = STROKE_TESSELLATION_TOLERANCE_PX / camera.zoom as f32;
 
         let mut stroke_vertices = Vec::new();
-        for element in scene.elements_in_viewport(board_min, board_max) {
-            tessellate_stroke(
+        // Sorted by id (draw/creation order) before tessellating: `elements_in_viewport`
+        // comes from the R-tree, whose iteration order is spatial, not insertion order —
+        // with every element the same color this was invisible, but once elements can
+        // differ in color, drawing them in an arbitrary order means a freshly-drawn
+        // stroke can render *underneath* an older one it overlaps, instead of on top like
+        // it should.
+        let mut visible_elements: Vec<_> =
+            scene.elements_in_viewport(board_min, board_max).collect();
+        visible_elements.sort_by_key(|element| element.id);
+        for element in visible_elements {
+            tessellate_colored_stroke(
                 &element.path,
+                element.color,
                 STROKE_WIDTH,
                 tessellation_tolerance,
                 &mut stroke_vertices,
@@ -785,37 +976,48 @@ impl Renderer {
         let (stroke_buffer, stroke_count) =
             self.upload_vertices("stroke vertices", &stroke_vertices);
 
-        // The pen's raw preview draws as thin lines; a shape tool's preview draws
-        // tessellated, exactly like a committed element — see `ScenePreview`'s doc comment.
-        let (preview_vertices, preview_pipeline): (Vec<Vertex>, &wgpu::RenderPipeline) =
-            match preview {
-                ScenePreview::None => (Vec::new(), &self.preview_pipeline),
-                ScenePreview::RawPoints(points) => {
-                    (preview_line_vertices(points), &self.preview_pipeline)
-                }
-                ScenePreview::Path(path) => {
-                    let mut verts = Vec::new();
-                    tessellate_stroke(path, STROKE_WIDTH, tessellation_tolerance, &mut verts);
-                    (verts, &self.stroke_pipeline)
-                }
-                ScenePreview::Selection(rect) => {
-                    (selection_rect_vertices(rect), &self.preview_pipeline)
-                }
-                ScenePreview::EraseCursor { center, radius } => (
-                    erase_cursor_vertices(center, radius),
-                    &self.preview_pipeline,
-                ),
-                ScenePreview::MultiSelection(rects) => {
-                    let verts = rects
-                        .iter()
-                        .copied()
-                        .flat_map(selection_rect_vertices)
-                        .collect();
-                    (verts, &self.preview_pipeline)
-                }
-            };
-        let (preview_buffer, preview_count) =
-            self.upload_vertices("preview vertices", &preview_vertices);
+        // The pen's raw preview draws as thin colored lines; a shape tool's preview draws
+        // tessellated and colored, exactly like a committed element — see `ScenePreview`'s
+        // doc comment. The UI-only overlays (Selection/EraseCursor/MultiSelection) stay on
+        // the separate uniform theme-colored path — they aren't board content and
+        // shouldn't track whatever color the user's currently drawing with.
+        let mut colored_preview_vertices: Vec<ColorVertex> = Vec::new();
+        let mut colored_preview_pipeline = &self.colored_preview_pipeline;
+        let mut uniform_preview_vertices: Vec<Vertex> = Vec::new();
+        match preview {
+            ScenePreview::None => {}
+            ScenePreview::RawPoints { points, color } => {
+                colored_preview_vertices = colored_preview_line_vertices(points, color);
+                colored_preview_pipeline = &self.colored_preview_pipeline;
+            }
+            ScenePreview::Path { path, color } => {
+                tessellate_colored_stroke(
+                    path,
+                    color,
+                    STROKE_WIDTH,
+                    tessellation_tolerance,
+                    &mut colored_preview_vertices,
+                );
+                colored_preview_pipeline = &self.colored_stroke_pipeline;
+            }
+            ScenePreview::Selection(rect) => {
+                uniform_preview_vertices = selection_rect_vertices(rect);
+            }
+            ScenePreview::EraseCursor { center, radius } => {
+                uniform_preview_vertices = erase_cursor_vertices(center, radius);
+            }
+            ScenePreview::MultiSelection(rects) => {
+                uniform_preview_vertices = rects
+                    .iter()
+                    .copied()
+                    .flat_map(selection_rect_vertices)
+                    .collect();
+            }
+        }
+        let (colored_preview_buffer, colored_preview_count) =
+            self.upload_vertices("colored preview vertices", &colored_preview_vertices);
+        let (uniform_preview_buffer, uniform_preview_count) =
+            self.upload_vertices("uniform preview vertices", &uniform_preview_vertices);
 
         let view = surface_texture
             .texture
@@ -850,20 +1052,28 @@ impl Renderer {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, &self.theme_bind_group, &[]);
 
-            pass.set_pipeline(&self.grid_pipeline);
-            pass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
-            pass.draw(0..self.grid_vertex_count, 0..1);
+            if grid_count > 0 {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_vertex_buffer(0, grid_buffer.slice(..));
+                pass.draw(0..grid_count, 0..1);
+            }
 
             if stroke_count > 0 {
-                pass.set_pipeline(&self.stroke_pipeline);
+                pass.set_pipeline(&self.colored_stroke_pipeline);
                 pass.set_vertex_buffer(0, stroke_buffer.slice(..));
                 pass.draw(0..stroke_count, 0..1);
             }
 
-            if preview_count > 0 {
-                pass.set_pipeline(preview_pipeline);
-                pass.set_vertex_buffer(0, preview_buffer.slice(..));
-                pass.draw(0..preview_count, 0..1);
+            if colored_preview_count > 0 {
+                pass.set_pipeline(colored_preview_pipeline);
+                pass.set_vertex_buffer(0, colored_preview_buffer.slice(..));
+                pass.draw(0..colored_preview_count, 0..1);
+            }
+
+            if uniform_preview_count > 0 {
+                pass.set_pipeline(&self.preview_pipeline);
+                pass.set_vertex_buffer(0, uniform_preview_buffer.slice(..));
+                pass.draw(0..uniform_preview_count, 0..1);
             }
         }
 
@@ -876,6 +1086,8 @@ impl Renderer {
             scale_factor,
             &command_bar,
             active_tool_name,
+            std::mem::take(&mut self.egui_pending_events),
+            color_picker,
         );
         let clipped_primitives = self
             .egui_ctx

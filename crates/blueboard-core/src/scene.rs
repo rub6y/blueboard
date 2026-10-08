@@ -14,7 +14,13 @@ use crate::history::Snapshot;
 pub struct Element {
     pub id: u64,
     pub path: BezPath,
+    pub color: [f32; 3],
 }
+
+/// What a new element gets if nothing more specific is given (`add_element`, and any
+/// loaded element from a pre-color file format version). White, matching the fixed
+/// stroke color every element used before per-element color existed.
+pub const DEFAULT_ELEMENT_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 
 /// What's actually indexed by the R-tree: just an id and a bounding box, not the element
 /// itself — elements live in `Scene::elements`, looked up by id after a spatial query.
@@ -44,27 +50,34 @@ impl Scene {
         Self::default()
     }
 
+    /// Adds an element in [`DEFAULT_ELEMENT_COLOR`] — most of this crate's own tests use
+    /// this, since they don't care about color. Drawing tools that know what color the
+    /// user actually picked use [`Scene::add_element_with_color`] instead.
     pub fn add_element(&mut self, path: BezPath) -> u64 {
+        self.add_element_with_color(path, DEFAULT_ELEMENT_COLOR)
+    }
+
+    pub fn add_element_with_color(&mut self, path: BezPath, color: [f32; 3]) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.insert_element(id, path);
+        self.insert_element(id, path, color);
         id
     }
 
     /// Inserts an element under a specific id rather than generating one — used when
     /// loading a saved board ([`crate::file_format`]), so loaded elements keep the ids
     /// they were saved with instead of being renumbered.
-    pub(crate) fn insert_loaded_element(&mut self, id: u64, path: BezPath) {
-        self.insert_element(id, path);
+    pub(crate) fn insert_loaded_element(&mut self, id: u64, path: BezPath, color: [f32; 3]) {
+        self.insert_element(id, path, color);
         // Any elements added after loading must not collide with a loaded id.
         self.next_id = self.next_id.max(id + 1);
     }
 
-    fn insert_element(&mut self, id: u64, path: BezPath) {
+    fn insert_element(&mut self, id: u64, path: BezPath, color: [f32; 3]) {
         let bbox = path.bounding_box();
         let envelope = AABB::from_corners([bbox.x0, bbox.y0], [bbox.x1, bbox.y1]);
         self.index.insert(IndexedBounds { id, envelope });
-        self.elements.insert(id, Element { id, path });
+        self.elements.insert(id, Element { id, path, color });
     }
 
     pub fn element(&self, id: u64) -> Option<&Element> {
@@ -89,6 +102,14 @@ impl Scene {
     /// removed and reinserted rather than mutated, since a move changes the bounding box
     /// the old entry was indexed under.
     pub fn set_element_path(&mut self, id: u64, path: BezPath) {
+        // A move doesn't change what color the element was drawn in — read it back from
+        // the existing entry (falling back to the default for an id that, degenerately,
+        // doesn't exist yet) rather than letting `insert_element` reset it.
+        let color = self
+            .elements
+            .get(&id)
+            .map(|element| element.color)
+            .unwrap_or(DEFAULT_ELEMENT_COLOR);
         if let Some(old) = self.elements.get(&id) {
             let old_bbox = old.path.bounding_box();
             let old_envelope =
@@ -98,7 +119,7 @@ impl Scene {
                 envelope: old_envelope,
             });
         }
-        self.insert_element(id, path);
+        self.insert_element(id, path, color);
     }
 
     /// The id of the element nearest `point` (board-space), if any lie within `tolerance`
@@ -137,14 +158,14 @@ impl Scene {
     /// A point-in-time copy of this scene's contents for [`crate::history`]. Derived data
     /// (the R-tree) is not copied — [`Scene::restore`] rebuilds it from the elements.
     pub fn snapshot(&self) -> Snapshot {
-        let mut elements: Vec<(u64, BezPath)> = self
+        let mut elements: Vec<(u64, BezPath, [f32; 3])> = self
             .elements
             .values()
-            .map(|element| (element.id, element.path.clone()))
+            .map(|element| (element.id, element.path.clone(), element.color))
             .collect();
         // Sorted by id so the same elements always compare equal regardless of `HashMap`
         // iteration order — same reasoning as `file_format::save`.
-        elements.sort_by_key(|(id, _)| *id);
+        elements.sort_by_key(|(id, _, _)| *id);
         Snapshot { elements }
     }
 
@@ -159,11 +180,11 @@ impl Scene {
         // `next_id` is never lowered, only raised past the highest restored id: ids are
         // never reused (the same stability rule `insert_loaded_element` follows), and
         // lowering it after e.g. undoing a `clear` would collide with the restored ids.
-        if let Some(highest) = snapshot.elements.iter().map(|(id, _)| *id).max() {
+        if let Some(highest) = snapshot.elements.iter().map(|(id, _, _)| *id).max() {
             self.next_id = self.next_id.max(highest + 1);
         }
-        for (id, path) in snapshot.elements {
-            self.insert_element(id, path);
+        for (id, path, color) in snapshot.elements {
+            self.insert_element(id, path, color);
         }
     }
 

@@ -2,6 +2,92 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Fix: newer strokes rendering underneath older ones
+- Caught by ruba right after the color work above landed: a freshly-drawn stroke could
+  render *behind* an older one it overlapped, instead of on top. Root cause predates
+  color entirely — `render()`'s committed-element loop drew whatever order
+  `Scene::elements_in_viewport` happened to yield (the R-tree's spatial iteration order,
+  not insertion/creation order), so draw order was always effectively arbitrary; with
+  every element the same fixed white it was invisible, but once elements can differ in
+  color it's an obvious "wrong thing on top" bug.
+- Fix: collect the visible elements into a `Vec` and sort by `id` (monotonically
+  increasing, never reused — see [[Scene_graph]]) before tessellating, so later-created
+  elements always draw last/on top, regardless of whatever order the R-tree query itself
+  returns them in.
+- **Verified by actually running the app**: drew a red stroke, then a near-identical blue
+  stroke directly on top of it after zooming in enough for a real multi-pixel-wide solid
+  overlap region (not just a hairline, where MSAA edge antialiasing alone would blend two
+  near-coincident colors regardless of draw order — confirmed separately that *that*
+  blending is a real, expected antialiasing artifact, not this bug, by sampling a pixel
+  dead-center in a deliberately near-perfect 1-board-unit-offset overlap and seeing a
+  red/blue blend only at that near-hairline width). At real stroke width, the overlap
+  region sampled pure blue, confirmed both visually and by reading the pixel's RGB value
+  (`srgb(149,187,249)`, dominated by blue, no red component) — the fix holds.
+
+## 2026-10-09 — Per-element color, an interactive color picker, and an infinite/configurable grid
+- **Per-element color**: [[Scene_graph]]'s `Element` gained a `color: [f32; 3]` field.
+  `add_element` keeps defaulting to white (most of this crate's own tests don't care);
+  `add_element_with_color` is for callers that do. `set_element_path` (the move/drag
+  commit) now explicitly re-reads and preserves the existing element's color rather than
+  letting `insert_element` reset it, and [[History]]'s `Snapshot` had to grow a color
+  field too — undo/redo already round-tripped `(id, path)` through a snapshot/restore
+  cycle, and without this fix every undo would have silently stripped color back to
+  default. `erase_circle` now reads an element's color before removing it and passes it
+  through to every surviving split piece. [[File_format]] bumped to version 2
+  (`ElementDocument` gained `color`) — per this format's existing strict-version stance, a
+  version-1 file is rejected outright, not migrated with a backfilled default.
+- [[Tool_registry]]: `ToolContext` gained a `color` field (the current drawing color, set
+  by `:color`); `PenTool`/`ShapeTool` read it at `on_pointer_down` and hold it in their own
+  state for the rest of the gesture (`preview()` has no `ctx` to re-read it from). The
+  lasso tool's in-progress loop preview deliberately ignores `ctx.color` and stays the
+  fixed default — it's a selection gesture, not board content, same reasoning
+  `GroupSelection`'s UI-only boxes already follow.
+- New `blueboard-app/src/color.rs`: a small named-color palette plus `#rrggbb`/`rrggbb`
+  hex parsing, backing a new `:color <name|#hex|picker>` command. `picker` toggles an
+  interactive **traditional color picker** (egui's built-in `color_picker_color32` — the
+  saturation/value square + hue strip), the one piece of UI in this app that's actually
+  interactive rather than pure display (see [[Render_crate]]/[[Command_line]]'s "egui
+  doesn't own input" note) — real pointer events are forwarded to it only while open
+  (`Renderer::push_egui_event`), and only left-clicks/cursor-moves; the active tool's own
+  dispatch is suppressed for the same duration so clicking the picker can't also draw on
+  the canvas underneath it. `Escape` closes the picker in preference to its normal
+  quit-the-app behavior while it's open.
+- **Infinite, configurable grid**: `generate_grid_lines` is now called fresh every frame,
+  sized to exactly the camera's current visible board-space extent (the same `board_min`/
+  `board_max` viewport culling already computes) instead of a fixed 2000-unit buffer built
+  once at startup — that's what makes it look infinite: it covers whatever's visible at
+  any zoom or pan, not just back to a fixed starting size. Lines snap to spacing-aligned
+  positions (`floor`, not raw `min`) so the grid doesn't visibly swim while panning. A
+  `MAX_GRID_LINES_PER_AXIS` cap widens the effective spacing rather than drawing an
+  unreasonable vertex count when zoomed far out with a small configured spacing. New
+  `:grid <show|hide|bigger|smaller|number>` command (`GridSettings` on `App`, runtime-only
+  per sign-off — not persisted to `config.toml`).
+- **Render-crate architecture**: committed strokes/shapes and their live preview (pen/
+  shape tools) moved to a new per-vertex-colored path — `ColorVertex`/`vs_colored`/
+  `fs_colored` — while the grid and the UI-only overlays (selection boxes, the eraser
+  cursor) stayed on the existing uniform theme-colored path, deliberately: those aren't
+  board content and shouldn't track whatever color the user's currently drawing with. The
+  now-unused uniform `TriangleList` stroke pipeline was deleted outright rather than left
+  dead. `Renderer::render` was restructured to take one `Frame` struct instead of a
+  positional argument list — clippy's `too_many_arguments` finally tripped once grid
+  settings and the color picker joined camera/scene/preview/command_bar/tool
+  name/scale_factor.
+- Three new tests in `blueboard-app/src/color.rs` (named lookup case-insensitivity, hex
+  with/without `#`, invalid input rejected) and one in `erase.rs`
+  (`surviving_pieces_keep_the_original_color`) — 31 total across the workspace, all
+  passing. `clippy`/`fmt --check` clean.
+- **Verified by actually running the app** under Xvfb: `:color red` then drawing a
+  rectangle, `:color #00a0ff` then a line — both committed in the exact colors set, not
+  the old fixed white. Scroll-zoomed out 15 steps and confirmed the grid still fully
+  covers the viewport rather than showing blank background past the old fixed extent.
+  `:grid hide`/`:grid show` toggled visibility; two `:grid bigger` presses took spacing
+  100 -> 150 -> 225 exactly (the configured `GRID_STEP_FACTOR`). `:color picker` opened
+  the interactive picker; clicking the hue strip then the saturation/value square visibly
+  moved the picker's selection circle and updated its RGB readout, closing the picker and
+  drawing a new stroke afterward produced that exact picked color — full round trip from
+  pointer click to `App::current_color` to a committed element, not just a cosmetic
+  widget.
+
 ## 2026-10-09 — Rectangle and lasso multi-select, plus `:delete`
 - Two new tools: `select-rect` (key `V`, marquee — drag over empty space selects every
   element whose bounding box overlaps the dragged rectangle at all, reusing

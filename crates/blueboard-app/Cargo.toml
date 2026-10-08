@@ -10,6 +10,10 @@ path = "src/main.rs"
 [dependencies]
 blueboard-core = { path = "../blueboard-core" }
 blueboard-render = { path = "../blueboard-render" }
+# Only for constructing the handful of input events forwarded to the color picker (see
+# `main.rs`'s `screen_to_egui_points`) — must match `blueboard-render`'s egui version,
+# since these events cross the crate boundary into `Renderer::push_egui_event`.
+egui = "0.36.2"
 glam = "0.34.1"
 kurbo = "0.13.1"
 log = { version = "0.4.34", features = ["std"] }

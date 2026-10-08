@@ -47,6 +47,8 @@ impl CommandRegistry {
         registry.register(NewCommand);
         registry.register(ToolCommand);
         registry.register(DeleteCommand);
+        registry.register(ColorCommand);
+        registry.register(GridCommand);
         registry.register(UndoCommand);
         registry.register(RedoCommand);
         registry.register(HelpCommand);
@@ -234,6 +236,91 @@ impl Command for DeleteCommand {
             Ok("deleted selection".to_string())
         } else {
             Err("nothing selected".to_string())
+        }
+    }
+}
+
+/// Sets the color the pen and shape tools draw their next element in, or toggles the
+/// interactive picker. Named colors and `#rrggbb`/`rrggbb` hex both go through
+/// `crate::color::parse_color`; `picker` is handled separately since it's not a color at
+/// all.
+struct ColorCommand;
+impl Command for ColorCommand {
+    fn name(&self) -> &'static str {
+        "color"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<name|#hex|picker>"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        let arg = args.trim();
+        if arg.eq_ignore_ascii_case("picker") {
+            app.color_picker_open = !app.color_picker_open;
+            let state = if app.color_picker_open {
+                "open"
+            } else {
+                "closed"
+            };
+            return Ok(format!("color picker: {state}"));
+        }
+        match crate::color::parse_color(arg) {
+            Some(color) => {
+                app.current_color = color;
+                Ok(format!("color: {arg}"))
+            }
+            None => Err(format!("unknown color: {arg}")),
+        }
+    }
+}
+
+/// Multiplicative step `:grid bigger`/`:grid smaller` scale the spacing by each press.
+const GRID_STEP_FACTOR: f32 = 1.5;
+/// Spacing bounds (board-space), both for the step commands and a direct `:grid <number>`
+/// — prevents a degenerate near-zero or absurdly coarse grid.
+const GRID_MIN_SPACING: f32 = 5.0;
+const GRID_MAX_SPACING: f32 = 5000.0;
+
+/// Shows/hides the reference grid, or changes its spacing — relative (`bigger`/`smaller`,
+/// multiplying by [`GRID_STEP_FACTOR`]) or an exact board-space number.
+struct GridCommand;
+impl Command for GridCommand {
+    fn name(&self) -> &'static str {
+        "grid"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<show|hide|bigger|smaller|size>"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        match args.trim() {
+            "show" => {
+                app.grid.visible = true;
+                Ok("grid: shown".to_string())
+            }
+            "hide" => {
+                app.grid.visible = false;
+                Ok("grid: hidden".to_string())
+            }
+            "bigger" => {
+                app.grid.spacing =
+                    (app.grid.spacing * GRID_STEP_FACTOR).clamp(GRID_MIN_SPACING, GRID_MAX_SPACING);
+                Ok(format!("grid spacing: {}", app.grid.spacing))
+            }
+            "smaller" => {
+                app.grid.spacing =
+                    (app.grid.spacing / GRID_STEP_FACTOR).clamp(GRID_MIN_SPACING, GRID_MAX_SPACING);
+                Ok(format!("grid spacing: {}", app.grid.spacing))
+            }
+            arg => match arg.parse::<f32>() {
+                Ok(spacing) if spacing > 0.0 => {
+                    app.grid.spacing = spacing.clamp(GRID_MIN_SPACING, GRID_MAX_SPACING);
+                    Ok(format!("grid spacing: {}", app.grid.spacing))
+                }
+                _ => Err(format!("unknown grid command: {arg}")),
+            },
         }
     }
 }

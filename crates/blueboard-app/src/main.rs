@@ -11,7 +11,7 @@ use std::sync::Arc;
 use blueboard_core::camera::Camera;
 use blueboard_core::history::History;
 use blueboard_core::scene::Scene;
-use blueboard_render::{CommandBarContent, RenderOutcome, Renderer};
+use blueboard_render::{CommandBarContent, Frame, GridSettings, RenderOutcome, Renderer};
 use glam::DVec2;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -19,6 +19,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+mod color;
 mod commands;
 mod config;
 mod logging;
@@ -57,6 +58,18 @@ struct App {
     /// replaces it. `bool` is "is this an error" (picks the display color).
     status: Option<(String, bool)>,
     should_quit: bool,
+
+    /// What the pen and shape tools draw their *next* element in — set by `:color`,
+    /// remembered per-element once drawn (an element's own color never changes just
+    /// because this does). Overridden to white in `main()`'s `App` literal, since
+    /// `#[derive(Default)]` would otherwise zero it to black.
+    current_color: [f32; 3],
+    /// Whether the `:color picker` toggle is currently showing the interactive color
+    /// picker — see `handle_key_press`'s `Escape` arm (closes it in preference to
+    /// quitting) and `window_event`'s pointer handlers (suppress tool dispatch and
+    /// forward real input to egui while this is `true`).
+    color_picker_open: bool,
+    grid: GridSettings,
 }
 
 impl ApplicationHandler for App {
@@ -146,15 +159,18 @@ impl ApplicationHandler for App {
                 let scale_factor = window.scale_factor() as f32;
                 let preview = self.tools.active_tool().preview();
                 let active_tool_name = self.tools.active_tool().name();
+                let color_picker = self.color_picker_open.then_some(&mut self.current_color);
 
-                match renderer.render(
-                    &self.camera,
-                    &self.scene,
+                match renderer.render(Frame {
+                    camera: &self.camera,
+                    scene: &self.scene,
                     preview,
                     command_bar,
                     active_tool_name,
+                    grid: self.grid,
+                    color_picker,
                     scale_factor,
-                ) {
+                }) {
                     RenderOutcome::Rendered | RenderOutcome::Skipped => {}
                     RenderOutcome::NeedsReconfigure => {
                         let size = window.inner_size();
@@ -169,6 +185,21 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // While the color picker is open, a left click is for it, not the canvas
+                // — forwarded to egui below instead of dispatched to the active tool, so
+                // clicking the picker can't also draw underneath it.
+                if self.color_picker_open {
+                    let pos = screen_to_egui_points(self.last_cursor, window.scale_factor());
+                    renderer.push_egui_event(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: state == ElementState::Pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                    window.request_redraw();
+                    return;
+                }
+
                 let (width, height) = renderer.viewport_size();
                 let viewport = DVec2::new(width as f64, height as f64);
                 // Snapshot around the dispatch so a tool that commits something (a
@@ -183,6 +214,7 @@ impl ApplicationHandler for App {
                     camera: &self.camera,
                     scene: &mut self.scene,
                     viewport,
+                    color: self.current_color,
                 };
                 match state {
                     ElementState::Pressed => self
@@ -208,7 +240,11 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = DVec2::new(position.x, position.y);
-                if self.panning {
+                if self.color_picker_open {
+                    let pos = screen_to_egui_points(cursor, window.scale_factor());
+                    renderer.push_egui_event(egui::Event::PointerMoved(pos));
+                    window.request_redraw();
+                } else if self.panning {
                     self.camera.pan_by_screen_delta(cursor - self.last_cursor);
                     window.request_redraw();
                 } else {
@@ -218,6 +254,7 @@ impl ApplicationHandler for App {
                         camera: &self.camera,
                         scene: &mut self.scene,
                         viewport,
+                        color: self.current_color,
                     };
                     self.tools
                         .active_tool_mut()
@@ -244,6 +281,17 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// Converts a screen-space cursor position (physical pixels, winit's unit) to the
+/// logical-pixel "points" egui's `RawInput` events expect — same division by scale factor
+/// `RedrawRequested` already does for `screen_size_points`, just for one point instead of
+/// the whole viewport.
+fn screen_to_egui_points(cursor: DVec2, scale_factor: f64) -> egui::Pos2 {
+    egui::pos2(
+        (cursor.x / scale_factor) as f32,
+        (cursor.y / scale_factor) as f32,
+    )
 }
 
 /// What the command line would complete right now, if anything: the fixed text to keep
@@ -329,6 +377,10 @@ impl App {
             window.request_redraw();
         } else {
             match &event.logical_key {
+                Key::Named(NamedKey::Escape) if self.color_picker_open => {
+                    self.color_picker_open = false;
+                    window.request_redraw();
+                }
                 Key::Named(NamedKey::Escape) => event_loop.exit(),
                 Key::Character(text) if text.as_str() == ":" => {
                     self.command_line_active = true;
@@ -391,6 +443,9 @@ fn main() {
     let mut app = App {
         config,
         registry,
+        // `#[derive(Default)]` would otherwise zero this to black — see the field's doc
+        // comment.
+        current_color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
         ..Default::default()
     };
     event_loop.run_app(&mut app).expect("event loop error");

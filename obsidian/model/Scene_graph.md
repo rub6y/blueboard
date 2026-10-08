@@ -24,3 +24,10 @@ element from both the map and the [[RTree_index]]) and, via the `erase` module b
 top of it, `erase_circle` (subtracts a circular region from every element it touches —
 real segment/circle clipping on a flattened polyline, not just nearest-vertex removal —
 splitting strokes and shapes into whatever survives outside the circle).
+
+Each element now also carries a `color: [f32; 3]`, set by [[Command_registry]]'s
+`:color` command via [[Tool_registry]]'s `ToolContext`. `set_element_path` (the move
+commit) preserves an element's existing color rather than resetting it; `erase_circle`
+carries an erased element's color through to every surviving split piece. Undo/redo's
+`Snapshot` had to grow a color field too, for the same reason — without it, every undo
+would silently strip color back to default.

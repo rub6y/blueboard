@@ -190,6 +190,7 @@ version = "0.1.0"
 dependencies = [
  "blueboard-core",
  "blueboard-render",
+ "egui",
  "glam",
  "kurbo",
  "log",

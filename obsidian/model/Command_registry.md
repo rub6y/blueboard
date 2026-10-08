@@ -34,3 +34,8 @@ Tab-completion.
 whichever of the three selection-based tools is active deletes its own current selection;
 every other tool's default no-ops, reported back as "nothing selected."
 
+`:color <name|#hex|picker>` sets what the pen/shape tools draw their next element in
+(named palette + hex parsing in `blueboard-app/src/color.rs`), or toggles the
+interactive color picker — see [[Render_crate]]. `:grid <show|hide|bigger|smaller|
+number>` controls the reference grid's visibility and spacing.
+
