@@ -2,6 +2,28 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-08 — Pen smoothing fix + zoom raised to 400%
+- **Bug found by ruba** (side-by-side comparison with Miro, this time a near-horizontal
+  line specifically): blueboard's strokes showed visible staircase-like kinks that Miro's
+  didn't, even with the MSAA fix from earlier the same day. Root cause was different from
+  the earlier aliasing bug: real mouse/trackpad jitter (a pixel or two) was being recorded
+  on every `CursorMoved` event and handed to [[Fitting]] with a tight (1.5px) tolerance,
+  so the curve fitter faithfully reproduced the jitter as real direction changes in the
+  fitted path — worst-case visible on a horizontal line, where the jitter is the line's
+  entire vertical variation. Not a rendering/tessellation-resolution problem at all (ruled
+  out by the clean diagonal edges already confirmed in the earlier AA fix).
+- Fix, two parts, both in [[App_crate]]: (1) decimate raw pointer samples by screen-space
+  distance (2px) before they ever reach [[Fitting]], so near-stationary jitter is dropped
+  rather than recorded; (2) loosened the fit tolerance 1.5px -> 2.5px so the fitter smooths
+  over what jitter does get through, trading imperceptible positional fidelity for
+  smoothness.
+- [[Zoom_range]] raised from the brief's original 200% to 400% (`MAX_ZOOM` in
+  `blueboard-core/src/camera.rs`), after ruba compared directly against Miro's deeper zoom.
+  `MIN_ZOOM` (1%) left as-is.
+- Verified by drawing a synthetic jittery near-horizontal line via `xdotool` (±1px random
+  vertical noise) and confirming it renders smooth; verified 400% zoom by checking grid
+  spacing scaled exactly 4x after scrolling to the new clamp.
+
 ## 2026-10-08 — Phase 2 complete: vector pen
 - [[Fitting]] (`blueboard-core/src/fitting.rs`) fits raw pointer samples to a
   [[Bezier_curve]] path by wrapping them as a `kurbo::ParamCurveFit` source (a

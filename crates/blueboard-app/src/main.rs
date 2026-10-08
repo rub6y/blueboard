@@ -22,7 +22,17 @@ use winit::window::{Window, WindowId};
 /// is allowed to deviate from the raw pointer samples — see `planning/math.tex`'s curve
 /// fitting section. Converted to board-space units by dividing by the current zoom, so a
 /// stroke looks equally precise regardless of zoom level when it was drawn.
-const PEN_FIT_TOLERANCE_PX: f64 = 1.5;
+///
+/// Loose enough to smooth over a pixel or two of real mouse/trackpad jitter rather than
+/// faithfully reproducing it as visible kinks — tightening this past a couple of pixels
+/// trades smoothness for positional fidelity nobody can actually see.
+const PEN_FIT_TOLERANCE_PX: f64 = 2.5;
+
+/// Minimum screen-space distance between recorded raw pointer samples while drawing.
+/// Pointer-move events arrive far more densely than meaningful hand motion, so most of
+/// that density is jitter, not intent — decimating by distance (rather than keeping every
+/// event) stops that jitter from ever reaching the curve fitter as fake curvature.
+const PEN_MIN_SAMPLE_DISTANCE_PX: f64 = 2.0;
 
 #[derive(Default)]
 struct App {
@@ -35,6 +45,9 @@ struct App {
     /// Board-space points of the stroke currently being drawn, in order. Cleared (and
     /// fit to a curve, added to `scene`) when the pen is lifted.
     current_stroke: Vec<DVec2>,
+    /// Screen-space position of the last *recorded* sample in `current_stroke` (not
+    /// necessarily the last `CursorMoved` event — see [`PEN_MIN_SAMPLE_DISTANCE_PX`]).
+    last_sample_screen: DVec2,
     last_cursor: DVec2,
 }
 
@@ -97,6 +110,7 @@ impl ApplicationHandler for App {
                 self.drawing = state == ElementState::Pressed;
                 if self.drawing {
                     self.current_stroke.clear();
+                    self.last_sample_screen = self.last_cursor;
                     let (width, height) = renderer.viewport_size();
                     let viewport = DVec2::new(width as f64, height as f64);
                     self.current_stroke
@@ -126,11 +140,14 @@ impl ApplicationHandler for App {
                 if self.panning {
                     self.camera.pan_by_screen_delta(cursor - self.last_cursor);
                     window.request_redraw();
-                } else if self.drawing {
+                } else if self.drawing
+                    && cursor.distance(self.last_sample_screen) >= PEN_MIN_SAMPLE_DISTANCE_PX
+                {
                     let (width, height) = renderer.viewport_size();
                     let viewport = DVec2::new(width as f64, height as f64);
                     self.current_stroke
                         .push(self.camera.screen_to_board(cursor, viewport));
+                    self.last_sample_screen = cursor;
                     window.request_redraw();
                 }
                 self.last_cursor = cursor;
