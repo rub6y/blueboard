@@ -10,6 +10,7 @@
 use blueboard_core::camera::Camera;
 use blueboard_core::erase;
 use blueboard_core::fitting::fit_stroke;
+use blueboard_core::lasso;
 use blueboard_core::scene::Scene;
 use blueboard_render::ScenePreview;
 use glam::DVec2;
@@ -71,6 +72,16 @@ pub trait Tool {
 
     /// What to draw as a live, not-yet-committed preview right now, if anything.
     fn preview(&self) -> ScenePreview<'_>;
+
+    /// Removes whatever this tool currently has selected from `scene`, if anything, and
+    /// clears its own selection state — returns whether anything was actually removed, so
+    /// `DeleteCommand` (`commands.rs`) knows whether to report "nothing selected" instead
+    /// of silently doing nothing. Most tools have no notion of a standing selection and
+    /// no-op here; the selection-based tools (`select`, `select-rect`, `select-lasso`)
+    /// override it.
+    fn delete_selection(&mut self, _scene: &mut Scene) -> bool {
+        false
+    }
 }
 
 pub struct ToolRegistry {
@@ -94,6 +105,8 @@ impl ToolRegistry {
             Box::new(SelectionTool::default()),
             Box::new(EraserTool::default()),
             Box::new(EraserObjectTool::default()),
+            Box::new(SelectRectTool::default()),
+            Box::new(SelectLassoTool::default()),
         ];
         Self { tools, active: 0 }
     }
@@ -362,6 +375,16 @@ impl Tool for SelectionTool {
             None => ScenePreview::None,
         }
     }
+
+    fn delete_selection(&mut self, scene: &mut Scene) -> bool {
+        let Some(id) = self.selected.take() else {
+            return false;
+        };
+        self.selected_path = None;
+        self.drag = None;
+        self.dragging_path = None;
+        scene.remove_element(id)
+    }
 }
 
 /// Screen-space radius (converted to board-space the same way as every other tolerance in
@@ -470,5 +493,257 @@ impl EraserObjectTool {
         if let Some(id) = ctx.scene.hit_test(self.cursor, self.radius) {
             ctx.scene.remove_element(id);
         }
+    }
+}
+
+/// Shared state and behavior for a "select a group, then drag to move or delete it" tool
+/// — used by both [`SelectRectTool`] and [`SelectLassoTool`], which differ only in how a
+/// *fresh* selection region gets defined (a dragged rectangle vs. a freehand closed
+/// loop). Pulled out so the group-move/delete logic — itself a straightforward extension
+/// of [`SelectionTool`]'s single-element version — isn't duplicated between them.
+#[derive(Default)]
+struct GroupSelection {
+    selected: Vec<u64>,
+    /// Kept in sync with `selected` so `preview` can show every selected element's
+    /// current bounding box without needing scene access — same reasoning
+    /// `SelectionTool`'s `selected_path` field documents.
+    selected_paths: Vec<(u64, BezPath)>,
+    /// Set from pointer-down until release when dragging the group: the board-space point
+    /// grabbed at, and every selected element's id and path as grabbed — same
+    /// translate-from-the-fixed-original pattern `SelectionTool` uses, so float drift
+    /// can't accumulate over a long drag.
+    drag: Option<(DVec2, Vec<(u64, BezPath)>)>,
+    /// The in-progress dragged paths, recomputed each `on_pointer_move`; empty while not
+    /// dragging.
+    dragging_paths: Vec<(u64, BezPath)>,
+}
+
+impl GroupSelection {
+    /// If `screen_pos` hits an element that's already part of the selection, begins a
+    /// group-move drag and returns `true` — the caller shouldn't start defining a fresh
+    /// selection region this gesture. Otherwise clears the selection (a fresh region is
+    /// about to be drawn) and returns `false`.
+    fn begin(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) -> bool {
+        let board = ctx.screen_to_board(screen_pos);
+        let tolerance = SELECT_HIT_TOLERANCE_PX / ctx.camera.zoom;
+        let hit_already_selected = ctx
+            .scene
+            .hit_test(board, tolerance)
+            .is_some_and(|id| self.selected.contains(&id));
+        if hit_already_selected {
+            self.drag = Some((board, self.selected_paths.clone()));
+            return true;
+        }
+        self.selected.clear();
+        self.selected_paths.clear();
+        self.drag = None;
+        false
+    }
+
+    fn drag_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        let Some((anchor, originals)) = &self.drag else {
+            return;
+        };
+        let delta = ctx.screen_to_board(screen_pos) - *anchor;
+        let affine = Affine::translate((delta.x, delta.y));
+        self.dragging_paths = originals
+            .iter()
+            .map(|(id, path)| (*id, affine * path))
+            .collect();
+    }
+
+    fn commit_move(&mut self, ctx: &mut ToolContext) {
+        if self.drag.take().is_some() {
+            let paths = std::mem::take(&mut self.dragging_paths);
+            for (id, path) in &paths {
+                ctx.scene.set_element_path(*id, path.clone());
+            }
+            self.selected_paths = paths;
+        }
+    }
+
+    /// Replaces the selection with `ids`, reading each one's current path from the scene
+    /// — how a freshly-drawn marquee/lasso region becomes the new selection.
+    fn set_selected(&mut self, ctx: &ToolContext, ids: Vec<u64>) {
+        self.selected_paths = ids
+            .iter()
+            .filter_map(|&id| {
+                ctx.scene
+                    .element(id)
+                    .map(|element| (id, element.path.clone()))
+            })
+            .collect();
+        self.selected = ids;
+    }
+
+    fn preview(&self) -> ScenePreview<'_> {
+        let paths = if !self.dragging_paths.is_empty() {
+            &self.dragging_paths
+        } else {
+            &self.selected_paths
+        };
+        if paths.is_empty() {
+            ScenePreview::None
+        } else {
+            ScenePreview::MultiSelection(
+                paths.iter().map(|(_, path)| path.bounding_box()).collect(),
+            )
+        }
+    }
+
+    fn delete(&mut self, scene: &mut Scene) -> bool {
+        if self.selected.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for id in self.selected.drain(..) {
+            changed |= scene.remove_element(id);
+        }
+        self.selected_paths.clear();
+        self.drag = None;
+        self.dragging_paths.clear();
+        changed
+    }
+}
+
+/// Rectangle (marquee) multi-select: drag over empty space to select every element whose
+/// bounding box overlaps the dragged rectangle at all (touch selection, not containment —
+/// reuses `Scene::elements_in_viewport` directly, the same broad-phase query viewport
+/// culling already runs). Dragging from an already-selected element instead moves the
+/// whole group — see [`GroupSelection`].
+#[derive(Default)]
+pub struct SelectRectTool {
+    group: GroupSelection,
+    marquee_start: Option<DVec2>,
+    marquee_current: Option<DVec2>,
+}
+
+impl Tool for SelectRectTool {
+    fn name(&self) -> &'static str {
+        "select-rect"
+    }
+
+    fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        if self.group.begin(ctx, screen_pos) {
+            return;
+        }
+        let board = ctx.screen_to_board(screen_pos);
+        self.marquee_start = Some(board);
+        self.marquee_current = Some(board);
+    }
+
+    fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        if self.group.drag.is_some() {
+            self.group.drag_move(ctx, screen_pos);
+        } else if self.marquee_start.is_some() {
+            self.marquee_current = Some(ctx.screen_to_board(screen_pos));
+        }
+    }
+
+    fn on_pointer_up(&mut self, ctx: &mut ToolContext, _screen_pos: DVec2) {
+        if self.group.drag.is_some() {
+            self.group.commit_move(ctx);
+            return;
+        }
+        let (Some(start), Some(current)) = (self.marquee_start.take(), self.marquee_current.take())
+        else {
+            return;
+        };
+        let min = DVec2::new(start.x.min(current.x), start.y.min(current.y));
+        let max = DVec2::new(start.x.max(current.x), start.y.max(current.y));
+        let ids = ctx
+            .scene
+            .elements_in_viewport(min, max)
+            .map(|e| e.id)
+            .collect();
+        self.group.set_selected(ctx, ids);
+    }
+
+    fn preview(&self) -> ScenePreview<'_> {
+        if let (Some(start), Some(current)) = (self.marquee_start, self.marquee_current) {
+            return ScenePreview::Selection(kurbo::Rect::from_points(
+                (start.x, start.y),
+                (current.x, current.y),
+            ));
+        }
+        self.group.preview()
+    }
+
+    fn delete_selection(&mut self, scene: &mut Scene) -> bool {
+        self.group.delete(scene)
+    }
+}
+
+/// Minimum screen-space distance between recorded lasso points — same decimation
+/// reasoning as the pen tool's own `PEN_MIN_SAMPLE_DISTANCE_PX`, just for a selection
+/// gesture instead of a permanent stroke: pointer-move events arrive far denser than the
+/// loop shape actually needs, and this is a selection boundary, not ink, so there's no
+/// streamline-smoothing step to match the pen's.
+const LASSO_MIN_SAMPLE_DISTANCE_PX: f64 = 3.0;
+
+/// Lasso multi-select: draw a freehand closed loop over empty space to select every
+/// element the loop touches (see `blueboard_core::lasso`). Dragging from an
+/// already-selected element instead moves the whole group — see [`GroupSelection`].
+#[derive(Default)]
+pub struct SelectLassoTool {
+    group: GroupSelection,
+    /// Board-space points of the loop currently being drawn; cleared once it's finalized
+    /// into a selection (or abandoned by a plain click).
+    loop_points: Vec<DVec2>,
+    drawing: bool,
+    last_sample_screen: DVec2,
+}
+
+impl Tool for SelectLassoTool {
+    fn name(&self) -> &'static str {
+        "select-lasso"
+    }
+
+    fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        if self.group.begin(ctx, screen_pos) {
+            self.drawing = false;
+            self.loop_points.clear();
+            return;
+        }
+        self.drawing = true;
+        self.last_sample_screen = screen_pos;
+        self.loop_points.clear();
+        self.loop_points.push(ctx.screen_to_board(screen_pos));
+    }
+
+    fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        if self.group.drag.is_some() {
+            self.group.drag_move(ctx, screen_pos);
+            return;
+        }
+        if !self.drawing {
+            return;
+        }
+        if screen_pos.distance(self.last_sample_screen) >= LASSO_MIN_SAMPLE_DISTANCE_PX {
+            self.loop_points.push(ctx.screen_to_board(screen_pos));
+            self.last_sample_screen = screen_pos;
+        }
+    }
+
+    fn on_pointer_up(&mut self, ctx: &mut ToolContext, _screen_pos: DVec2) {
+        if self.group.drag.is_some() {
+            self.group.commit_move(ctx);
+            return;
+        }
+        self.drawing = false;
+        let ids = lasso::elements_touching_loop(ctx.scene, &self.loop_points);
+        self.group.set_selected(ctx, ids);
+        self.loop_points.clear();
+    }
+
+    fn preview(&self) -> ScenePreview<'_> {
+        if self.drawing && self.loop_points.len() >= 2 {
+            return ScenePreview::RawPoints(&self.loop_points);
+        }
+        self.group.preview()
+    }
+
+    fn delete_selection(&mut self, scene: &mut Scene) -> bool {
+        self.group.delete(scene)
     }
 }

@@ -46,6 +46,7 @@ impl CommandRegistry {
         registry.register(ClearCommand);
         registry.register(NewCommand);
         registry.register(ToolCommand);
+        registry.register(DeleteCommand);
         registry.register(UndoCommand);
         registry.register(RedoCommand);
         registry.register(HelpCommand);
@@ -214,6 +215,25 @@ impl Command for ToolCommand {
             Ok(format!("tool: {name}"))
         } else {
             Err(format!("unknown tool: {name}"))
+        }
+    }
+}
+
+/// Deletes whatever the active tool currently has selected — only the selection-based
+/// tools (`select`, `select-rect`, `select-lasso`) have anything to delete; every other
+/// tool's `Tool::delete_selection` default no-ops, which is reported back as an error
+/// here rather than silently succeeding.
+struct DeleteCommand;
+impl Command for DeleteCommand {
+    fn name(&self) -> &'static str {
+        "delete"
+    }
+
+    fn run(&self, app: &mut App, _args: &str) -> Result<String, String> {
+        if app.tools.active_tool_mut().delete_selection(&mut app.scene) {
+            Ok("deleted selection".to_string())
+        } else {
+            Err("nothing selected".to_string())
         }
     }
 }

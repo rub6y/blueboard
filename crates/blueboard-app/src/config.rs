@@ -48,10 +48,15 @@ fn default_keybindings() -> HashMap<String, String> {
         ("l", "tool line"),
         ("v", "tool select"),
         ("x", "tool eraser"),
+        ("d", "delete"),
         // Same "distinct literal character via Shift" trick as `u`/`U` below — not a
         // modifier binding, just the fact that winit reports Shift+x's logical key as the
         // literal `"X"`.
         ("X", "tool eraser-object"),
+        // `V`/`L` ("rectangle variant of select" / mnemonic "Lasso") — same Shift trick
+        // again, not related to lowercase `v`/`l`'s own tools beyond the mnemonic.
+        ("V", "tool select-rect"),
+        ("L", "tool select-lasso"),
         // `U` (redo) is just a distinct single character, not "shift+u" — with no
         // modifier support in this map, it works only because winit reports Shift+u's
         // logical key as the literal `"U"`, which the lookup in `main.rs` matches as-is.

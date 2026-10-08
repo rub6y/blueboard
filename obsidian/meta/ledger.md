@@ -2,6 +2,55 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Rectangle and lasso multi-select, plus `:delete`
+- Two new tools: `select-rect` (key `V`, marquee — drag over empty space selects every
+  element whose bounding box overlaps the dragged rectangle at all, reusing
+  `Scene::elements_in_viewport` directly) and `select-lasso` (key `L`, freehand closed
+  loop — selects every element the loop touches). Chosen over extending the existing
+  `select` tool, after asking: `select` stays exactly single-click-and-move, untouched.
+- New `blueboard-core` module `lasso.rs`: `elements_touching_loop(scene, loop_points)`, a
+  free function over `&Scene` (same shape as `erase::erase_circle` over `&mut Scene`, for
+  the same reason — a selection-tool feature built on the scene graph's public API, not a
+  core scene-graph operation itself). Standard ray-casting point-in-polygon test against
+  each candidate's *flattened* outline points (R-tree broad-phased by the loop's own
+  bounding box first). Documented one-directional approximation: an element that fully
+  contains the loop without any of its own points crossing into it is missed — accepted
+  the same way `hit_test`'s tie-breaking already is, not worth real polygon-clipping for a
+  selection gesture. The flattening helper itself (`flatten_to_points`) was pulled out of
+  `erase.rs` into a new shared `geometry.rs` module rather than duplicated.
+- Both new tools share their group-move/delete logic via a `GroupSelection` helper
+  (`tools.rs`) rather than duplicating it twice — the only thing that differs between them
+  is how a *fresh* selection region gets defined (dragged rectangle vs. freehand loop).
+  Dragging from an element *already* in the selection moves the whole group together
+  (same translate-from-the-fixed-original-on-release pattern `SelectionTool`'s
+  single-element move already uses); dragging from anywhere else starts a fresh
+  marquee/loop, replacing the old selection.
+- `Tool` gained a `delete_selection(&mut self, scene: &mut Scene) -> bool` method
+  (default no-op) and a new `:delete` command (default key `d`) calls it on whichever
+  tool is active — `SelectionTool` picked up the same lever for free (one trivial
+  override), not just the two new group tools. Goes through the existing
+  command-run-wrapped-in-a-scene-snapshot undo mechanism, so `:delete`/`d` is undoable
+  with no new history plumbing.
+- `blueboard-render` gained `ScenePreview::MultiSelection(Vec<Rect>)` — one bounding-box
+  outline per selected element, owned rather than borrowed since it's recomputed fresh
+  every frame (a group drag moves every box).
+- Four new `lasso.rs` unit tests (fully-inside, entirely-outside, boundary-crossing,
+  degenerate-loop) — all passing, 27 total in `blueboard-core`. `clippy`/`fmt --check`
+  clean.
+- **Verified by actually running the app** under the established Xvfb convention: drew
+  three separate rect shapes, marquee-selected two of them (screenshots show the
+  selection — though a selected rect's highlight box exactly coincides with its own
+  already-white outline in this theme, so it's not visually distinguishable from
+  "unselected" in a screenshot of rect shapes specifically; confirmed functionally via
+  delete/undo/move instead, which are unambiguous), deleted the group, undid the delete
+  (all three back), lasso-selected the third rect by drawing a loop around it, deleted it
+  too. Also specifically re-verified group-move (the first attempt accidentally grabbed a
+  rect's *interior* rather than its hit-testable outline, which `GroupSelection::begin`
+  correctly treated as "start a new selection" rather than "move" — not a bug, but worth
+  re-testing properly): dragging from exactly on a selected rect's edge moved both
+  selected rects together by an identical offset, confirmed by the two boxes' unchanged
+  relative spacing in the before/after screenshots.
+
 ## 2026-10-09 — Tab-completion extended to `:tool <name>`'s argument
 - [[Tool_registry]] gained `completions(prefix)`, mirroring [[Command_registry]]'s — tool
   names starting with `prefix`.

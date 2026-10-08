@@ -30,3 +30,7 @@ The command registry also answers `completions(prefix)` — every command name s
 with `prefix`, paired with its usage hint — which drives the [[Command_line]]'s
 Tab-completion.
 
+`:delete` (key `d`) calls the active [[Tool_registry|tool]]'s `delete_selection` —
+whichever of the three selection-based tools is active deletes its own current selection;
+every other tool's default no-ops, reported back as "nothing selected."
+

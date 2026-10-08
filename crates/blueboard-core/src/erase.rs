@@ -13,8 +13,9 @@
 //! they're no longer a closed shape.
 
 use glam::DVec2;
-use kurbo::{BezPath, PathEl, Point};
+use kurbo::{BezPath, Point};
 
+use crate::geometry::flatten_to_points;
 use crate::scene::Scene;
 
 /// Flattening tolerance (board-space) for turning an element's Bezier path into a polyline
@@ -59,7 +60,7 @@ pub fn erase_circle(scene: &mut Scene, center: DVec2, radius: f64) -> bool {
 /// id). `Some(pieces)` otherwise — `pieces` is every remaining fragment, possibly empty if
 /// the whole element was inside the circle.
 fn clip_path_outside_circle(path: &BezPath, center: Point, radius: f64) -> Option<Vec<BezPath>> {
-    let (points, closed) = flatten_to_points(path);
+    let (points, closed) = flatten_to_points(path, ERASE_FLATTEN_TOLERANCE);
     if points.len() < 2 {
         return None;
     }
@@ -79,21 +80,6 @@ fn clip_path_outside_circle(path: &BezPath, center: Point, radius: f64) -> Optio
             .map(|run| path_from_points(&run))
             .collect(),
     )
-}
-
-/// Flattens `path` into its vertices (board-space) and whether it was closed. Assumes a
-/// single sub-path, which is all [`crate::scene::Scene`] elements ever are (one `MoveTo`,
-/// then `LineTo`/`QuadTo`/`CurveTo`, optionally one trailing `ClosePath`).
-fn flatten_to_points(path: &BezPath) -> (Vec<Point>, bool) {
-    let mut points = Vec::new();
-    let mut closed = false;
-    kurbo::flatten(path.iter(), ERASE_FLATTEN_TOLERANCE, |el| match el {
-        PathEl::MoveTo(p) | PathEl::LineTo(p) => points.push(p),
-        PathEl::ClosePath => closed = true,
-        // `flatten`'s callback only ever emits the three variants above.
-        PathEl::QuadTo(..) | PathEl::CurveTo(..) => unreachable!(),
-    });
-    (points, closed)
 }
 
 fn is_inside(p: Point, center: Point, radius: f64) -> bool {

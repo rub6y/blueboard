@@ -128,6 +128,11 @@ pub enum ScenePreview<'a> {
         center: DVec2,
         radius: f64,
     },
+    /// The rectangle/lasso multi-select tools' selected-group indicator: one bounding-box
+    /// outline per selected element, same plain-outline treatment as `Selection` — owned
+    /// rather than borrowed since these are recomputed fresh each frame (a group drag
+    /// moves every box), not references into the tool's own stored state.
+    MultiSelection(Vec<kurbo::Rect>),
 }
 
 #[repr(C)]
@@ -800,6 +805,14 @@ impl Renderer {
                     erase_cursor_vertices(center, radius),
                     &self.preview_pipeline,
                 ),
+                ScenePreview::MultiSelection(rects) => {
+                    let verts = rects
+                        .iter()
+                        .copied()
+                        .flat_map(selection_rect_vertices)
+                        .collect();
+                    (verts, &self.preview_pipeline)
+                }
             };
         let (preview_buffer, preview_count) =
             self.upload_vertices("preview vertices", &preview_vertices);

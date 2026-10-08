@@ -4,10 +4,16 @@ The tool registry is a central table of drawing tools, each implementing one `To
 trait.
 
 The tool registry holds the [[Vector_pen]] (Phase 2), rect/ellipse/line shape tools, a
-select/move tool (see [[Scene_graph]]'s `hit_test` and `set_element_path`), and, as of
-Phase 5's eraser work, two eraser tools: `eraser` (partial — subtracts a circular region
-from whatever it passes over, via [[Scene_graph]]'s `erase_circle`) and `eraser-object`
-(whole-element — `hit_test` plus `remove_element`) — text is still a future tool.
+select/move tool (see [[Scene_graph]]'s `hit_test` and `set_element_path`), two eraser
+tools (`eraser` partial / `eraser-object` whole-element), and two multi-select tools:
+`select-rect` (marquee, reuses `Scene::elements_in_viewport`) and `select-lasso`
+(freehand closed loop, see `blueboard_core::lasso`) — text is still a future tool.
+
+`select-rect` and `select-lasso` share their group-move/delete logic via a
+`GroupSelection` helper in `tools.rs`, differing only in how a fresh selection region
+gets defined. `Tool` itself gained `delete_selection` (default no-op, overridden by all
+three selection-based tools) so a single `:delete` command (key `d`) works across all of
+them without each needing its own delete command.
 
 The tool registry follows the same addon-friendly pattern as the [[Command_registry]], but
 a `Tool` is given a `ToolContext` (camera + scene only), not `&mut App` — tools never need

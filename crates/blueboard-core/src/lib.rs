@@ -4,5 +4,7 @@ pub mod camera;
 pub mod erase;
 pub mod file_format;
 pub mod fitting;
+mod geometry;
 pub mod history;
+pub mod lasso;
 pub mod scene;

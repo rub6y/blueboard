@@ -41,6 +41,7 @@ that's the one built-in command whose argument has a fixed, known vocabulary.
 | `:clear` | `:clear` | Deletes every element on the board. |
 | `:new` | `:new` | Same as `:clear` — there's no concept of multiple open boards yet. |
 | `:tool` | `:tool <name>` | Switches the active tool by name (see the Tools table below). |
+| `:delete` | `:delete` | Deletes whatever the active tool currently has selected (works with `select`, `select-rect`, `select-lasso`; errors "nothing selected" with any other tool, or none). |
 | `:undo` | `:undo` | Steps back one edit. |
 | `:redo` | `:redo` | Re-applies an edit just undone. |
 | `:help` | `:help` | Lists every command and its usage hint, one line, in the command bar. |
@@ -65,13 +66,20 @@ switching.
 | Select | `select` | `v` | Click an element's outline to select it (shown as a bounding-box outline); drag to move it. Click empty space to deselect. |
 | Eraser (partial) | `eraser` | `x` | Drag a circular eraser over the board. Subtracts exactly the circled region from whatever it passes over — a stroke erased in the middle splits into two pieces; a closed shape (rect/ellipse) partially erased becomes an open arc; fully circled, an element disappears entirely. Shows a circle-outline cursor at the eraser's size. |
 | Eraser (whole object) | `eraser-object` | `X` (Shift+x) | Click or drag over elements to delete them whole — same outline-click targeting as Select, but deletes instead of selecting. |
+| Select (rectangle) | `select-rect` | `V` (Shift+v) | Drag over empty space to select every element whose bounding box overlaps the dragged rectangle at all (touching counts, not just fully enclosed). Drag from an already-selected element instead to move the whole group together. |
+| Select (lasso) | `select-lasso` | `L` (Shift+l) | Draw a freehand closed loop over empty space to select every element the loop touches. Drag from an already-selected element instead to move the whole group together. |
 
 Shape tools (rect/ellipse/line) commit nothing on a plain click with no drag (a
 zero-length shape is silently skipped). A click with the pen needs at least two recorded
 points to produce a stroke, for the same reason.
 
 Both erasers mutate the board live as you drag — there's no separate "commit" step — but
-the whole drag still collapses into a single `:undo` step.
+the whole drag still collapses into a single `:undo` step. The two multi-select tools work
+the same way: a plain click (no drag) with nothing already selected just clears the
+selection, same as clicking empty space with `select`.
+
+Any of `select`/`select-rect`/`select-lasso`'s current selection can be removed with
+`:delete` (key `d`).
 
 ## Keybindings
 
@@ -89,7 +97,10 @@ they just match the distinct character winit reports for Shift+<key>.
 | `l` | `:tool line` |
 | `v` | `:tool select` |
 | `x` | `:tool eraser` |
+| `d` | `:delete` |
 | `X` | `:tool eraser-object` |
+| `V` | `:tool select-rect` |
+| `L` | `:tool select-lasso` |
 | `u` | `:undo` |
 | `U` | `:redo` |
 
