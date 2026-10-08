@@ -87,6 +87,18 @@ impl CommandRegistry {
         }
     }
 
+    /// Commands whose name starts with `prefix`, as `(name, usage)` pairs — same data
+    /// `help_text` prints, filtered. Used by the command line's Tab-completion; kept here
+    /// rather than in `blueboard-render` so `CommandRegistry` doesn't need a dependency on
+    /// render-crate presentation types just to answer "what matches so far."
+    pub fn completions(&self, prefix: &str) -> Vec<(&'static str, &'static str)> {
+        self.commands
+            .iter()
+            .filter(|command| command.name().starts_with(prefix))
+            .map(|command| (command.name(), command.usage()))
+            .collect()
+    }
+
     pub fn run(&self, app: &mut App, name: &str, args: &str) -> Result<String, String> {
         match self.commands.iter().find(|command| command.name() == name) {
             // Intercepted before reaching `HelpCommand::run` — see `help_text`'s doc

@@ -26,3 +26,7 @@ arguments.
 myboard`) and appends it automatically, unless the given name already ends with `.bbd` —
 so `:save foo` and `:open foo` refer to the same `foo.bbd` file.
 
+The command registry also answers `completions(prefix)` — every command name starting
+with `prefix`, paired with its usage hint — which drives the [[Command_line]]'s
+Tab-completion.
+

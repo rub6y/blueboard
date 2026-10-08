@@ -47,6 +47,12 @@ struct App {
     command_line_active: bool,
     /// Everything typed after `:` so far.
     command_line_text: String,
+    /// Which Tab-completion candidate (from `registry.completions`, filtered by
+    /// `command_line_text`) is currently highlighted, if any. Reset to `None` whenever the
+    /// user types or backspaces directly, so a fresh prefix always starts unselected — a
+    /// stale index would otherwise point at an unrelated candidate once the match set
+    /// changes underneath it.
+    command_completion_index: Option<usize>,
     /// The last command's result, shown in the command bar until the next command
     /// replaces it. `bool` is "is this an error" (picks the display color).
     status: Option<(String, bool)>,
@@ -110,9 +116,23 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                // Only the command *name* (text before the first space) completes — once
+                // a space is typed the user is onto arguments, which aren't completed.
+                let completions: Vec<blueboard_render::Completion> =
+                    if self.command_line_active && !self.command_line_text.contains(' ') {
+                        self.registry
+                            .completions(&self.command_line_text)
+                            .into_iter()
+                            .map(|(name, usage)| blueboard_render::Completion { name, usage })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                 let command_bar = if self.command_line_active {
                     CommandBarContent::Editing {
                         text: &self.command_line_text,
+                        completions: &completions,
+                        selected: self.command_completion_index,
                     }
                 } else if let Some((message, is_error)) = &self.status {
                     CommandBarContent::Status {
@@ -124,12 +144,14 @@ impl ApplicationHandler for App {
                 };
                 let scale_factor = window.scale_factor() as f32;
                 let preview = self.tools.active_tool().preview();
+                let active_tool_name = self.tools.active_tool().name();
 
                 match renderer.render(
                     &self.camera,
                     &self.scene,
                     preview,
                     command_bar,
+                    active_tool_name,
                     scale_factor,
                 ) {
                     RenderOutcome::Rendered | RenderOutcome::Skipped => {}
@@ -245,11 +267,30 @@ impl App {
                 }
                 Key::Named(NamedKey::Backspace) => {
                     self.command_line_text.pop();
+                    self.command_completion_index = None;
+                }
+                Key::Named(NamedKey::Tab) => {
+                    // Only the command name (no space typed yet) has anything to
+                    // complete — matches `RedrawRequested`'s same check for what to show.
+                    if !self.command_line_text.contains(' ') {
+                        let candidates = self.registry.completions(&self.command_line_text);
+                        if !candidates.is_empty() {
+                            let next = match self.command_completion_index {
+                                Some(i) => (i + 1) % candidates.len(),
+                                None => 0,
+                            };
+                            self.command_completion_index = Some(next);
+                            self.command_line_text = candidates[next].0.to_string();
+                        }
+                    }
                 }
                 _ => {
                     if let Some(text) = &event.text {
-                        self.command_line_text
-                            .extend(text.chars().filter(|c| !c.is_control()));
+                        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                        if !typed.is_empty() {
+                            self.command_line_text.push_str(&typed);
+                            self.command_completion_index = None;
+                        }
                     }
                 }
             }
@@ -260,6 +301,7 @@ impl App {
                 Key::Character(text) if text.as_str() == ":" => {
                     self.command_line_active = true;
                     self.command_line_text.clear();
+                    self.command_completion_index = None;
                     window.request_redraw();
                 }
                 Key::Character(text) => {

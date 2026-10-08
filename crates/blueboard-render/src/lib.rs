@@ -77,13 +77,28 @@ impl From<ThemeColors> for ThemeUniform {
     }
 }
 
+/// One command-line Tab-completion candidate: a command's name and usage hint, the same
+/// pair `:help` lists — a small named struct rather than a bare tuple so the UI code
+/// doesn't have to remember which element is which.
+pub struct Completion {
+    pub name: &'static str,
+    pub usage: &'static str,
+}
+
 /// What the `:`-command bar should show this frame — built from `blueboard-app`'s input
 /// state, analogous to [`ScenePreview`] for the active tool.
 pub enum CommandBarContent<'a> {
     /// Not in command mode and no status to show.
     Hidden,
-    /// Actively typing a command; `text` is everything after the `:`.
-    Editing { text: &'a str },
+    /// Actively typing a command; `text` is everything after the `:`. `completions` is
+    /// every registered command matching what's been typed so far (filtered live, not
+    /// only after Tab — qutebrowser-style discoverability), and `selected` is which one
+    /// Tab has cycled to, if any.
+    Editing {
+        text: &'a str,
+        completions: &'a [Completion],
+        selected: Option<usize>,
+    },
     /// The result of the last command, shown until replaced by the next one.
     Status { message: &'a str, is_error: bool },
 }
@@ -326,14 +341,25 @@ fn create_msaa_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+/// Bar height with no completion row showing.
+const COMMAND_BAR_HEIGHT: f32 = 24.0;
+/// Extra height given to the completion row, shown above the input line while a typed
+/// command prefix matches at least one registered command.
+const COMPLETION_ROW_HEIGHT: f32 = 20.0;
+
 /// Lay out the command bar as a thin bottom panel and return what egui produced —
 /// shapes to tessellate and any texture updates (the font atlas, the first time text is
 /// drawn). Pure UI description; no wgpu here.
+///
+/// Always drawn, even with `content: Hidden` — `active_tool_name` on its left makes the
+/// bar a persistent status line (which tool is active), the same idea as vim's own bottom
+/// status line always being present, not just when a command is being typed.
 fn run_command_bar_ui(
     ctx: &egui::Context,
     viewport_size: (u32, u32),
     scale_factor: f32,
     content: &CommandBarContent<'_>,
+    active_tool_name: &str,
 ) -> egui::FullOutput {
     let screen_size_points = egui::vec2(
         viewport_size.0 as f32 / scale_factor,
@@ -347,28 +373,60 @@ fn run_command_bar_ui(
         ..Default::default()
     };
 
-    ctx.run_ui(raw_input, |ui| {
-        if matches!(content, CommandBarContent::Hidden) {
-            return;
+    let completions = match content {
+        CommandBarContent::Editing { completions, .. } if !completions.is_empty() => {
+            Some(*completions)
         }
+        _ => None,
+    };
+    let bar_height = COMMAND_BAR_HEIGHT + completions.map_or(0.0, |_| COMPLETION_ROW_HEIGHT);
+
+    ctx.run_ui(raw_input, |ui| {
         // egui 0.36 unified Top/Bottom/Left/RightPanel into one `Panel` type;
         // `Panel::bottom` is the constructor that used to be `TopBottomPanel::bottom`.
         egui::Panel::bottom("command_bar")
-            .exact_size(24.0)
+            .exact_size(bar_height)
             .show(ui, |ui| {
-                ui.centered_and_justified(|ui| match content {
-                    CommandBarContent::Hidden => {}
-                    CommandBarContent::Editing { text } => {
-                        ui.monospace(format!(":{text}"));
-                    }
-                    CommandBarContent::Status { message, is_error } => {
-                        let color = if *is_error {
-                            egui::Color32::from_rgb(255, 120, 120)
-                        } else {
-                            egui::Color32::WHITE
+                ui.vertical(|ui| {
+                    if let Some(completions) = completions {
+                        let selected = match content {
+                            CommandBarContent::Editing { selected, .. } => *selected,
+                            _ => None,
                         };
-                        ui.colored_label(color, *message);
+                        ui.horizontal(|ui| {
+                            for (i, completion) in completions.iter().enumerate() {
+                                let label = if completion.usage.is_empty() {
+                                    completion.name.to_string()
+                                } else {
+                                    format!("{} {}", completion.name, completion.usage)
+                                };
+                                let color = if Some(i) == selected {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::GRAY
+                                };
+                                ui.colored_label(color, label);
+                            }
+                        });
                     }
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::GRAY, active_tool_name);
+                        ui.separator();
+                        match content {
+                            CommandBarContent::Hidden => {}
+                            CommandBarContent::Editing { text, .. } => {
+                                ui.monospace(format!(":{text}"));
+                            }
+                            CommandBarContent::Status { message, is_error } => {
+                                let color = if *is_error {
+                                    egui::Color32::from_rgb(255, 120, 120)
+                                } else {
+                                    egui::Color32::WHITE
+                                };
+                                ui.colored_label(color, *message);
+                            }
+                        }
+                    });
                 });
             });
     })
@@ -669,6 +727,7 @@ impl Renderer {
         scene: &Scene,
         preview: ScenePreview<'_>,
         command_bar: CommandBarContent<'_>,
+        active_tool_name: &str,
         scale_factor: f32,
     ) -> RenderOutcome {
         // `get_current_texture` returns an enum rather than a `Result` as of wgpu 30 — the
@@ -803,6 +862,7 @@ impl Renderer {
             (self.config.width, self.config.height),
             scale_factor,
             &command_bar,
+            active_tool_name,
         );
         let clipped_primitives = self
             .egui_ctx

@@ -14,11 +14,23 @@ A log is written to both stderr and `$XDG_STATE_HOME/blueboard/blueboard.log` (f
 to `~/.local/state/...`), including a line on clean quit — useful for telling a deliberate
 exit apart from a crash.
 
+## The command bar
+
+Always visible at the bottom of the window. Its left side permanently shows the **active
+tool's name** — it doubles as a status line, not just a place to type commands.
+
 ## The command line
 
 Press `:` to open it (vim-style), type a command, Enter to run it, Escape to cancel. The
 bar also shows the result (or error) of the last command run until the next one replaces
 it.
+
+**Tab-completion**: as soon as what you've typed (before any space) matches one or more
+command names, they're listed above the input — live, updating as you type, not only
+after pressing Tab. Press Tab to cycle a highlighted selection through the matches
+(wrapping back to the first after the last); the input fills with whatever's highlighted,
+so Enter then runs it. Only the command *name* completes — once you've typed a space onto
+arguments, completion stops.
 
 | Command | Usage | What it does |
 |---|---|---|

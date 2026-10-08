@@ -2,6 +2,37 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Command-line Tab-completion + persistent tool-name status
+- [[Command_registry]] gained `completions(prefix)`, returning every registered command
+  whose name starts with `prefix` as `(name, usage)` pairs — same data `:help` prints,
+  filtered. Kept in `blueboard-app`'s `commands.rs` rather than `blueboard-render`, so the
+  registry doesn't need a dependency on render-crate presentation types just to answer
+  "what matches so far."
+- [[Command_line]] now shows live, qutebrowser-style completions: as soon as a command
+  name prefix (text before the first space) matches one or more commands, they're listed
+  above the input, re-filtered every frame — not only after pressing Tab. Tab cycles a
+  highlighted selection through that list (wrapping around) and fills the input with it;
+  Enter still just runs whatever's in the input, unchanged. Typing or Backspace resets the
+  highlight (a stale index would otherwise point at an unrelated candidate once the match
+  set changes underneath it). Once a space is typed (onto arguments), completion stops —
+  only the command name itself completes.
+- The command bar is now always drawn, not only while composing/showing a status — its
+  left side permanently shows the active tool's name, functioning as a persistent status
+  line (same idea as vim's own bottom status line) rather than something that only
+  appears on demand. [[Render_crate]]'s `CommandBarContent::Editing` gained `completions`
+  and `selected` fields; `Renderer::render` gained an `active_tool_name` parameter.
+- Verified by actually running the app under the established Xvfb convention: screenshots
+  confirm the tool name updates immediately on switching tools even with the bar otherwise
+  idle, typing `:s` shows exactly the one matching command (`save [name]`) live before any
+  Tab press, pressing Tab fills the input to `:save`, and `:u` matches only `undo` (not
+  itself, since `u` isn't a registered command name). `cargo test`/`clippy`/`fmt --check`
+  all clean.
+- **Harness note, not a project finding**: `pkill` (not `kill <pid>`) reliably hangs/kills
+  this session's sandboxed shell outright when used to clean up the Xvfb/app processes
+  between test runs — no error text, the whole command just never completes. Plain `kill
+  <pid>` on a specific PID works fine. Recorded here since it cost real time working out
+  during this session and will otherwise resurface in any future Xvfb-based verification.
+
 ## 2026-10-09 — Phase 5 (partial): two eraser tools
 - [[Tool_registry]] gained two eraser tools: `eraser` (key `x`, partial — subtracts a
   circular region from whatever it passes over, splitting strokes/shapes rather than
