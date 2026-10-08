@@ -2,6 +2,38 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-08 — Streamline smoothing, crash resilience, logging
+- Follow-up to the pen smoothing fix below: a *second* comparison against Miro, zoomed in
+  past where a stroke was drawn, still showed small regular kinks — decimation thins point
+  density but doesn't touch the position of points that survive, so jitter was still baked
+  into each recorded sample, just invisible until zoomed in far enough. Researched how
+  open-source tools solve this; found [[Perfect_freehand]] (used by tldraw, Excalidraw) and
+  adopted its "streamline" idea — an exponential moving average pulling each new point
+  toward a running average before decimation/fitting. Confirmed fixed: same jittery test
+  line, zoomed to the level that showed kinks before, now smooth.
+- Developed on a branch (`experiment/pen-streamline-smoothing`) specifically so alternative
+  smoothing strategies could be tried if this one hadn't worked.
+- **Crash resilience**, prompted by ruba reporting the app "sometimes crashes for no
+  reason": found that wgpu's default behavior for an uncaptured device error is to treat
+  it as fatal and panic the whole process — confirmed by Phase 1's shader bug, whose log
+  had literally read "Handling wgpu errors as fatal by default" right before crashing.
+  Installed `on_uncaptured_error` and `set_device_lost_callback` handlers that log instead
+  of panicking, and replaced stroke tessellation's `.expect(...)` with a graceful
+  skip-and-log (one malformed stroke now drops just that stroke, not the whole app).
+- **Logging**: added a small dual-sink logger (`blueboard-app/src/logging.rs`) writing to
+  both stderr and `$XDG_STATE_HOME/blueboard/blueboard.log`, plus a panic hook appending to
+  the same file — a GUI app's stderr is easy to lose (closed terminal, launched from a
+  desktop icon), exactly the situation "why did it crash" needs answered.
+- **Verification-methodology finding**: a background test process logged a committed
+  stroke before any synthetic input had been sent to it. Root cause: test processes were
+  launched on `DISPLAY=:0`, ruba's actual live desktop session, not an isolated display —
+  real mouse activity on the shared display can land on a test window. This most likely
+  also explains the earlier "stale content in screenshots" mystery from Phase 2's first
+  bug hunt, previously (incorrectly) suspected to be compositor caching. Logged here so
+  future "verified by running" claims in this project are read with that caveat.
+- Added `planning/phase2_explained.tex` (companion to Phase 1's, same format) covering the
+  fitting/scene-graph/tessellation code and all three Phase 2 bug hunts.
+
 ## 2026-10-08 — Pen smoothing fix + zoom raised to 400%
 - **Bug found by ruba** (side-by-side comparison with Miro, this time a near-horizontal
   line specifically): blueboard's strokes showed visible staircase-like kinks that Miro's
