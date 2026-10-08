@@ -2,6 +2,49 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Phase 5 (partial): two eraser tools
+- [[Tool_registry]] gained two eraser tools: `eraser` (key `x`, partial — subtracts a
+  circular region from whatever it passes over, splitting strokes/shapes rather than
+  deleting them whole) and `eraser-object` (key `X`, whole-element — same `hit_test`
+  outline-click [[Selection_tool]] uses, but deletes instead of selecting).
+- New `blueboard-core` module `erase.rs`: real segment/circle clipping geometry, not just
+  nearest-vertex removal — flattens an element's `BezPath` to a polyline (`kurbo::flatten`),
+  walks it computing exact segment-circle intersection points, and splits into the runs that
+  survive outside the circle. A closed shape (rect/ellipse) that's partially erased
+  correctly becomes an open arc chain (rotates the vertex list to an outside point first, so
+  the loop can be cut open without losing geometry, then re-joins the first/last resulting
+  runs if the cut's far side is actually one continuous piece); fully circled, it disappears
+  entirely. [[Scene_graph]] gained `remove_element` (map + R-tree removal) for both the
+  object eraser and `erase.rs`'s remove-then-reinsert-the-pieces step.
+- Both tools mutate the scene directly on every `on_pointer_down`/`on_pointer_move` while
+  dragging, unlike the selection tool's preview-then-commit-on-release — there's no
+  ambiguous in-progress state to roll back for an eraser, so there's nothing to gain by
+  waiting for release. `main.rs` still only snapshots once around the whole pointer-down..up
+  span (confirmed by re-reading it, not assumed), so a multi-element erase drag still
+  collapses to one undo step for free, same mechanism the selection tool already relies on.
+- [[Render_crate]] gained `ScenePreview::EraseCursor { center, radius }` — a circle outline
+  (32-segment `LineList`, same preview pipeline as `Selection`) showing both what's about to
+  be erased and, for the partial eraser, exactly how big a bite the next erase will take.
+- Five new `erase.rs` unit tests (line split in two, full removal, untouched-when-nowhere-
+  near, closed-shape partial erase leaves one open arc, closed-shape full removal) — all
+  passing, 23 total in `blueboard-core`. `cargo clippy --all-targets` clean.
+- **Verified by actually running the app** under the established Xvfb convention (not
+  `DISPLAY=:0`). One new wrinkle this session, worth recording since it cost real time: a
+  plain `nix-shell -p xorg.xvfb xdotool imagemagick --run "... nix develop -c ..."` (nested
+  nix invocations, everything backgrounded with `&` inside the `--run` string) reliably
+  hung or produced a blank capture — `./target/debug/blueboard` run bare (outside `nix
+  develop`) also crashes immediately for a different reason, missing `libxkbcommon-x11.so`
+  at dlopen time, because the X11 runtime libs only exist on `nix develop`'s
+  `LD_LIBRARY_PATH`, not on a bare Xvfb/xdotool `nix-shell -p` shell. What actually worked:
+  resolve `Xvfb`/`xdotool`/`import`'s store paths once via `nix-shell -p ... --run 'which
+  ...'`, then call those paths directly (no further nix-shell nesting) alongside `nix
+  develop -c ./target/debug/blueboard`, with `timeout` wrapping both the X server and the
+  app instead of relying on background PIDs + manual `kill`. Confirmed visually, not just
+  by log lines: screenshots at each step show the rectangle's corner cleanly notched out by
+  the partial eraser (the two edges no longer meet), two separate lines with only the
+  clicked one removed by the object eraser, and an empty board after two undos (proving the
+  partial erase's scene mutation really did collapse to one real undo step, not zero or two).
+
 ## 2026-10-08 — `:help` command
 - [[Command_registry]] gained `:help`, listing every registered command and its usage
   hint on one line (fits the command bar's fixed single-line height — no render-crate

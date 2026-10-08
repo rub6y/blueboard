@@ -8,6 +8,7 @@
 //! the kind of whole-self borrow conflict `commands.rs`/`main.rs` had to work around.
 
 use blueboard_core::camera::Camera;
+use blueboard_core::erase;
 use blueboard_core::fitting::fit_stroke;
 use blueboard_core::scene::Scene;
 use blueboard_render::ScenePreview;
@@ -91,6 +92,8 @@ impl ToolRegistry {
             Box::new(ShapeTool::ellipse()),
             Box::new(ShapeTool::line()),
             Box::new(SelectionTool::default()),
+            Box::new(EraserTool::default()),
+            Box::new(EraserObjectTool::default()),
         ];
         Self { tools, active: 0 }
     }
@@ -346,6 +349,115 @@ impl Tool for SelectionTool {
         match self.dragging_path.as_ref().or(self.selected_path.as_ref()) {
             Some(path) => ScenePreview::Selection(path.bounding_box()),
             None => ScenePreview::None,
+        }
+    }
+}
+
+/// Screen-space radius (converted to board-space the same way as every other tolerance in
+/// this file) of the partial eraser's circle — wide enough to feel like an actual eraser
+/// rather than a pin-point, narrow enough not to take out unrelated nearby strokes.
+const ERASER_RADIUS_PX: f64 = 10.0;
+
+/// Partial eraser: subtracts a circular region from whatever strokes/shapes it passes over
+/// (`blueboard_core::erase`), splitting them rather than deleting them whole. Mutates the
+/// scene directly on every `on_pointer_down`/`on_pointer_move` while dragging — unlike the
+/// selection tool, there's no "preview then commit" step to get right, since erasing has no
+/// ambiguous in-progress state to roll back if the drag were abandoned (it can't be; there's
+/// no cancel gesture for a drag already in flight). `main.rs` still only snapshots once
+/// around the whole pointer-down..up span, so a multi-element erase drag collapses to one
+/// undo step, same as `SelectionTool`'s move.
+#[derive(Default)]
+pub struct EraserTool {
+    erasing: bool,
+    /// Last-known board-space cursor position, kept even while not erasing so `preview` has
+    /// something to draw the moment the tool becomes active (before any drag starts).
+    cursor: DVec2,
+    radius: f64,
+}
+
+impl EraserTool {
+    fn update_cursor(&mut self, ctx: &ToolContext, screen_pos: DVec2) {
+        self.cursor = ctx.screen_to_board(screen_pos);
+        self.radius = ERASER_RADIUS_PX / ctx.camera.zoom;
+    }
+}
+
+impl Tool for EraserTool {
+    fn name(&self) -> &'static str {
+        "eraser"
+    }
+
+    fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        self.erasing = true;
+        self.update_cursor(ctx, screen_pos);
+        erase::erase_circle(ctx.scene, self.cursor, self.radius);
+    }
+
+    fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        self.update_cursor(ctx, screen_pos);
+        if self.erasing {
+            erase::erase_circle(ctx.scene, self.cursor, self.radius);
+        }
+    }
+
+    fn on_pointer_up(&mut self, _ctx: &mut ToolContext, _screen_pos: DVec2) {
+        self.erasing = false;
+    }
+
+    fn preview(&self) -> ScenePreview<'_> {
+        ScenePreview::EraseCursor {
+            center: self.cursor,
+            radius: self.radius,
+        }
+    }
+}
+
+/// Whole-object eraser: removes entire elements it passes over, via the same
+/// `hit_test`-by-outline `SelectionTool` uses to pick a click target, except every
+/// candidate it touches is deleted rather than just the nearest one selected.
+#[derive(Default)]
+pub struct EraserObjectTool {
+    erasing: bool,
+    cursor: DVec2,
+    radius: f64,
+}
+
+impl Tool for EraserObjectTool {
+    fn name(&self) -> &'static str {
+        "eraser-object"
+    }
+
+    fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        self.erasing = true;
+        self.erase_at(ctx, screen_pos);
+    }
+
+    fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        self.cursor = ctx.screen_to_board(screen_pos);
+        self.radius = SELECT_HIT_TOLERANCE_PX / ctx.camera.zoom;
+        if self.erasing {
+            self.erase_at(ctx, screen_pos);
+        }
+    }
+
+    fn on_pointer_up(&mut self, _ctx: &mut ToolContext, _screen_pos: DVec2) {
+        self.erasing = false;
+    }
+
+    fn preview(&self) -> ScenePreview<'_> {
+        ScenePreview::EraseCursor {
+            center: self.cursor,
+            radius: self.radius,
+        }
+    }
+}
+
+impl EraserObjectTool {
+    fn erase_at(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        self.cursor = ctx.screen_to_board(screen_pos);
+        self.radius = SELECT_HIT_TOLERANCE_PX / ctx.camera.zoom;
+        if let Some(id) = ctx.scene.hit_test(self.cursor, self.radius) {
+            ctx.scene.remove_element(id);
         }
     }
 }

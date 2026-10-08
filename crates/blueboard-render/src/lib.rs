@@ -106,6 +106,13 @@ pub enum ScenePreview<'a> {
     /// as a plain outline (not tessellated like `Path`) so it reads as "this is marked,"
     /// not as content on the board.
     Selection(kurbo::Rect),
+    /// Either eraser's cursor: a board-space circle outline showing what's about to be
+    /// erased (and, for the partial eraser, exactly how big a bite the next erase will
+    /// take) — same plain-outline treatment as `Selection`.
+    EraseCursor {
+        center: DVec2,
+        radius: f64,
+    },
 }
 
 #[repr(C)]
@@ -272,6 +279,27 @@ fn selection_rect_vertices(rect: kurbo::Rect) -> Vec<Vertex> {
                 },
             ]
         })
+        .collect()
+}
+
+/// Number of segments approximating the eraser cursor's circle — plenty for something
+/// drawn at cursor size; no need for the zoom-dependent tessellation tolerance the actual
+/// board content uses.
+const ERASE_CURSOR_SEGMENTS: u32 = 32;
+
+/// Build a circle outline (as `LineList` segments) for `ScenePreview::EraseCursor`.
+fn erase_cursor_vertices(center: DVec2, radius: f64) -> Vec<Vertex> {
+    let point_at = |i: u32| {
+        let angle = (i as f64 / ERASE_CURSOR_SEGMENTS as f64) * std::f64::consts::TAU;
+        Vertex {
+            position: [
+                (center.x + radius * angle.cos()) as f32,
+                (center.y + radius * angle.sin()) as f32,
+            ],
+        }
+    };
+    (0..ERASE_CURSOR_SEGMENTS)
+        .flat_map(|i| [point_at(i), point_at(i + 1)])
         .collect()
 }
 
@@ -709,6 +737,10 @@ impl Renderer {
                 ScenePreview::Selection(rect) => {
                     (selection_rect_vertices(rect), &self.preview_pipeline)
                 }
+                ScenePreview::EraseCursor { center, radius } => (
+                    erase_cursor_vertices(center, radius),
+                    &self.preview_pipeline,
+                ),
             };
         let (preview_buffer, preview_count) =
             self.upload_vertices("preview vertices", &preview_vertices);

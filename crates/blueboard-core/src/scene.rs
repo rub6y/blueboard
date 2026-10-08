@@ -71,6 +71,19 @@ impl Scene {
         self.elements.get(&id)
     }
 
+    /// Removes an element entirely, from both the map and the R-tree. Used by the
+    /// whole-object eraser tool directly, and by [`crate::erase`] to drop an element
+    /// before re-adding whatever survives a partial erase as new elements.
+    pub fn remove_element(&mut self, id: u64) -> bool {
+        let Some(element) = self.elements.remove(&id) else {
+            return false;
+        };
+        let bbox = element.path.bounding_box();
+        let envelope = AABB::from_corners([bbox.x0, bbox.y0], [bbox.x1, bbox.y1]);
+        self.index.remove(&IndexedBounds { id, envelope });
+        true
+    }
+
     /// Replaces an existing element's path in place (its id and position in `elements`
     /// are unchanged) — used by the selection tool to commit a drag. The R-tree entry is
     /// removed and reinserted rather than mutated, since a move changes the bounding box
