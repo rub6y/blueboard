@@ -46,12 +46,23 @@ impl CommandRegistry {
     }
 }
 
-fn path_or_default(args: &str) -> &str {
+/// `.bbd` extension `:save`/`:open` append to a bare name — so `:save foo` and
+/// `:open foo` both mean `foo.bbd`, without the user having to type the extension
+/// (or getting a different file if they forget it on open vs. save).
+const BOARD_EXTENSION: &str = ".bbd";
+
+/// Resolve a `:save`/`:open` argument to an actual file path: no argument means
+/// [`DEFAULT_BOARD_PATH`]; otherwise the given name, with [`BOARD_EXTENSION`] appended
+/// unless it's already there (so `:save board.bbd` doesn't become `board.bbd.bbd`).
+fn resolve_board_path(args: &str) -> String {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        DEFAULT_BOARD_PATH
+        return DEFAULT_BOARD_PATH.to_string();
+    }
+    if trimmed.to_ascii_lowercase().ends_with(BOARD_EXTENSION) {
+        trimmed.to_string()
     } else {
-        trimmed
+        format!("{trimmed}{BOARD_EXTENSION}")
     }
 }
 
@@ -62,8 +73,8 @@ impl Command for SaveCommand {
     }
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
-        let path = path_or_default(args);
-        file_format::save(&app.scene, path)
+        let path = resolve_board_path(args);
+        file_format::save(&app.scene, &path)
             .map(|()| format!("saved {} stroke(s) to {path}", app.scene.len()))
             .map_err(|err| format!("save to {path} failed: {err}"))
     }
@@ -76,8 +87,8 @@ impl Command for OpenCommand {
     }
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
-        let path = path_or_default(args);
-        match file_format::load(path) {
+        let path = resolve_board_path(args);
+        match file_format::load(&path) {
             Ok(scene) => {
                 let count = scene.len();
                 app.scene = scene;

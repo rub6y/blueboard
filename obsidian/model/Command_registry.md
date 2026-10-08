@@ -22,3 +22,7 @@ The command registry is reached two ways: typed into the [[Command_line]] (`:sav
 board.bbd`), or via a [[Keybindings]] entry that names a command directly with no
 arguments.
 
+`save`/`open`'s path argument takes a bare name without the `.bbd` extension (`:save
+myboard`) and appends it automatically, unless the given name already ends with `.bbd` —
+so `:save foo` and `:open foo` refer to the same `foo.bbd` file.
+
