@@ -2,6 +2,24 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Tab-completion extended to `:tool <name>`'s argument
+- [[Tool_registry]] gained `completions(prefix)`, mirroring [[Command_registry]]'s — tool
+  names starting with `prefix`.
+- The command line's Tab-completion (previous entry) now also completes `:tool <name>`'s
+  argument against registered tool names — the one built-in command whose argument has a
+  fixed, known vocabulary to complete against; every other command's arguments (a
+  save/open path, say) still aren't completed. `:tool r` + Tab -> `:tool rect`.
+- The completion logic was pulled out of `App`'s methods into a free function,
+  `command_line_completions` — it needs `&self.command_line_text`/`&self.registry`/
+  `&self.tools` at a call site (`RedrawRequested`) that already holds `&mut
+  self.renderer`, and a `&self` method there would conflict with that borrow the same way
+  a whole-`self` borrow always does in this file; passing the three fields directly (same
+  trick `RedrawRequested`'s existing `self.tools.active_tool().preview()` already relies
+  on) keeps the borrows disjoint.
+- Verified by actually running the app under Xvfb: typing `:tool r` shows `rect` as the
+  only match, Tab fills the input to `:tool rect`, Enter switches the tool and the bar's
+  left-side label updates to `rect`. `cargo test`/`clippy`/`fmt --check` all clean.
+
 ## 2026-10-09 — Command-line Tab-completion + persistent tool-name status
 - [[Command_registry]] gained `completions(prefix)`, returning every registered command
   whose name starts with `prefix` as `(name, usage)` pairs — same data `:help` prints,

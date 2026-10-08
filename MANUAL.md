@@ -30,7 +30,9 @@ command names, they're listed above the input — live, updating as you type, no
 after pressing Tab. Press Tab to cycle a highlighted selection through the matches
 (wrapping back to the first after the last); the input fills with whatever's highlighted,
 so Enter then runs it. Only the command *name* completes — once you've typed a space onto
-arguments, completion stops.
+arguments, completion stops, with one exception: `:tool <name>`'s argument also
+completes against registered tool names (e.g. `:tool r` + Tab -> `:tool rect`), since
+that's the one built-in command whose argument has a fixed, known vocabulary.
 
 | Command | Usage | What it does |
 |---|---|---|

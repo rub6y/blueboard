@@ -117,6 +117,17 @@ impl ToolRegistry {
             None => false,
         }
     }
+
+    /// Tool names starting with `prefix` — drives the command line's Tab-completion for
+    /// `:tool <name>`'s argument, the one built-in command whose argument has a fixed,
+    /// completable vocabulary.
+    pub fn completions(&self, prefix: &str) -> Vec<&'static str> {
+        self.tools
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| name.starts_with(prefix))
+            .collect()
+    }
 }
 
 /// Freehand drawing: raw pointer samples, smoothed and decimated, curve-fit into a

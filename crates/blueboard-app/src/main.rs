@@ -47,11 +47,11 @@ struct App {
     command_line_active: bool,
     /// Everything typed after `:` so far.
     command_line_text: String,
-    /// Which Tab-completion candidate (from `registry.completions`, filtered by
-    /// `command_line_text`) is currently highlighted, if any. Reset to `None` whenever the
-    /// user types or backspaces directly, so a fresh prefix always starts unselected — a
-    /// stale index would otherwise point at an unrelated candidate once the match set
-    /// changes underneath it.
+    /// Which Tab-completion candidate (from `command_line_completions`, below) is
+    /// currently highlighted, if any. Reset to `None` whenever the user types or
+    /// backspaces directly, so a fresh prefix always starts unselected — a stale index
+    /// would otherwise point at an unrelated candidate once the match set changes
+    /// underneath it.
     command_completion_index: Option<usize>,
     /// The last command's result, shown in the command bar until the next command
     /// replaces it. `bool` is "is this an error" (picks the display color).
@@ -116,18 +116,19 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // Only the command *name* (text before the first space) completes — once
-                // a space is typed the user is onto arguments, which aren't completed.
-                let completions: Vec<blueboard_render::Completion> =
-                    if self.command_line_active && !self.command_line_text.contains(' ') {
-                        self.registry
-                            .completions(&self.command_line_text)
-                            .into_iter()
-                            .map(|(name, usage)| blueboard_render::Completion { name, usage })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                let completions: Vec<blueboard_render::Completion> = if self.command_line_active {
+                    let (_, candidates) = command_line_completions(
+                        &self.command_line_text,
+                        &self.registry,
+                        &self.tools,
+                    );
+                    candidates
+                        .into_iter()
+                        .map(|(name, usage)| blueboard_render::Completion { name, usage })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let command_bar = if self.command_line_active {
                     CommandBarContent::Editing {
                         text: &self.command_line_text,
@@ -245,6 +246,37 @@ impl ApplicationHandler for App {
     }
 }
 
+/// What the command line would complete right now, if anything: the fixed text to keep
+/// (prepended to whatever candidate is chosen) and the matching candidates as `(name,
+/// usage)` pairs. Completes the command name itself (nothing typed after it yet), or —
+/// the one special case — a tool name for `:tool <prefix>`, since that's the one built-in
+/// command whose argument has a fixed, known vocabulary to complete against; every other
+/// command's arguments (a save/open path, say) aren't completed.
+///
+/// A free function, not an `App` method, deliberately: its two call sites both need it
+/// alongside a `&mut self.renderer`/`&self.window` borrow already in scope (see
+/// `RedrawRequested`'s comment on why command dispatch is handled the same way), and a
+/// `&self` method call would conflict with that the same way a whole-`self` borrow always
+/// does — passing the specific fields it needs keeps the borrows disjoint.
+fn command_line_completions<'a>(
+    text: &'a str,
+    registry: &'a commands::CommandRegistry,
+    tools: &'a tools::ToolRegistry,
+) -> (&'static str, Vec<(&'static str, &'static str)>) {
+    match text.split_once(' ') {
+        None => ("", registry.completions(text)),
+        Some(("tool", rest)) if !rest.contains(' ') => (
+            "tool ",
+            tools
+                .completions(rest)
+                .into_iter()
+                .map(|name| (name, ""))
+                .collect(),
+        ),
+        _ => ("", Vec::new()),
+    }
+}
+
 impl App {
     /// Keyboard handling lives outside `window_event`'s main match because command
     /// dispatch needs a whole `&mut self` — see the call site's comment.
@@ -270,18 +302,18 @@ impl App {
                     self.command_completion_index = None;
                 }
                 Key::Named(NamedKey::Tab) => {
-                    // Only the command name (no space typed yet) has anything to
-                    // complete — matches `RedrawRequested`'s same check for what to show.
-                    if !self.command_line_text.contains(' ') {
-                        let candidates = self.registry.completions(&self.command_line_text);
-                        if !candidates.is_empty() {
-                            let next = match self.command_completion_index {
-                                Some(i) => (i + 1) % candidates.len(),
-                                None => 0,
-                            };
-                            self.command_completion_index = Some(next);
-                            self.command_line_text = candidates[next].0.to_string();
-                        }
+                    let (fixed_prefix, candidates) = command_line_completions(
+                        &self.command_line_text,
+                        &self.registry,
+                        &self.tools,
+                    );
+                    if !candidates.is_empty() {
+                        let next = match self.command_completion_index {
+                            Some(i) => (i + 1) % candidates.len(),
+                            None => 0,
+                        };
+                        self.command_completion_index = Some(next);
+                        self.command_line_text = format!("{fixed_prefix}{}", candidates[next].0);
                     }
                 }
                 _ => {

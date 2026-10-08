@@ -18,3 +18,8 @@ The tool registry lives in `blueboard-app/src/tools.rs`.
 
 The tool registry switches tools via `:tool <name>` (a [[Command_registry]] command) or a
 [[Keybindings]] entry — both ultimately call the same `set_active`.
+
+The tool registry also answers `completions(prefix)` — every tool name starting with
+`prefix` — mirroring [[Command_registry]]'s own `completions`; it's what lets
+[[Command_line]]'s Tab-completion complete `:tool <name>`'s argument, not just the
+command name itself.
