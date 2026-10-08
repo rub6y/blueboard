@@ -2,6 +2,22 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-08 — `:help` command
+- [[Command_registry]] gained `:help`, listing every registered command and its usage
+  hint on one line (fits the command bar's fixed single-line height — no render-crate
+  changes needed).
+- Non-obvious wrinkle: `HelpCommand::run` can't actually build the listing — by the time
+  any command's `run` executes, `app.registry` has been swapped out for the call (the
+  `std::mem::take` dance `run_command` already does to dodge a borrow conflict), so it's
+  an empty placeholder from inside `run`. Fixed by intercepting `"help"` one level up, in
+  `CommandRegistry::run` itself, where `self` is still the one live copy. `HelpCommand`
+  stays registered (so `:help` is discoverable and lists itself) but its `run` body is
+  effectively unreachable — returns an `Err` rather than panicking if that ever changes,
+  matching this project's established crash-resilience stance rather than `unreachable!()`.
+- Verified by running the app (Xvfb, per the convention established for the selection
+  tool below) and typing `:help`: bar showed
+  `:save [name]  :open [name]  :clear  :new  :tool <name>  :undo  :redo  :help  :q`.
+
 ## 2026-10-08 — Phase 5 (partial): selection + move tool
 - [[Tool_registry]] gained a `select` tool (keybinding `v`): click-to-select,
   drag-to-move. [[Scene_graph]] gained the two primitives it needed:

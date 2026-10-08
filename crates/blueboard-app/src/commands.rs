@@ -12,6 +12,12 @@ use crate::{App, DEFAULT_BOARD_PATH};
 pub trait Command {
     fn name(&self) -> &'static str;
 
+    /// Argument hint shown by `:help` after the command name (e.g. `"[name]"`,
+    /// `"<name>"`) — empty (the default) for a command that takes no arguments.
+    fn usage(&self) -> &'static str {
+        ""
+    }
+
     /// Whether running this command should be recorded as an undo point (the app takes a
     /// scene snapshot around every run and hands it to `History::record` when this is
     /// `true`). Commands whose scene changes are the history mechanism itself — `undo`
@@ -42,12 +48,33 @@ impl CommandRegistry {
         registry.register(ToolCommand);
         registry.register(UndoCommand);
         registry.register(RedoCommand);
+        registry.register(HelpCommand);
         registry.register(QuitCommand);
         registry
     }
 
     pub fn register(&mut self, command: impl Command + 'static) {
         self.commands.push(Box::new(command));
+    }
+
+    /// `:help`'s output: every registered command's name and usage hint, one line. Built
+    /// here, not in `HelpCommand::run`, because by the time a command's `run` is called
+    /// `app`'s own `registry` field has been swapped out for the duration of the call (see
+    /// `main.rs`'s `run_command`) — `self` here is the one live copy that still has the
+    /// full command list to read.
+    fn help_text(&self) -> String {
+        self.commands
+            .iter()
+            .map(|command| {
+                let usage = command.usage();
+                if usage.is_empty() {
+                    format!(":{}", command.name())
+                } else {
+                    format!(":{} {usage}", command.name())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
     }
 
     /// Whether running `name` should be recorded as an undo point — see
@@ -62,6 +89,9 @@ impl CommandRegistry {
 
     pub fn run(&self, app: &mut App, name: &str, args: &str) -> Result<String, String> {
         match self.commands.iter().find(|command| command.name() == name) {
+            // Intercepted before reaching `HelpCommand::run` — see `help_text`'s doc
+            // comment for why the listing can't be built from inside a `Command::run`.
+            Some(_) if name == "help" => Ok(self.help_text()),
             Some(command) => command.run(app, args),
             None => Err(format!("unknown command: {name}")),
         }
@@ -94,6 +124,10 @@ impl Command for SaveCommand {
         "save"
     }
 
+    fn usage(&self) -> &'static str {
+        "[name]"
+    }
+
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
         let path = resolve_board_path(args);
         file_format::save(&app.scene, &path)
@@ -106,6 +140,10 @@ struct OpenCommand;
 impl Command for OpenCommand {
     fn name(&self) -> &'static str {
         "open"
+    }
+
+    fn usage(&self) -> &'static str {
+        "[name]"
     }
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
@@ -154,6 +192,10 @@ impl Command for ToolCommand {
         "tool"
     }
 
+    fn usage(&self) -> &'static str {
+        "<name>"
+    }
+
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
         let name = args.trim();
         if app.tools.set_active(name) {
@@ -199,6 +241,29 @@ impl Command for RedoCommand {
         } else {
             Err("nothing to redo".to_string())
         }
+    }
+}
+
+/// Lists every registered command. Registered like any other command so `:help` is
+/// discoverable the same way the rest are (present in the registry, listed in its own
+/// output) — but `run` here is never actually called: `CommandRegistry::run` intercepts
+/// `"help"` before dispatch, since building the listing needs the live registry (see
+/// `CommandRegistry::help_text`), and this method's `&mut App` doesn't have one — `app`'s
+/// `registry` field is swapped out for the duration of any command's `run` call. Returns
+/// an `Err` rather than panicking if that interception is ever bypassed, in keeping with
+/// this project's crash-resilience stance (see the ledger's Phase 4 entry).
+struct HelpCommand;
+impl Command for HelpCommand {
+    fn name(&self) -> &'static str {
+        "help"
+    }
+
+    fn records_undo(&self) -> bool {
+        false
+    }
+
+    fn run(&self, _app: &mut App, _args: &str) -> Result<String, String> {
+        Err("help text is built by CommandRegistry::run directly".to_string())
     }
 }
 
