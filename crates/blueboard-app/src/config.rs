@@ -46,6 +46,11 @@ fn default_keybindings() -> HashMap<String, String> {
         ("r", "tool rect"),
         ("e", "tool ellipse"),
         ("l", "tool line"),
+        // `U` (redo) is just a distinct single character, not "shift+u" — with no
+        // modifier support in this map, it works only because winit reports Shift+u's
+        // logical key as the literal `"U"`, which the lookup in `main.rs` matches as-is.
+        ("u", "undo"),
+        ("U", "redo"),
     ]
     .into_iter()
     .map(|(key, command)| (key.to_string(), command.to_string()))

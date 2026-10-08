@@ -12,6 +12,15 @@ use crate::{App, DEFAULT_BOARD_PATH};
 pub trait Command {
     fn name(&self) -> &'static str;
 
+    /// Whether running this command should be recorded as an undo point (the app takes a
+    /// scene snapshot around every run and hands it to `History::record` when this is
+    /// `true`). Commands whose scene changes are the history mechanism itself — `undo`
+    /// and `redo` — return `false`: recording them would push an entry that "undoes the
+    /// undo", re-applying the very edit the user just stepped back from.
+    fn records_undo(&self) -> bool {
+        true
+    }
+
     /// Run the command with everything after the command name (and separating
     /// whitespace) as `args`. `Ok` is a status message to show in the command bar; `Err`
     /// is an error message, shown in the command bar's error color.
@@ -31,12 +40,24 @@ impl CommandRegistry {
         registry.register(ClearCommand);
         registry.register(NewCommand);
         registry.register(ToolCommand);
+        registry.register(UndoCommand);
+        registry.register(RedoCommand);
         registry.register(QuitCommand);
         registry
     }
 
     pub fn register(&mut self, command: impl Command + 'static) {
         self.commands.push(Box::new(command));
+    }
+
+    /// Whether running `name` should be recorded as an undo point — see
+    /// [`Command::records_undo`]. An unknown name reports `true`, but it also fails to
+    /// run at all, so the snapshot taken around it matches itself and records nothing.
+    pub fn records_undo(&self, name: &str) -> bool {
+        match self.commands.iter().find(|command| command.name() == name) {
+            Some(command) => command.records_undo(),
+            None => true,
+        }
     }
 
     pub fn run(&self, app: &mut App, name: &str, args: &str) -> Result<String, String> {
@@ -139,6 +160,44 @@ impl Command for ToolCommand {
             Ok(format!("tool: {name}"))
         } else {
             Err(format!("unknown tool: {name}"))
+        }
+    }
+}
+
+struct UndoCommand;
+impl Command for UndoCommand {
+    fn name(&self) -> &'static str {
+        "undo"
+    }
+
+    fn records_undo(&self) -> bool {
+        false
+    }
+
+    fn run(&self, app: &mut App, _args: &str) -> Result<String, String> {
+        if app.history.undo(&mut app.scene) {
+            Ok("undone".to_string())
+        } else {
+            Err("nothing to undo".to_string())
+        }
+    }
+}
+
+struct RedoCommand;
+impl Command for RedoCommand {
+    fn name(&self) -> &'static str {
+        "redo"
+    }
+
+    fn records_undo(&self) -> bool {
+        false
+    }
+
+    fn run(&self, app: &mut App, _args: &str) -> Result<String, String> {
+        if app.history.redo(&mut app.scene) {
+            Ok("redone".to_string())
+        } else {
+            Err("nothing to redo".to_string())
         }
     }
 }

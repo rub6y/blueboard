@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use blueboard_core::camera::Camera;
+use blueboard_core::history::History;
 use blueboard_core::scene::Scene;
 use blueboard_render::{CommandBarContent, RenderOutcome, Renderer};
 use glam::DVec2;
@@ -33,6 +34,9 @@ struct App {
     renderer: Option<Renderer>,
     camera: Camera,
     scene: Scene,
+    /// Undo/redo stacks for `scene` — every scene edit not made *by* the history itself
+    /// is recorded (see `run_command` and the tool-dispatch arm below).
+    history: History,
     panning: bool,
     last_cursor: DVec2,
 
@@ -144,6 +148,14 @@ impl ApplicationHandler for App {
             } => {
                 let (width, height) = renderer.viewport_size();
                 let viewport = DVec2::new(width as f64, height as f64);
+                // Snapshot around the dispatch so a tool that commits something (a
+                // stroke, a shape) becomes one undo point automatically — a tool that
+                // commits nothing records nothing (`History::record` checks for a
+                // change). `on_pointer_move` is deliberately *not* wrapped: it fires at
+                // screen refresh rate, and a snapshot per event would cost far more than
+                // the edits are worth — a future tool that mutates the scene mid-drag
+                // (e.g. selection move) has to record its own edit.
+                let before = self.scene.snapshot();
                 let mut ctx = tools::ToolContext {
                     camera: &self.camera,
                     scene: &mut self.scene,
@@ -159,6 +171,7 @@ impl ApplicationHandler for App {
                         .active_tool_mut()
                         .on_pointer_up(&mut ctx, self.last_cursor),
                 }
+                self.history.record(before, &self.scene);
                 window.request_redraw();
             }
 
@@ -277,8 +290,15 @@ impl App {
         // the command (e.g. replacing the scene) — swap it out for the call, then put it
         // back. See `tools.rs`'s doc comment for why `Tool` dispatch doesn't need this.
         let registry = std::mem::take(&mut self.registry);
+        // Asked before the run, while the registry is still available: this is what keeps
+        // `undo`/`redo` from recording themselves as edits to undo.
+        let records_undo = registry.records_undo(name);
+        let before = self.scene.snapshot();
         let result = registry.run(self, name, args);
         self.registry = registry;
+        if records_undo {
+            self.history.record(before, &self.scene);
+        }
         self.status = Some(match result {
             Ok(message) => (message, false),
             Err(message) => (message, true),

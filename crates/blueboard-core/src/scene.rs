@@ -9,6 +9,8 @@ use glam::DVec2;
 use kurbo::{BezPath, Shape as _};
 use rstar::{RTree, RTreeObject, AABB};
 
+use crate::history::Snapshot;
+
 pub struct Element {
     pub id: u64,
     pub path: BezPath,
@@ -62,6 +64,39 @@ impl Scene {
         let envelope = AABB::from_corners([bbox.x0, bbox.y0], [bbox.x1, bbox.y1]);
         self.index.insert(IndexedBounds { id, envelope });
         self.elements.insert(id, Element { id, path });
+    }
+
+    /// A point-in-time copy of this scene's contents for [`crate::history`]. Derived data
+    /// (the R-tree) is not copied — [`Scene::restore`] rebuilds it from the elements.
+    pub fn snapshot(&self) -> Snapshot {
+        let mut elements: Vec<(u64, BezPath)> = self
+            .elements
+            .values()
+            .map(|element| (element.id, element.path.clone()))
+            .collect();
+        // Sorted by id so the same elements always compare equal regardless of `HashMap`
+        // iteration order — same reasoning as `file_format::save`.
+        elements.sort_by_key(|(id, _)| *id);
+        Snapshot { elements }
+    }
+
+    /// Replaces this scene's contents with `snapshot`'s — how [`crate::history`] applies
+    /// an undo/redo.
+    pub(crate) fn restore(&mut self, snapshot: Snapshot) {
+        // Both the element map *and* the index are rebuilt: a stale index entry left
+        // behind by a removed element would make `elements_in_viewport` report an id
+        // whose bounding box no longer matches the element it finds.
+        self.elements.clear();
+        self.index = RTree::new();
+        // `next_id` is never lowered, only raised past the highest restored id: ids are
+        // never reused (the same stability rule `insert_loaded_element` follows), and
+        // lowering it after e.g. undoing a `clear` would collide with the restored ids.
+        if let Some(highest) = snapshot.elements.iter().map(|(id, _)| *id).max() {
+            self.next_id = self.next_id.max(highest + 1);
+        }
+        for (id, path) in snapshot.elements {
+            self.insert_element(id, path);
+        }
     }
 
     /// Elements whose bounding box intersects the given board-space rectangle — the

@@ -3,4 +3,5 @@
 pub mod camera;
 pub mod file_format;
 pub mod fitting;
+pub mod history;
 pub mod scene;
