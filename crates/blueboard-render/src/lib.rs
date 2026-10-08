@@ -102,6 +102,10 @@ pub enum ScenePreview<'a> {
     /// An exact path (e.g. a shape tool's in-progress rectangle/ellipse/line) — drawn
     /// tessellated, identically to a committed element.
     Path(&'a kurbo::BezPath),
+    /// The selection tool's selected-element indicator: a board-space bounding box, drawn
+    /// as a plain outline (not tessellated like `Path`) so it reads as "this is marked,"
+    /// not as content on the board.
+    Selection(kurbo::Rect),
 }
 
 #[repr(C)]
@@ -243,6 +247,28 @@ fn preview_line_vertices(points: &[DVec2]) -> Vec<Vertex> {
                 },
                 Vertex {
                     position: [pair[1].x as f32, pair[1].y as f32],
+                },
+            ]
+        })
+        .collect()
+}
+
+/// Build a closed rectangle outline (four `LineList` segments) for `ScenePreview::Selection`.
+fn selection_rect_vertices(rect: kurbo::Rect) -> Vec<Vertex> {
+    let corners = [
+        [rect.x0 as f32, rect.y0 as f32],
+        [rect.x1 as f32, rect.y0 as f32],
+        [rect.x1 as f32, rect.y1 as f32],
+        [rect.x0 as f32, rect.y1 as f32],
+    ];
+    (0..4)
+        .flat_map(|i| {
+            [
+                Vertex {
+                    position: corners[i],
+                },
+                Vertex {
+                    position: corners[(i + 1) % 4],
                 },
             ]
         })
@@ -679,6 +705,9 @@ impl Renderer {
                     let mut verts = Vec::new();
                     tessellate_stroke(path, STROKE_WIDTH, tessellation_tolerance, &mut verts);
                     (verts, &self.stroke_pipeline)
+                }
+                ScenePreview::Selection(rect) => {
+                    (selection_rect_vertices(rect), &self.preview_pipeline)
                 }
             };
         let (preview_buffer, preview_count) =

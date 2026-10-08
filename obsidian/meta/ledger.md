@@ -2,6 +2,44 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-08 — Phase 5 (partial): selection + move tool
+- [[Tool_registry]] gained a `select` tool (keybinding `v`): click-to-select,
+  drag-to-move. [[Scene_graph]] gained the two primitives it needed:
+  `hit_test(point, tolerance)` (nearest element within tolerance, by distance to the
+  path's rendered *outline* — every element renders as a stroke, so this matches what's
+  visibly clickable rather than treating rect/ellipse as hit-testable by interior fill)
+  and `set_element_path` (replace a path in place, reindexing the [[RTree_index]] entry
+  since a move changes the bounding box).
+- A drag only *previews* the move (translating the originally-grabbed path via
+  `kurbo::Affine::translate`, re-done from the fixed original each move rather than
+  compounded, so float drift can't accumulate) and commits in one step on release — this
+  was a deliberate fit to the existing undo architecture: `main.rs` only
+  snapshots-and-records around pointer down/up, not every move, so a tool that mutated
+  the scene mid-drag would need its own History plumbing. One commit on release means the
+  whole drag is a single undo step for free.
+- [[Render_crate]] gained `ScenePreview::Selection(Rect)` — a plain 4-segment box outline
+  via the existing `LineList` preview pipeline, no shader/theme changes. Deliberately
+  reuses the same line color as other previews; a distinct highlight color is left as
+  future polish, not required to tell selection apart from content (shape, not color,
+  does that here).
+- Four new `Scene` unit tests (`hit_test` hit/miss/nearest-of-two-overlapping,
+  `set_element_path` reindexing) plus the existing suite, all passing (18 total in
+  `blueboard-core`).
+- **Verified by actually running the app**, on an isolated `Xvfb` display rather than the
+  shared live desktop this time — the Phase 4 ledger entry flagged `DISPLAY=:0` testing as
+  a contamination risk (real desktop input landing on the test window), and driving a
+  window on ruba's actual desktop via synthetic input wasn't something to do without
+  asking first anyway. `xdotool windowfocus` (not `windowactivate` — no window manager is
+  running on a bare `Xvfb`, so activation fails, but focus alone is enough for winit to
+  deliver keyboard events) was the one wrinkle; otherwise drew a shape, selected it,
+  watched the live drag preview follow the cursor, confirmed the commit on release,
+  confirmed clicking empty space deselects, and confirmed `:undo`/`u` reverts the move —
+  all via screenshots at each step, not just trusting the log.
+- Undo/redo (`[[Command_registry]]`'s `undo`/`redo`, [[Core_crate]]'s `history.rs`) was
+  already complete and tested on this branch from a prior session but uncommitted;
+  committed first, as its own commit, before starting this work.
+- Still open in Phase 5: text tool, eraser, basic LOD for zoomed-out rendering.
+
 ## 2026-10-08 — Phase 4 complete: command line + config
 - Vim-like `:`-command line implemented: [[App_crate]] owns input handling (raw `winit`
   key events, not an egui widget) and state; [[Render_crate]] renders the bar via

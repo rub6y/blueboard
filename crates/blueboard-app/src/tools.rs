@@ -12,7 +12,7 @@ use blueboard_core::fitting::fit_stroke;
 use blueboard_core::scene::Scene;
 use blueboard_render::ScenePreview;
 use glam::DVec2;
-use kurbo::{BezPath, Shape as _};
+use kurbo::{Affine, BezPath, Shape as _};
 
 /// How far (in screen pixels, at the zoom level the stroke was drawn at) the fitted curve
 /// is allowed to deviate from the raw pointer samples — see `planning/math.tex`'s curve
@@ -90,6 +90,7 @@ impl ToolRegistry {
             Box::new(ShapeTool::rect()),
             Box::new(ShapeTool::ellipse()),
             Box::new(ShapeTool::line()),
+            Box::new(SelectionTool::default()),
         ];
         Self { tools, active: 0 }
     }
@@ -275,6 +276,75 @@ impl Tool for ShapeTool {
     fn preview(&self) -> ScenePreview<'_> {
         match &self.current {
             Some(path) => ScenePreview::Path(path),
+            None => ScenePreview::None,
+        }
+    }
+}
+
+/// Screen-space radius (at the zoom level a click happens at, same conversion pattern as
+/// [`PEN_FIT_TOLERANCE_PX`]) within which a click counts as hitting an element's outline —
+/// loose enough to forgive clicking a pixel or two off a thin stroke.
+const SELECT_HIT_TOLERANCE_PX: f64 = 6.0;
+
+/// Click-to-select, drag-to-move. Unlike `ShapeTool`, a drag here never creates anything
+/// — it mutates an existing element's path, and only on release: `on_pointer_move` can't
+/// safely commit to the scene itself (see `main.rs`'s tool-dispatch comment — only pointer
+/// down/up are snapshotted for undo), so a move is previewed from the original path and
+/// applied in one step in `on_pointer_up`.
+#[derive(Default)]
+pub struct SelectionTool {
+    selected: Option<u64>,
+    /// The selected element's current path, kept in sync on select and after a committed
+    /// move. This exists so [`Tool::preview`] can show the selection box at rest, without
+    /// needing scene access — `preview`'s signature deliberately has none, see `tools.rs`'s
+    /// module doc comment on why `Tool` doesn't take `&mut App`.
+    selected_path: Option<BezPath>,
+    /// Set from pointer-down until release: the selected element's path *as it was when
+    /// grabbed*, and the board-space point it was grabbed at. `on_pointer_move` always
+    /// translates from this fixed original rather than compounding translations onto an
+    /// already-moved path, so floating-point drift can't accumulate over a long drag.
+    drag: Option<(BezPath, DVec2)>,
+    /// The in-progress dragged path, recomputed each `on_pointer_move`; `None` while not
+    /// dragging, distinct from `selected_path` being `Some` but at rest.
+    dragging_path: Option<BezPath>,
+}
+
+impl Tool for SelectionTool {
+    fn name(&self) -> &'static str {
+        "select"
+    }
+
+    fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        let board = ctx.screen_to_board(screen_pos);
+        let tolerance = SELECT_HIT_TOLERANCE_PX / ctx.camera.zoom;
+        self.selected = ctx.scene.hit_test(board, tolerance);
+        self.selected_path = self
+            .selected
+            .and_then(|id| ctx.scene.element(id))
+            .map(|element| element.path.clone());
+        self.drag = self.selected_path.clone().map(|path| (path, board));
+        self.dragging_path = None;
+    }
+
+    fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        let Some((original, grabbed_at)) = &self.drag else {
+            return;
+        };
+        let delta = ctx.screen_to_board(screen_pos) - *grabbed_at;
+        self.dragging_path = Some(Affine::translate((delta.x, delta.y)) * original);
+    }
+
+    fn on_pointer_up(&mut self, ctx: &mut ToolContext, _screen_pos: DVec2) {
+        if let (Some(id), Some(path)) = (self.selected, self.dragging_path.take()) {
+            ctx.scene.set_element_path(id, path.clone());
+            self.selected_path = Some(path);
+        }
+        self.drag = None;
+    }
+
+    fn preview(&self) -> ScenePreview<'_> {
+        match self.dragging_path.as_ref().or(self.selected_path.as_ref()) {
+            Some(path) => ScenePreview::Selection(path.bounding_box()),
             None => ScenePreview::None,
         }
     }

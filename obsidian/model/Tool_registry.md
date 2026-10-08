@@ -3,8 +3,9 @@
 The tool registry is a central table of drawing tools, each implementing one `Tool`
 trait.
 
-The tool registry holds the [[Vector_pen]] (Phase 2) and, as of Phase 5, rect/ellipse/line
-shape tools — text, eraser, and selection are still future tools.
+The tool registry holds the [[Vector_pen]] (Phase 2), rect/ellipse/line shape tools, and,
+as of Phase 5's selection work, a select/move tool (see [[Scene_graph]]'s `hit_test` and
+`set_element_path`) — text and eraser are still future tools.
 
 The tool registry follows the same addon-friendly pattern as the [[Command_registry]], but
 a `Tool` is given a `ToolContext` (camera + scene only), not `&mut App` — tools never need

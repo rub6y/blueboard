@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use glam::DVec2;
-use kurbo::{BezPath, Shape as _};
+use kurbo::{BezPath, ParamCurveNearest, Point, Shape as _};
 use rstar::{RTree, RTreeObject, AABB};
 
 use crate::history::Snapshot;
@@ -18,6 +18,7 @@ pub struct Element {
 
 /// What's actually indexed by the R-tree: just an id and a bounding box, not the element
 /// itself — elements live in `Scene::elements`, looked up by id after a spatial query.
+#[derive(PartialEq)]
 struct IndexedBounds {
     id: u64,
     envelope: AABB<[f64; 2]>,
@@ -64,6 +65,60 @@ impl Scene {
         let envelope = AABB::from_corners([bbox.x0, bbox.y0], [bbox.x1, bbox.y1]);
         self.index.insert(IndexedBounds { id, envelope });
         self.elements.insert(id, Element { id, path });
+    }
+
+    pub fn element(&self, id: u64) -> Option<&Element> {
+        self.elements.get(&id)
+    }
+
+    /// Replaces an existing element's path in place (its id and position in `elements`
+    /// are unchanged) — used by the selection tool to commit a drag. The R-tree entry is
+    /// removed and reinserted rather than mutated, since a move changes the bounding box
+    /// the old entry was indexed under.
+    pub fn set_element_path(&mut self, id: u64, path: BezPath) {
+        if let Some(old) = self.elements.get(&id) {
+            let old_bbox = old.path.bounding_box();
+            let old_envelope =
+                AABB::from_corners([old_bbox.x0, old_bbox.y0], [old_bbox.x1, old_bbox.y1]);
+            self.index.remove(&IndexedBounds {
+                id,
+                envelope: old_envelope,
+            });
+        }
+        self.insert_element(id, path);
+    }
+
+    /// The id of the element nearest `point` (board-space), if any lie within `tolerance`
+    /// of it — used by the selection tool to turn a click into "what did the user click
+    /// on." Distance is to the path's *outline*, not its filled interior: every element
+    /// renders as a stroke (see `blueboard-render::tessellate_stroke`), even shapes that
+    /// look "filled", so this matches what's actually visible rather than treating
+    /// rect/ellipse as hit-testable by interior containment.
+    ///
+    /// Ties (two elements equally close, e.g. overlapping) resolve to the nearer one;
+    /// exact ties fall back to whichever the R-tree query happens to visit last, which in
+    /// practice is fine for a feature this is — a perfect "topmost wins" ordering would
+    /// need a z-order the scene doesn't track yet.
+    pub fn hit_test(&self, point: DVec2, tolerance: f64) -> Option<u64> {
+        let query = AABB::from_corners(
+            [point.x - tolerance, point.y - tolerance],
+            [point.x + tolerance, point.y + tolerance],
+        );
+        let candidate_point = Point::new(point.x, point.y);
+        self.index
+            .locate_in_envelope_intersecting(query)
+            .filter_map(|entry| {
+                let element = self.elements.get(&entry.id)?;
+                let distance = element
+                    .path
+                    .segments()
+                    .map(|segment| segment.nearest(candidate_point, 0.1).distance_sq)
+                    .fold(f64::INFINITY, f64::min)
+                    .sqrt();
+                (distance <= tolerance).then_some((entry.id, distance))
+            })
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(id, _)| id)
     }
 
     /// A point-in-time copy of this scene's contents for [`crate::history`]. Derived data
@@ -121,5 +176,67 @@ impl Scene {
 
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A horizontal line from `(x0, y)` to `(x1, y)` — easy to reason about distances to.
+    fn horizontal_line(x0: f64, x1: f64, y: f64) -> BezPath {
+        let mut path = BezPath::new();
+        path.move_to((x0, y));
+        path.line_to((x1, y));
+        path
+    }
+
+    #[test]
+    fn hit_test_finds_an_element_within_tolerance() {
+        let mut scene = Scene::new();
+        let id = scene.add_element(horizontal_line(0.0, 10.0, 0.0));
+
+        assert_eq!(scene.hit_test(DVec2::new(5.0, 1.0), 2.0), Some(id));
+    }
+
+    #[test]
+    fn hit_test_misses_past_tolerance() {
+        let mut scene = Scene::new();
+        scene.add_element(horizontal_line(0.0, 10.0, 0.0));
+
+        assert_eq!(scene.hit_test(DVec2::new(5.0, 10.0), 2.0), None);
+    }
+
+    #[test]
+    fn hit_test_picks_the_nearer_of_two_overlapping_elements() {
+        let mut scene = Scene::new();
+        let far = scene.add_element(horizontal_line(0.0, 10.0, 0.0));
+        let near = scene.add_element(horizontal_line(0.0, 10.0, 1.0));
+
+        let hit = scene.hit_test(DVec2::new(5.0, 1.4), 5.0);
+        assert_eq!(hit, Some(near));
+        assert_ne!(hit, Some(far));
+    }
+
+    #[test]
+    fn set_element_path_moves_the_indexed_bounding_box() {
+        let mut scene = Scene::new();
+        let id = scene.add_element(horizontal_line(0.0, 10.0, 0.0));
+
+        scene.set_element_path(id, horizontal_line(100.0, 110.0, 100.0));
+
+        // The element no longer intersects its old location...
+        let old_location: Vec<_> = scene
+            .elements_in_viewport(DVec2::new(-5.0, -5.0), DVec2::new(15.0, 5.0))
+            .map(|element| element.id)
+            .collect();
+        assert!(old_location.is_empty());
+        // ...and does intersect its new one, via the same index query — proving the old
+        // R-tree entry was actually removed, not just shadowed by the new one.
+        let new_location: Vec<_> = scene
+            .elements_in_viewport(DVec2::new(95.0, 95.0), DVec2::new(115.0, 105.0))
+            .map(|element| element.id)
+            .collect();
+        assert_eq!(new_location, vec![id]);
     }
 }
