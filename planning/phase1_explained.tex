@@ -1,0 +1,486 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.97}
+\definecolor{codeframe}{rgb}{0.8,0.8,0.82}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  xleftmargin=1em,
+  xrightmargin=1em,
+  aboveskip=1em,
+  belowskip=1em,
+}
+
+\title{Blueboard Phase 1, explained}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{What this document is}
+Phase 1 (\texttt{PLAN.md}, tag \texttt{v0.1-window-and-camera}) took the project from an
+empty cargo workspace to an actual window: a GPU-cleared screen with a reference grid you
+can pan by dragging and zoom by scrolling, clamped to the brief's 1\%--200\% range. This
+note walks through \emph{what was written, in what order, and why} — including the Rust
+language features used along the way, for a reader who knows roughly what the pieces
+should do but not yet how to spell that in Rust. It is a companion to the code, not a
+replacement for reading it: file and line references point at the real source.
+
+\tableofcontents
+
+\section{The shape of the problem}
+
+Three things had to exist before anything would show on screen:
+\begin{enumerate}
+  \item A \textbf{window} — an OS-level surface to draw into and receive input from.
+  \item A \textbf{GPU pipeline} — wgpu's way of saying ``here is a shader, here is how
+    vertices are laid out, here is what to draw.''
+  \item A \textbf{camera} — the pan/zoom state that turns ``board space'' (where strokes
+    will eventually live) into ``screen space'' (where pixels are).
+\end{enumerate}
+These map directly onto the three-crate split decided in Phase 0: the camera went into
+\texttt{blueboard-core} (pure math, no GPU, no windowing), the pipeline into
+\texttt{blueboard-render} (wgpu, nothing about windows or input), and the event loop that
+ties them together into \texttt{blueboard-app} (\texttt{winit}, owns the window, owns
+input handling). Each section below follows that same order: core, then render, then app
+— which is also the order the code was written in, since render depends on core's
+\texttt{Camera} type, and app depends on both.
+
+\section{\texttt{blueboard-core}: the camera}
+
+File: \texttt{crates/blueboard-core/src/camera.rs}.
+
+\subsection{Why this lives in \texttt{core}, not \texttt{render}}
+The camera is just two numbers and some arithmetic: a pan offset and a zoom factor, plus
+the formulas to convert between screen pixels and board coordinates. None of that touches
+the GPU. Keeping it in \texttt{core} means it can be unit-tested without ever opening a
+window or talking to a graphics driver — which is exactly how it was tested (see
+\S\ref{sec:testing}).
+
+\subsection{The struct}
+\begin{lstlisting}
+pub const MIN_ZOOM: f64 = 0.01;
+pub const MAX_ZOOM: f64 = 2.0;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
+    pub pan: DVec2,
+    pub zoom: f64,
+}
+\end{lstlisting}
+A few things to unpack for a reader new to Rust:
+\begin{itemize}
+  \item \texttt{pub const} declares a compile-time constant, public outside this module.
+    \texttt{MIN\_ZOOM}/\texttt{MAX\_ZOOM} encode the brief's 1\%--200\% requirement as
+    actual named values instead of magic numbers scattered through the code.
+  \item \texttt{\#[derive(Debug, Clone, Copy)]} is an \emph{attribute} that asks the
+    compiler to auto-generate three trait implementations: \texttt{Debug} (so
+    \texttt{\{:?\}} can print a \texttt{Camera} for debugging), and \texttt{Clone}+
+    \texttt{Copy} (so a \texttt{Camera} value can be duplicated by simple bitwise copy —
+    cheap, since it's just two numbers — rather than requiring an explicit
+    \texttt{.clone()} call or being \emph{moved} out from under its owner, which is Rust's
+    default for most types).
+  \item \texttt{DVec2} is \texttt{glam}'s two-component \texttt{f64} vector type —
+    \texttt{glam} is the math library chosen in Phase 0's research for exactly this: a
+    well-tested, fast vector/matrix type instead of hand-rolling one.
+  \item Every field is \texttt{pub}: there's no invariant between \texttt{pan} and
+    \texttt{zoom} that setting them directly could violate, so there's no reason to hide
+    them behind getter/setter methods (a very un-Rust pattern anyway).
+\end{itemize}
+
+\subsection{Panning}
+\begin{lstlisting}
+pub fn pan_by_screen_delta(&mut self, screen_delta: DVec2) {
+    self.pan -= screen_delta / self.zoom;
+}
+\end{lstlisting}
+\texttt{\&mut self} is Rust's way of saying ``this method needs to mutate the
+\texttt{Camera} it's called on.'' Compare to \texttt{\&self} (read-only borrow, used
+below) and plain \texttt{self} (takes ownership, consumes the value — not used here since
+we want to keep using the camera afterwards). The borrow checker enforces that only one
+\texttt{\&mut} borrow of a value can exist at a time, which is what prevents, e.g., two
+parts of the event loop from mutating the camera simultaneously and corrupting it.
+
+The math: dragging the mouse by \texttt{screen\_delta} pixels should move the board content
+by that many \emph{screen} pixels, which is \texttt{screen\_delta / zoom} board units (at
+2x zoom, 10 screen pixels of drag is only 5 board units). Subtracting (rather than adding)
+is because \texttt{pan} is defined as ``the board point at the viewport center'' — dragging
+the canvas right moves that center point left in board space.
+
+\subsection{Zooming, anchored on the cursor}
+\begin{lstlisting}
+pub fn zoom_by(&mut self, factor: f64, anchor_screen: DVec2, viewport: DVec2) {
+    let anchor_board_before = self.screen_to_board(anchor_screen, viewport);
+    self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+    let anchor_board_after = self.screen_to_board(anchor_screen, viewport);
+    self.pan += anchor_board_before - anchor_board_after;
+}
+\end{lstlisting}
+This is the ``zoom towards the cursor'' behavior every decent editor has: find which board
+point is currently under the cursor, change the zoom, then nudge \texttt{pan} so that same
+board point is \emph{still} under the cursor. \texttt{f64::clamp} is a standard-library
+method that restricts a value to a range in one call — this is where \texttt{MIN\_ZOOM}/
+\texttt{MAX\_ZOOM} actually get enforced, so no code path can push zoom outside the brief's
+range no matter how it's called.
+
+\subsection{Coordinate conversion and the view matrix}
+\begin{lstlisting}
+pub fn screen_to_board(&self, screen: DVec2, viewport: DVec2) -> DVec2 {
+    (screen - viewport * 0.5) / self.zoom + self.pan
+}
+
+pub fn view_matrix(&self, viewport: Vec2) -> Mat4 {
+    let zoom = self.zoom as f32;
+    let pan = self.pan.as_vec2();
+    let scale = Mat4::from_scale(Vec3::new(
+        2.0 * zoom / viewport.x,
+        -2.0 * zoom / viewport.y,
+        1.0,
+    ));
+    let translate = Mat4::from_translation(Vec3::new(-pan.x, -pan.y, 0.0));
+    scale * translate
+}
+\end{lstlisting}
+\texttt{screen\_to\_board} inverts the view transform: screen pixels, relative to the
+viewport center, scaled down by zoom, then shifted by the pan offset. \texttt{view\_matrix}
+builds the matrix the GPU actually uses, as a composition of two 4x4 matrices: translate by
+\texttt{-pan} first, then scale into \emph{clip space} (wgpu's $[-1, 1]$ coordinate range,
+with Y flipped since board space is Y-down like screen space, but clip space is Y-up — the
+\texttt{-2.0 * zoom / viewport.y} negative sign is doing that flip). Matrix multiplication
+with column vectors applies the \emph{rightmost} operation first, so \texttt{scale *
+translate} means ``translate, then scale,'' matching the math worked out in
+\texttt{planning/math.tex}. Note the explicit \texttt{as f32} cast: the camera itself
+stores \texttt{f64} (so board coordinates keep precision far from the origin), but GPU math
+is \texttt{f32} — the cast is the one place that precision gets intentionally narrowed, right
+before it reaches the GPU.
+
+\subsection{Tests}
+\label{sec:testing}
+\begin{lstlisting}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_clamps_to_brief_range() { /* ... */ }
+
+    #[test]
+    fn zoom_keeps_anchor_point_fixed_on_screen() { /* ... */ }
+}
+\end{lstlisting}
+\texttt{\#[cfg(test)]} tells the compiler to only include this module when running
+\texttt{cargo test} — it doesn't bloat the real binary. \texttt{mod tests \{ ... \}}
+declares a nested module; \texttt{use super::*;} pulls in everything from the parent module
+(\texttt{Camera}, \texttt{MIN\_ZOOM}, etc.) so the tests can use them unqualified. Each
+\texttt{\#[test]}-annotated function is run independently by the test harness. These are
+exactly the kind of tests that justify keeping \texttt{Camera} in \texttt{core}: no window,
+no GPU, just arithmetic — they run in milliseconds.
+
+\section{\texttt{blueboard-render}: the wgpu pipeline}
+
+File: \texttt{crates/blueboard-render/src/lib.rs}, plus the shader at
+\texttt{src/shader.wgsl}.
+
+\subsection{The GPU pipeline, conceptually}
+wgpu follows the WebGPU API fairly closely. The objects involved, in the order they're
+created:
+\begin{description}
+  \item[\texttt{Instance}] the entry point into the GPU API — picks a backend (Vulkan on
+    this Linux machine).
+  \item[\texttt{Surface}] the drawable target tied to the OS window.
+  \item[\texttt{Adapter}] a handle to a physical GPU.
+  \item[\texttt{Device} and \texttt{Queue}] the logical device used to create GPU
+    resources, and the queue used to submit work to it.
+  \item[\texttt{ShaderModule}] compiled WGSL (WebGPU's shading language) code.
+  \item[\texttt{RenderPipeline}] ties a vertex shader, a fragment shader, a vertex buffer
+    layout, and other fixed-function state (blending, primitive topology) into one
+    reusable object.
+  \item[\texttt{Buffer}] raw GPU memory — used here both for vertex data (the grid lines)
+    and for the uniform (the camera's view matrix, updated every frame).
+  \item[\texttt{BindGroup}] the mechanism by which a buffer (or texture, or sampler) is
+    actually attached to a pipeline at draw time — declared via a
+    \texttt{BindGroupLayout} that describes \emph{what} will be bound, satisfied by a
+    \texttt{BindGroup} that provides the actual resource.
+\end{description}
+\texttt{Renderer::new} in the code builds exactly this chain, once, at startup.
+\texttt{Renderer::render} runs every frame: write the current camera matrix into the
+uniform buffer, acquire a texture to draw into, record drawing commands into a
+\texttt{CommandEncoder}, submit them, and present the result.
+
+\subsection{Async setup and \texttt{pollster}}
+\begin{lstlisting}
+pub async fn new<W>(window: Arc<W>, size: (u32, u32)) -> Self
+where
+    W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+{ /* ... */ }
+\end{lstlisting}
+Requesting a GPU adapter and device are asynchronous operations in wgpu (they may involve
+waiting on the driver). Rust's \texttt{async fn} doesn't run on its own — it returns a
+\emph{future} that has to be driven to completion by an executor. Rather than pull in a
+full async runtime like \texttt{tokio} for two awaited calls, the app crate uses
+\texttt{pollster::block\_on(...)}, a tiny crate whose entire job is ``run this future to
+completion on the current thread, synchronously.'' That's a deliberate scope choice: Phase
+1 doesn't need concurrent I/O, so the simplest thing that works was used instead of the
+heavier standard tool.
+
+\subsection{Generic over the window type}
+The \texttt{where W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static} clause is
+a \emph{trait bound}: instead of \texttt{Renderer::new} taking a concrete
+\texttt{winit::window::Window}, it takes \emph{any} type \texttt{W} that implements the two
+\texttt{raw-window-handle} traits wgpu needs to create a surface, plus \texttt{Send + Sync}
+(safe to share across threads) and \texttt{'static} (doesn't borrow anything with a limited
+lifetime). This is what keeps \texttt{blueboard-render} from depending on \texttt{winit} at
+all — per \texttt{PLAN.md}'s architecture section, render ``knows nothing about UI,'' and
+this is the concrete mechanism that makes that true while still letting \texttt{winit}'s
+\texttt{Window} be passed in from the app crate.
+
+\texttt{Arc<W>} (atomically-reference-counted pointer) is needed because the window has to
+be kept alive for as long as the \texttt{Surface} borrows from it, \emph{and} the app crate
+separately keeps its own handle to the same window to call things like
+\texttt{request\_redraw()}. \texttt{Arc} allows both owners to share the same allocation
+safely; \texttt{window.clone()} elsewhere in the app crate just bumps a reference count, it
+doesn't copy the window.
+
+\subsection{Vertex data and \texttt{bytemuck}}
+\begin{lstlisting}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 2],
+}
+\end{lstlisting}
+GPU buffers are raw bytes with an agreed-upon layout — there's no type information on the
+GPU side. \texttt{\#[repr(C)]} pins the struct's memory layout to C conventions (no field
+reordering, which Rust is otherwise free to do), so it matches exactly what the shader
+expects. \texttt{bytemuck::Pod} (``plain old data'') and \texttt{Zeroable} are marker
+traits, checked at compile time, that certify a type is safe to reinterpret as a byte
+slice — which is what \texttt{bytemuck::cast\_slice(\&grid\_vertices)} does when uploading
+the grid to a GPU buffer. Without those guarantees, reinterpreting arbitrary structs as
+bytes would be undefined behavior (e.g. if the struct contained a pointer or had padding
+with uninitialized memory); \texttt{bytemuck} makes it a checked, safe operation instead.
+
+\subsection{The reference grid}
+\begin{lstlisting}
+fn generate_grid_lines(extent: f32, spacing: f32) -> Vec<Vertex> {
+    let mut verts = Vec::new();
+    let mut x = -extent;
+    while x <= extent {
+        verts.push(Vertex { position: [x, -extent] });
+        verts.push(Vertex { position: [x, extent] });
+        x += spacing;
+    }
+    // ... same for horizontal lines ...
+    verts
+}
+\end{lstlisting}
+A plain function generating a \texttt{Vec<Vertex>} of line endpoints (pairs, since the
+pipeline is configured with \texttt{PrimitiveTopology::LineList} — every two vertices is
+one independent line segment). This exists purely so the camera's pan/zoom has something
+visible to confirm against before Phase 2 introduces real scene elements — it is
+explicitly \emph{not} the beginning of the real rendering pipeline (no culling, no LOD, no
+caching — all of that is future-phase work per \texttt{PLAN.md}).
+
+\subsection{The shader}
+\begin{lstlisting}[language=C]
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: CameraUniform;
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = camera.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.35, 0.35, 0.4, 1.0);
+}
+\end{lstlisting}
+WGSL is its own language, not Rust, though the syntax rhymes (it was designed around the
+same era with similar sensibilities). \texttt{@group(0) @binding(0)} matches the
+\texttt{BindGroupLayout} set up in Rust — group 0, binding 0 is where the camera's view
+matrix uniform buffer is attached. \texttt{vs\_main} runs once per vertex, transforming
+board-space positions into clip space by multiplying by the camera's matrix.
+\texttt{fs\_main} runs once per covered pixel, here just returning a flat gray.
+
+\paragraph{The one real bug this phase hit.} The first version of \texttt{fs\_main} was
+written as \texttt{fn fs\_main(in: VertexOutput) -> vec4<f32>}, without the
+\texttt{@location(0)} attribute on the return type. That compiles fine in Rust (shaders are
+just a string embedded via \texttt{include\_str!} until runtime) but \texttt{wgpu} panicked
+the moment the app actually ran: \textit{"Entry point arguments and return values must all
+have bindings."} WGSL requires every shader input/output to declare which pipeline binding
+it corresponds to; a fragment shader's return value implicitly needs \texttt{@location(0)}
+to say ``this is color target 0.'' This is exactly why \S\ref{sec:verification} (actually
+running the app) matters: \texttt{cargo build} and \texttt{cargo clippy} both passed clean
+with this bug present, because shader validation only happens when wgpu actually compiles
+the WGSL at runtime.
+
+\subsection{The result enum, not a direct error propagation}
+\begin{lstlisting}
+pub enum RenderOutcome {
+    Rendered,
+    Skipped,
+    NeedsReconfigure,
+}
+\end{lstlisting}
+Newer wgpu versions changed \texttt{Surface::get\_current\_texture} to return an enum
+(\texttt{CurrentSurfaceTexture}) covering several expected-but-not-fatal conditions
+(window occluded, surface outdated after a resize, etc.) rather than a
+\texttt{Result<\_, SurfaceError>}. Rather than have \texttt{blueboard-app} match on wgpu's
+enum directly — which would mean the app crate depending on the exact wgpu version used
+inside render — \texttt{Renderer::render} translates it into this small,
+render-crate-owned enum. This is the same ``keep the boundary thin'' instinct as the
+generic window type above: \texttt{blueboard-app} reacts to three outcomes it actually
+cares about, and doesn't need to know wgpu exists.
+
+\section{\texttt{blueboard-app}: the event loop}
+
+File: \texttt{crates/blueboard-app/src/main.rs}.
+
+\subsection{\texttt{ApplicationHandler}, not a closure}
+Older \texttt{winit} versions ran an event loop via a closure:
+\texttt{event\_loop.run(move |event, elwt| \{ ... \})}. The version resolved by Cargo for
+this project (0.30) replaced that with a trait:
+\begin{lstlisting}
+struct App {
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    camera: Camera,
+    dragging: bool,
+    last_cursor: DVec2,
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) { /* ... */ }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) { /* ... */ }
+}
+\end{lstlisting}
+\texttt{App} is a plain struct holding all the state the event loop needs between
+callbacks. \texttt{window} and \texttt{renderer} are \texttt{Option}s because they don't
+exist yet when the program starts — they're created inside \texttt{resumed}, which winit
+guarantees is called once the platform backend is actually ready to create windows (on some
+platforms, e.g. mobile, a window cannot be created before this point at all, which is why
+winit moved to this model). \texttt{\#[derive(Default)]} on \texttt{App} works here because
+every field has a sensible default: \texttt{None}, \texttt{Camera::default()} (pan at
+origin, 100\% zoom), \texttt{false}, and \texttt{DVec2::ZERO}.
+
+\subsection{Handling events: pattern matching}
+\begin{lstlisting}
+let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
+    return;
+};
+
+match event {
+    WindowEvent::CloseRequested => event_loop.exit(),
+    WindowEvent::Resized(size) => {
+        renderer.resize((size.width, size.height));
+        window.request_redraw();
+    }
+    WindowEvent::RedrawRequested => match renderer.render(&self.camera) {
+        RenderOutcome::Rendered | RenderOutcome::Skipped => {}
+        RenderOutcome::NeedsReconfigure => { /* ... */ }
+    },
+    // ...
+    _ => {}
+}
+\end{lstlisting}
+Two Rust features doing a lot of work here:
+\begin{itemize}
+  \item \textbf{\texttt{let-else}}: \texttt{let (Some(window), Some(renderer)) = (...) else
+    \{ return; \}} destructures the two \texttt{Option}s and, if either is \texttt{None}
+    (i.e. the window isn't created yet), returns early — avoiding a deeply nested
+    \texttt{if let Some(...) = ... \{ if let Some(...) = ... \{ ... \} \}}.
+  \item \textbf{\texttt{match} on enums}: \texttt{WindowEvent} is an enum with one variant
+    per kind of input/system event. The compiler checks match arms are exhaustive — the
+    trailing \texttt{\_ => \{\}} catches every event this phase doesn't care about yet (and
+    is required for the match to compile, since otherwise not every \texttt{WindowEvent}
+    variant would be handled). The nested \texttt{match renderer.render(...)} does the same
+    thing for the \texttt{RenderOutcome} enum described above, with \texttt{|} used to
+    group two variants (\texttt{Rendered} and \texttt{Skipped}) that need no action.
+\end{itemize}
+
+\subsection{Pan and zoom input}
+\begin{lstlisting}
+WindowEvent::CursorMoved { position, .. } => {
+    let cursor = DVec2::new(position.x, position.y);
+    if self.dragging {
+        self.camera.pan_by_screen_delta(cursor - self.last_cursor);
+        window.request_redraw();
+    }
+    self.last_cursor = cursor;
+}
+\end{lstlisting}
+\texttt{WindowEvent::CursorMoved \{ position, .. \}} destructures just the \texttt{position}
+field out of the event struct, with \texttt{..} meaning ``ignore the rest.'' Panning is
+computed as the delta between this move and the last recorded cursor position — which is
+why \texttt{last\_cursor} has to be tracked across events rather than recomputed each time.
+\texttt{window.request\_redraw()} is called explicitly after any state change that should
+cause a new frame — winit does not redraw continuously by default; it waits to be told a
+redraw is needed, which keeps the app idle (no CPU/GPU usage) when nothing is happening.
+
+\section{Tools used, and why}
+
+\begin{description}
+  \item[Nix flake + direnv] (\texttt{flake.nix}, \texttt{.envrc}) pin the exact Rust
+    toolchain and all native runtime libraries (Vulkan loader, Wayland/X11 client
+    libraries) so the dev environment is reproducible rather than depending on whatever
+    happens to be installed system-wide — standard practice on NixOS, decided in Phase 0.
+  \item[\texttt{cargo}] Rust's build tool and package manager; \texttt{cargo add} was used
+    throughout this phase to let the dependency resolver pick current, mutually-compatible
+    versions of \texttt{winit}, \texttt{wgpu}, \texttt{glam}, and \texttt{bytemuck} rather
+    than hand-guessing version numbers.
+  \item[\texttt{cargo fmt} / \texttt{cargo clippy}] formatting and linting, enforced as a
+    \texttt{lefthook} pre-commit hook (Phase 0) so style issues never land in history.
+  \item[\texttt{xdotool} and ImageMagick's \texttt{import}] used one-off (via \texttt{nix
+    -shell -p}, not added to the project's own dev shell) to actually drive the running app
+    — move the mouse, drag, scroll — and screenshot the result, which is how the shader bug
+    above was caught and how pan/zoom were confirmed working rather than just assumed from
+    reading the code.
+\end{description}
+
+\section{Decisions worth calling out}
+\label{sec:verification}
+
+\begin{itemize}
+  \item \textbf{Camera in \texttt{core}, not \texttt{render}.} Discussed in \S2.1 — the
+    payoff was concrete: two unit tests run in milliseconds with no GPU involved.
+  \item \textbf{A render-crate-owned \texttt{RenderOutcome} enum instead of re-exporting
+    wgpu's error type.} wgpu's own API for this changed shape within the same minor
+    version range explored during this phase; insulating the app crate behind a small,
+    stable enum means a future wgpu upgrade only has to be reconciled in one place.
+  \item \textbf{A static reference grid, not real scene rendering.} Deliberately minimal:
+    enough to see the camera work, nothing that would need to be thrown away once Phase 2
+    introduces actual vector strokes, tessellation, and culling.
+  \item \textbf{Verification meant actually running the app}, not just a clean
+    \texttt{cargo build}. The shader bug in \S3.6 would have shipped invisibly otherwise —
+    it is a class of bug (runtime shader validation) that Rust's own compiler cannot catch,
+    since WGSL lives in a string until wgpu parses it.
+\end{itemize}
+
+\section{What's next}
+Phase 2, per \texttt{PLAN.md}: the vector pen. Freehand pointer input gets fit to cubic
+Bezier paths (the fitting algorithm is already derived in \texttt{planning/math.tex}),
+tessellated into the GPU meshes the renderer now knows how to draw, and stored in
+\texttt{core}'s scene graph indexed by the R-tree that viewport culling will use starting
+in that phase.
+
+\end{document}
