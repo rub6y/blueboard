@@ -138,15 +138,21 @@ fn tessellate_stroke(path: &kurbo::BezPath, width: f32, tolerance: f32, out: &mu
 
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
     let mut tessellator = StrokeTessellator::new();
-    tessellator
-        .tessellate_path(
-            &lyon_path,
-            &options,
-            &mut BuffersBuilder::new(&mut buffers, |vertex: StrokeVertex| Vertex {
-                position: vertex.position().to_array(),
-            }),
-        )
-        .expect("stroke tessellation failed");
+    let result = tessellator.tessellate_path(
+        &lyon_path,
+        &options,
+        &mut BuffersBuilder::new(&mut buffers, |vertex: StrokeVertex| Vertex {
+            position: vertex.position().to_array(),
+        }),
+    );
+
+    // A malformed path (e.g. a degenerate curve from an edge case in curve fitting)
+    // should drop just this one stroke, logged, rather than panicking the whole app —
+    // losing one stroke's render is recoverable, a hard crash mid-drawing isn't.
+    if let Err(err) = result {
+        log::error!("stroke tessellation failed, skipping this stroke: {err:?}");
+        return;
+    }
 
     out.extend(
         buffers
@@ -236,6 +242,19 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .expect("failed to create wgpu device");
+
+        // wgpu's default behavior for an uncaptured device error (a validation error from
+        // any draw/buffer/pipeline call that isn't inside a push_error_scope) is to treat
+        // it as fatal and panic the whole process — confirmed the hard way by the Phase 1
+        // shader bug, whose log literally read "Handling wgpu errors as fatal by default"
+        // right before the panic. Logging instead turns "the app vanished, no idea why"
+        // into a diagnosable line in the log file.
+        device.on_uncaptured_error(Arc::new(|error| {
+            log::error!("wgpu uncaptured error: {error}");
+        }));
+        device.set_device_lost_callback(|reason, message| {
+            log::error!("wgpu device lost: {reason:?}: {message}");
+        });
 
         let surface_caps = surface.get_capabilities(&adapter);
         let format = surface_caps
@@ -433,9 +452,13 @@ impl Renderer {
                 return RenderOutcome::Skipped;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                log::warn!("surface outdated/lost, reconfiguring");
                 return RenderOutcome::NeedsReconfigure;
             }
-            wgpu::CurrentSurfaceTexture::Validation => return RenderOutcome::Skipped,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::error!("wgpu validation error acquiring surface texture");
+                return RenderOutcome::Skipped;
+            }
         };
 
         let viewport = glam::Vec2::new(self.config.width as f32, self.config.height as f32);

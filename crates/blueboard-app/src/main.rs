@@ -18,6 +18,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod logging;
+
 /// How far (in screen pixels, at the zoom level the stroke was drawn at) the fitted curve
 /// is allowed to deviate from the raw pointer samples — see `planning/math.tex`'s curve
 /// fitting section. Converted to board-space units by dividing by the current zoom, so a
@@ -28,11 +30,25 @@ use winit::window::{Window, WindowId};
 /// trades smoothness for positional fidelity nobody can actually see.
 const PEN_FIT_TOLERANCE_PX: f64 = 2.5;
 
-/// Minimum screen-space distance between recorded raw pointer samples while drawing.
+/// Minimum screen-space distance between recorded pointer samples while drawing.
 /// Pointer-move events arrive far more densely than meaningful hand motion, so most of
 /// that density is jitter, not intent — decimating by distance (rather than keeping every
-/// event) stops that jitter from ever reaching the curve fitter as fake curvature.
+/// event) stops redundant near-duplicate points from ever reaching the curve fitter.
+///
+/// Decimation alone only thins point *density*, though — it doesn't touch the *position*
+/// of the points that survive, so real jitter is still baked into each one. That's
+/// invisible at the zoom level a stroke was drawn at (within [`PEN_FIT_TOLERANCE_PX`]) but
+/// becomes visible as small regular kinks once zoomed in further. [`PEN_STREAMLINE_ALPHA`]
+/// below is what actually addresses that.
 const PEN_MIN_SAMPLE_DISTANCE_PX: f64 = 2.0;
+
+/// Exponential-moving-average weight given to each new raw pointer position, applied
+/// *before* decimation — same idea as the "streamline" parameter in
+/// [perfect-freehand](https://github.com/steveruizok/perfect-freehand) (used by tldraw and
+/// Excalidraw's pen tools): pull the recorded point toward a running average of recent
+/// positions instead of recording the raw, jittery position directly. Lower = smoother but
+/// laggier (recorded points trail further behind the actual cursor).
+const PEN_STREAMLINE_ALPHA: f64 = 0.5;
 
 #[derive(Default)]
 struct App {
@@ -48,6 +64,9 @@ struct App {
     /// Screen-space position of the last *recorded* sample in `current_stroke` (not
     /// necessarily the last `CursorMoved` event — see [`PEN_MIN_SAMPLE_DISTANCE_PX`]).
     last_sample_screen: DVec2,
+    /// Running exponential moving average of the cursor position while drawing — see
+    /// [`PEN_STREAMLINE_ALPHA`]. What actually gets decimated/recorded, not the raw cursor.
+    smoothed_cursor: DVec2,
     last_cursor: DVec2,
 }
 
@@ -67,7 +86,9 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
         let size = window.inner_size();
+        log::info!("window created at {}x{}", size.width, size.height);
         let renderer = pollster::block_on(Renderer::new(window.clone(), (size.width, size.height)));
+        log::info!("renderer initialized");
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -110,6 +131,7 @@ impl ApplicationHandler for App {
                 self.drawing = state == ElementState::Pressed;
                 if self.drawing {
                     self.current_stroke.clear();
+                    self.smoothed_cursor = self.last_cursor;
                     self.last_sample_screen = self.last_cursor;
                     let (width, height) = renderer.viewport_size();
                     let viewport = DVec2::new(width as f64, height as f64);
@@ -117,8 +139,12 @@ impl ApplicationHandler for App {
                         .push(self.camera.screen_to_board(self.last_cursor, viewport));
                 } else if self.current_stroke.len() >= 2 {
                     let accuracy = PEN_FIT_TOLERANCE_PX / self.camera.zoom;
+                    let raw_points = self.current_stroke.len();
                     if let Some(path) = fit_stroke(&self.current_stroke, accuracy) {
-                        self.scene.add_stroke(path);
+                        let id = self.scene.add_stroke(path);
+                        log::info!("stroke {id} committed from {raw_points} raw samples");
+                    } else {
+                        log::warn!("fit_stroke returned None for {raw_points} raw samples");
                     }
                     self.current_stroke.clear();
                     window.request_redraw();
@@ -140,15 +166,18 @@ impl ApplicationHandler for App {
                 if self.panning {
                     self.camera.pan_by_screen_delta(cursor - self.last_cursor);
                     window.request_redraw();
-                } else if self.drawing
-                    && cursor.distance(self.last_sample_screen) >= PEN_MIN_SAMPLE_DISTANCE_PX
-                {
-                    let (width, height) = renderer.viewport_size();
-                    let viewport = DVec2::new(width as f64, height as f64);
-                    self.current_stroke
-                        .push(self.camera.screen_to_board(cursor, viewport));
-                    self.last_sample_screen = cursor;
-                    window.request_redraw();
+                } else if self.drawing {
+                    self.smoothed_cursor = self.smoothed_cursor.lerp(cursor, PEN_STREAMLINE_ALPHA);
+                    if self.smoothed_cursor.distance(self.last_sample_screen)
+                        >= PEN_MIN_SAMPLE_DISTANCE_PX
+                    {
+                        let (width, height) = renderer.viewport_size();
+                        let viewport = DVec2::new(width as f64, height as f64);
+                        self.current_stroke
+                            .push(self.camera.screen_to_board(self.smoothed_cursor, viewport));
+                        self.last_sample_screen = self.smoothed_cursor;
+                        window.request_redraw();
+                    }
                 }
                 self.last_cursor = cursor;
             }
@@ -183,7 +212,8 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    env_logger::init();
+    let log_path = logging::init();
+    log::info!("blueboard starting, logging to {}", log_path.display());
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App::default();
