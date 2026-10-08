@@ -2,6 +2,39 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-08 — Phase 2 complete: vector pen
+- [[Fitting]] (`blueboard-core/src/fitting.rs`) fits raw pointer samples to a
+  [[Bezier_curve]] path by wrapping them as a `kurbo::ParamCurveFit` source (a
+  piecewise-linear polyline parameterized by normalized arc length) and reusing kurbo's
+  own `fit_to_bezpath`, rather than hand-implementing Schneider's algorithm — same math as
+  `planning/math.tex`, a maintained implementation instead of a bespoke one.
+- [[Scene_graph]] implemented as `Scene`/`Stroke` in `blueboard-core/src/scene.rs`, indexed
+  by an [[RTree_index]] (`rstar`) keyed on each stroke's bounding box.
+- [[Render_crate]] tessellates visible strokes via `lyon` (through a small kurbo-path ->
+  lyon-path adapter) and queries the scene's R-tree by the camera's current viewport each
+  frame before tessellating — [[Viewport_culling]] is wired in now per PLAN.md, even though
+  boards are still small; tessellation *caching* stays future-phase work.
+- Artistic direction from ruba: board background is deep blue, pen strokes (and the live
+  preview of a stroke still being drawn) are white.
+- **Bug found by comparing against Miro's rendering** (ruba's side-by-side screenshot):
+  blueboard's lines looked visibly jagged/faceted. Root causes, all fixed:
+  1. No MSAA — every triangle edge was a hard aliased boundary. Fixed with a 4x
+     multisampled offscreen target resolved into the swapchain each frame.
+  2. Stroke tessellation's flattening tolerance was a hardcoded board-space constant,
+     not divided by zoom — inconsistent with `planning/math.tex` §3's own documented
+     design (tolerance must be screen-space, tightening as zoom increases). The curve
+     *fit* tolerance had this right from the start; the tessellation tolerance didn't.
+  3. Default miter line joins read as sharper-cornered than Miro's pen; switched to round
+     joins/caps.
+- [[App_crate]] input scheme: left-drag now draws (was pan in Phase 1), middle-drag pans,
+  scroll still zooms.
+- Verified by running the binary and drawing with `xdotool`+screenshots. Noted for later
+  reference: this environment's `import -window` screenshot sometimes shows stale content
+  from a window's *previous* process (confirmed via matching pid/window-id that no second
+  process was involved) — looks like compositor-level window-thumbnail caching, not a bug
+  in the app; worth knowing before trusting a screenshot taken immediately after launch.
+- Milestone tag: `v0.2-vector-pen` (see [[Git_workflow]]).
+
 ## 2026-10-08 — Phase 1 complete: window, camera, grid
 - A [[Camera]] (pan/zoom state, board-space <-> screen-space math) was added to
   [[Core_crate]] — pure `glam`-based math, no GPU dependency, covered by unit tests for
