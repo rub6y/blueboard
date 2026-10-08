@@ -1,0 +1,290 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.97}
+\definecolor{codeframe}{rgb}{0.8,0.8,0.82}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  xleftmargin=1em,
+  xrightmargin=1em,
+  aboveskip=1em,
+  belowskip=1em,
+}
+
+\title{Blueboard Phase 3, explained}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{What this document is}
+Phase 3 (\texttt{PLAN.md}, tag \texttt{v0.3-file-format}) gave Blueboard a save format:
+\texttt{.bbd}, a compressed binary file that round-trips a board's strokes exactly. Smaller
+in scope than Phases 1--2, but file formats carry a particular kind of risk — a bug here
+doesn't just look wrong, it can destroy a user's work — so this note spends real time on
+the error handling and testing, not just the happy path. Same companion-to-the-code format
+as the previous two notes.
+
+\tableofcontents
+
+\section{The shape of the problem}
+A save format has to answer four questions, and this phase answers them in order:
+\begin{enumerate}
+  \item \textbf{What gets written?} Not a direct dump of the runtime \texttt{Scene} —
+    \S\ref{sec:schema} covers why a separate on-disk schema was worth the extra type.
+  \item \textbf{How is it encoded?} \texttt{serde} to describe the data, \texttt{bincode}
+    to pack it into dense bytes, \texttt{zstd} to compress those bytes — the pipeline
+    \texttt{RESEARCH.md} §3 committed to back in Phase 0.
+  \item \textbf{What happens when it's wrong?} A truncated file, a future format version, a
+    disk error — \S\ref{sec:errors} covers making these distinguishable, logged failures
+    instead of panics or silent corruption.
+  \item \textbf{How do you know it actually works?} \S\ref{sec:testing} and
+    \S\ref{sec:verification} — round-trip tests, then actually running the app and
+    reloading a real file from disk across two separate process launches.
+\end{enumerate}
+
+\section{The on-disk schema, kept separate from the runtime scene}
+\label{sec:schema}
+File: \texttt{crates/blueboard-core/src/file\_format.rs}.
+\begin{lstlisting}
+#[derive(Serialize, Deserialize)]
+struct StrokeDocument {
+    id: u64,
+    path: BezPath,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SceneDocument {
+    version: u32,
+    strokes: Vec<StrokeDocument>,
+}
+\end{lstlisting}
+It would have been shorter to just derive \texttt{Serialize}/\texttt{Deserialize} directly
+on \texttt{Scene} and \texttt{Stroke} from \texttt{scene.rs}. That was deliberately not
+done: \texttt{Scene} also owns an \texttt{RTree} spatial index (Phase 2), which is
+\emph{derived} data — fully determined by the strokes themselves, rebuilt in a few
+microseconds on load. Serializing it would bloat every file with redundant bytes and,
+worse, would couple the file format's stability to \texttt{Scene}'s internal
+implementation: a future refactor of how the scene graph is indexed would otherwise risk
+silently breaking every previously-saved \texttt{.bbd} file. A small, separate,
+file-format-only type is the standard way to avoid that coupling — it's the same instinct
+as \texttt{RenderOutcome} in Phase 1 (don't let an internal representation leak across a
+boundary that should stay stable).
+
+\texttt{BezPath} itself can be serialized because \texttt{kurbo} ships a \texttt{serde}
+cargo feature (\texttt{\#[cfg\_attr(feature = "serde", derive(Serialize, Deserialize))]}
+on its own types) — enabled via \texttt{cargo add kurbo --features serde} rather than
+writing a manual (de)serializer for every path element variant.
+
+\section{Save: scene \texorpdfstring{$\to$}{->} bytes \texorpdfstring{$\to$}{->} compressed bytes \texorpdfstring{$\to$}{->} disk}
+\begin{lstlisting}
+pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), SaveError> {
+    let mut strokes: Vec<StrokeDocument> = scene
+        .all_strokes()
+        .map(|stroke| StrokeDocument { id: stroke.id, path: stroke.path.clone() })
+        .collect();
+    strokes.sort_by_key(|stroke| stroke.id);
+
+    let document = SceneDocument { version: FORMAT_VERSION, strokes };
+
+    let encoded = bincode::serde::encode_to_vec(&document, bincode::config::standard())
+        .map_err(SaveError::Encode)?;
+    let compressed = zstd::encode_all(&encoded[..], zstd::DEFAULT_COMPRESSION_LEVEL)
+        .map_err(SaveError::Io)?;
+    std::fs::write(path, compressed).map_err(SaveError::Io)
+}
+\end{lstlisting}
+\texttt{impl AsRef<Path>} is the standard Rust pattern for ``accept anything path-like'' —
+a \texttt{\&str}, a \texttt{String}, a \texttt{PathBuf}, a \texttt{\&Path}, all implement
+\texttt{AsRef<Path>}, so callers don't have to convert to a specific type first.
+\texttt{sort\_by\_key(|stroke| stroke.id)} matters for a reason that isn't obvious from
+reading \texttt{save} in isolation: \texttt{Scene} stores strokes in a \texttt{HashMap},
+whose iteration order is \emph{not} guaranteed stable between runs (Rust's
+\texttt{HashMap} deliberately randomizes its hash seed per-process, partly as a
+DoS-hardening measure). Without sorting, saving the exact same scene twice could produce
+byte-for-byte different files — harmless for correctness, but bad for anyone diffing
+files or expecting determinism.
+
+\texttt{.map\_err(SaveError::Encode)?} is doing two things in one expression: an error
+type belonging to a dependency (\texttt{bincode::error::EncodeError}) gets wrapped into
+this module's own \texttt{SaveError} enum via \texttt{map\_err} (which takes the error out
+of a \texttt{Result} and runs it through a conversion function — here, an enum variant's
+constructor, which is itself a valid function in Rust), and then \texttt{?} either unwraps
+the \texttt{Ok} value and keeps going, or returns the (now-wrapped) \texttt{Err} out of
+\texttt{save} immediately. Chaining three fallible steps (encode, compress, write) this way
+reads almost like the happy path alone, with error handling pushed to the margins rather
+than nested \texttt{match} blocks three deep.
+
+\section{Load, and refusing to misread a future format}
+\begin{lstlisting}
+pub fn load(path: impl AsRef<Path>) -> Result<Scene, LoadError> {
+    let compressed = std::fs::read(path).map_err(LoadError::Io)?;
+    let encoded = zstd::decode_all(&compressed[..]).map_err(LoadError::Decompress)?;
+    let (document, _): (SceneDocument, usize) =
+        bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+            .map_err(LoadError::Decode)?;
+
+    if document.version != FORMAT_VERSION {
+        return Err(LoadError::UnsupportedVersion(document.version));
+    }
+
+    let mut scene = Scene::new();
+    for stroke in document.strokes {
+        scene.insert_loaded_stroke(stroke.id, stroke.path);
+    }
+    Ok(scene)
+}
+\end{lstlisting}
+\texttt{decode\_from\_slice} returns \texttt{(D, usize)} — the decoded value \emph{and} how
+many bytes of the input it actually consumed (useful if more data might follow the encoded
+value in the same buffer, which doesn't apply here — the whole decompressed buffer is one
+document — hence the \texttt{\_} discarding that count). The explicit
+\texttt{version != FORMAT\_VERSION} check is the file format's forward-compatibility
+contract: rather than silently misinterpreting bytes written by some future, differently-
+shaped \texttt{SceneDocument}, an unrecognized version is a clean, named, loggable error.
+Writing that check now, with the format at version 1 and no actual version-2 reader to
+test against yet, is cheap insurance against the alternative — discovering the need for it
+only after a format change has already shipped and already produced files nobody can read.
+
+\texttt{Scene::insert\_loaded\_stroke} (new this phase, in \texttt{scene.rs}) is why
+loading doesn't just call the existing \texttt{add\_stroke}:
+\begin{lstlisting}
+pub(crate) fn insert_loaded_stroke(&mut self, id: u64, path: BezPath) {
+    self.insert_stroke(id, path);
+    self.next_id = self.next_id.max(id + 1);
+}
+\end{lstlisting}
+\texttt{add\_stroke} \emph{generates} a fresh id; loading needs to \emph{preserve} the ids
+a file was saved with (so, e.g., future undo/redo history or references between objects
+stay valid across a save/reload), while still making sure the next \emph{new} stroke drawn
+after loading doesn't collide with one of the ids just loaded.
+\texttt{pub(crate)} — rather than \texttt{pub} — restricts this method to code inside
+\texttt{blueboard-core} itself: \texttt{blueboard-app} should never need to fabricate a
+stroke with an arbitrary id, only \texttt{file\_format.rs} (in the same crate) legitimately
+does.
+
+\section{Errors that are values, not panics}
+\label{sec:errors}
+\begin{lstlisting}
+#[derive(Debug)]
+pub enum LoadError {
+    Io(std::io::Error),
+    Decompress(std::io::Error),
+    Decode(bincode::error::DecodeError),
+    UnsupportedVersion(u32),
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadError::Io(err) => write!(f, "failed to read file: {err}"),
+            /* ... */
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+\end{lstlisting}
+Four failure modes (can't read the file at all, the bytes aren't valid zstd, the
+decompressed bytes aren't a valid encoded \texttt{SceneDocument}, or they are but from an
+unrecognized version) get four distinct variants rather than being collapsed into one
+generic ``something went wrong.'' That distinction is what let \texttt{blueboard-app} log
+something specific (\S\ref{sec:verification}) instead of ``load failed'' with no further
+information. \texttt{impl std::error::Error for LoadError \{\}} is an empty implementation
+— \texttt{Error} only \emph{requires} \texttt{Debug + Display}, both already satisfied, so
+the trait impl body has nothing left to add; its only purpose is to mark \texttt{LoadError}
+as participating in Rust's standard error-handling ecosystem (so it can be boxed as
+\texttt{Box<dyn Error>}, used with \texttt{?} in a function returning that, etc.).
+
+\section{Testing: four round trips}
+\label{sec:testing}
+\begin{lstlisting}
+#[test]
+fn save_then_load_round_trips_scene() {
+    let mut scene = Scene::new();
+    scene.add_stroke(sample_path(0.0));
+    scene.add_stroke(sample_path(10.0));
+
+    let path = temp_bbd_path("round-trips-scene");
+    save(&scene, &path).expect("save should succeed");
+    let loaded = load(&path).expect("load should succeed");
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(loaded.len(), scene.len());
+    /* ...compare sorted (id, path) pairs for equality... */
+}
+\end{lstlisting}
+Four tests, each isolating one concern: an empty scene round-trips (the degenerate case —
+no strokes shouldn't be a special case that crashes), a multi-stroke scene round-trips
+with its data intact, a loaded scene's \emph{next} new stroke gets an id after the highest
+loaded one (exercising \texttt{insert\_loaded\_stroke}'s id-continuation specifically,
+separate from round-trip correctness), and a deliberately version-mismatched file is
+rejected rather than misread. \texttt{temp\_bbd\_path} builds a path under
+\texttt{std::env::temp\_dir()} salted with the running process id \emph{and} thread id —
+\texttt{cargo test} runs tests in parallel threads by default, so two round-trip tests
+writing to a shared, unsalted filename could race and corrupt each other's file mid-test.
+\texttt{std::fs::remove\_file(\&path).ok()} discards the \texttt{Result} deliberately — if
+cleanup fails (file already gone, permissions oddity), that's not something the test itself
+should fail over.
+
+\section{Wiring it into the running app}
+\label{sec:verification}
+Phase 4 (next) is where a real \texttt{:save}/\texttt{:open} command line arrives. Rather
+than wait for that to even see the file format work end-to-end, \texttt{blueboard-app}
+got two temporary, unceremonious key bindings:
+\begin{lstlisting}
+KeyCode::KeyS => match file_format::save(&self.scene, DEFAULT_BOARD_PATH) {
+    Ok(()) => log::info!("saved {} stroke(s) to {DEFAULT_BOARD_PATH}", self.scene.len()),
+    Err(err) => log::error!("save to {DEFAULT_BOARD_PATH} failed: {err}"),
+},
+\end{lstlisting}
+This is the payoff of \S\ref{sec:errors}'s \texttt{Display} impls: \texttt{\{err\}} in the
+format string works, and produces an actually-readable log line, specifically because
+\texttt{LoadError}/\texttt{SaveError} implement \texttt{Display} rather than only
+\texttt{Debug}. Verification wasn't just running these tests — it was drawing two real
+strokes, pressing \texttt{S}, \emph{killing the process entirely}, launching a brand new
+one, pressing \texttt{O}, and watching the same two strokes reappear. That's a meaningfully
+stronger test than the in-process round-trip tests above: it exercises the actual
+\texttt{.bbd} bytes written to a real disk file by one process and read back by a
+completely separate one, which is the only way file-format bugs that only manifest
+across process boundaries (e.g. a bug masked by some in-process cache) would ever surface.
+
+\section{A dependency-ecosystem trap}
+Adding bincode via \texttt{cargo add bincode} resolved to version \texttt{3.0.0} — and its
+entire \texttt{src/lib.rs} was one line:
+\begin{lstlisting}
+compile_error!("https://xkcd.com/2347/");
+\end{lstlisting}
+(the referenced comic is about the fragility of unglamorous, load-bearing open-source
+infrastructure). This is a placeholder/squatted version, not the real, actively-maintained
+bincode — that's still on the 2.x line. \texttt{cargo add} resolves to the
+highest-numbered \emph{semver-compatible} version satisfying the constraint it's given;
+with no constraint specified, that's simply the highest version number that exists on
+crates.io, real or not. The fix was pinning explicitly: \texttt{cargo add bincode@2}. The
+general lesson — already true, but freshly demonstrated — is that ``\texttt{cargo add}
+picked a version'' is not the same claim as ``\texttt{cargo add} picked a \emph{good}
+version''; worth a second look whenever a dependency resolves to a version number that
+feels surprising for how mature or stable the project is believed to be.
+
+\section{What's next}
+Phase 4, per \texttt{PLAN.md}: the vim-like \texttt{:}-command line and the config file.
+\texttt{:save}/\texttt{:save <path>}/\texttt{:new}/\texttt{:clear}/\texttt{:q} replace this
+phase's temporary \texttt{S}/\texttt{O} bindings, wired through a command registry
+designed so later addons can register their own commands the same way — the architecture
+\texttt{PLAN.md} committed to back in Phase 0, implemented for real starting now.
+
+\end{document}
