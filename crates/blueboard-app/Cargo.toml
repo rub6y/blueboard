@@ -1,0 +1,12 @@
+[package]
+name = "blueboard-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "blueboard"
+path = "src/main.rs"
+
+[dependencies]
+blueboard-core = { path = "../blueboard-core" }
+blueboard-render = { path = "../blueboard-render" }

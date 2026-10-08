@@ -1,0 +1,7 @@
+[package]
+name = "blueboard-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blueboard-core = { path = "../blueboard-core" }

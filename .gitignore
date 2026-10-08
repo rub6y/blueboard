@@ -1,0 +1,8 @@
+/target
+.direnv/
+*.bbd
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc

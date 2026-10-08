@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/blueboard-core",
+    "crates/blueboard-render",
+    "crates/blueboard-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
