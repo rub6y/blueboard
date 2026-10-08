@@ -21,8 +21,14 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Flat mid-gray grid lines — just enough to see the camera transform working;
-    // real elements arrive in Phase 2.
-    return vec4<f32>(0.35, 0.35, 0.4, 1.0);
+fn fs_grid(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Muted blue-grey, visible against the board background without competing with
+    // actual strokes.
+    return vec4<f32>(0.3, 0.38, 0.58, 1.0);
+}
+
+@fragment
+fn fs_stroke(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Pen strokes (and their live preview) are drawn in flat white.
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
 }
