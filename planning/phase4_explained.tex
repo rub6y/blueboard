@@ -1,0 +1,412 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.97}
+\definecolor{codeframe}{rgb}{0.8,0.8,0.82}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  xleftmargin=1em,
+  xrightmargin=1em,
+  aboveskip=1em,
+  belowskip=1em,
+}
+
+\title{Blueboard Phase 4, explained}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{What this document is}
+Phase 4 (\texttt{PLAN.md}, tag \texttt{v0.4-commands-and-config}) gave Blueboard the
+vim-like \texttt{:}-command line and a config file, replacing Phase 3's temporary
+\texttt{S}/\texttt{O} hotkeys with the real thing: a command registry, a rendered command
+bar, and configurable keybindings/theme. It's the first phase to pull in a UI library
+(\texttt{egui}) and the first to hit a genuine Rust borrow-checker wall worth explaining in
+depth, plus two bugs — one a crash, one a design risk — found only by running the app.
+Same companion-to-the-code format as the previous three notes.
+
+\tableofcontents
+
+\section{The shape of the problem}
+Four pieces, built in dependency order:
+\begin{enumerate}
+  \item \textbf{A command registry} (\S\ref{sec:registry}) — somewhere for \texttt{:save},
+    \texttt{:open}, etc. to live as data (a name plus a function), not a hardcoded
+    \texttt{match}, per \texttt{PLAN.md}'s addon-friendliness architecture.
+  \item \textbf{Something to render the command bar} (\S\ref{sec:egui}) — text at the
+    bottom of the window, which meant pulling in a UI library rather than hand-rolling
+    font rasterization.
+  \item \textbf{Input handling for typing a command} (\S\ref{sec:input}) — which ran
+    straight into a real ownership problem once commands needed to mutate the same
+    \texttt{App} struct that was dispatching them.
+  \item \textbf{A config file} (\S\ref{sec:config}) — so keybindings and colors aren't
+    recompiled-to-change.
+\end{enumerate}
+
+\section{The command registry}
+\label{sec:registry}
+File: \texttt{crates/blueboard-app/src/commands.rs}.
+\begin{lstlisting}
+pub trait Command {
+    fn name(&self) -> &'static str;
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String>;
+}
+
+#[derive(Default)]
+pub struct CommandRegistry {
+    commands: Vec<Box<dyn Command>>,
+}
+
+impl CommandRegistry {
+    pub fn register(&mut self, command: impl Command + 'static) {
+        self.commands.push(Box::new(command));
+    }
+
+    pub fn run(&self, app: &mut App, name: &str, args: &str) -> Result<String, String> {
+        match self.commands.iter().find(|command| command.name() == name) {
+            Some(command) => command.run(app, args),
+            None => Err(format!("unknown command: {name}")),
+        }
+    }
+}
+\end{lstlisting}
+\texttt{Box<dyn Command>} is a \emph{trait object}: a pointer to some heap-allocated value
+of an unknown concrete type, known only to implement \texttt{Command}. This is what lets
+\texttt{Vec<Box<dyn Command>>} hold a \texttt{SaveCommand}, an \texttt{OpenCommand}, and a
+\texttt{QuitCommand} side by side — they're different types, but the vector only needs to
+know they all answer to \texttt{.name()} and \texttt{.run(...)}. \texttt{impl Command +
+'static} in \texttt{register}'s signature means ``any concrete type implementing
+\texttt{Command}, as long as it doesn't borrow anything with a limited lifetime'' — required
+because the \texttt{Box} has to be able to outlive the call to \texttt{register}.
+
+Why does this live in \texttt{blueboard-app} rather than \texttt{blueboard-core}, where
+\texttt{PLAN.md}'s original architecture sketch implied a shared, reusable registry
+concept? Because \texttt{Command::run} takes \texttt{\&mut App} — and \texttt{App} (the
+\texttt{winit} event-loop struct holding the window, the scene, the camera, all of it) is
+itself defined in \texttt{blueboard-app}. \texttt{blueboard-core} is lower in the
+dependency graph (both \texttt{blueboard-render} and \texttt{blueboard-app} depend on it,
+not the other way around), so it can't depend on a type that only exists in
+\texttt{blueboard-app} without creating a dependency cycle. The registry pattern itself
+(name + trait-object dispatch) is exactly what \texttt{PLAN.md} intended; it just has to
+live next to the state it operates on.
+
+The five built-in commands (\texttt{save}, \texttt{open}, \texttt{clear}, \texttt{new},
+\texttt{q}) are each a one-method \texttt{struct}/\texttt{impl Command} pair. \texttt{new}
+is implemented by just calling \texttt{ClearCommand.run(app, args)} — there's no concept of
+multiple distinct boards/files yet to make ``start a new board'' meaningfully different
+from ``erase this one,'' so it's registered as its own name (so it shows up correctly if
+anything ever lists available commands) but shares an implementation rather than
+duplicating it.
+
+\section{Rendering the command bar with egui}
+\label{sec:egui}
+
+\subsection{Why a UI library at all}
+Text rendering is genuinely hard to do well from scratch: font parsing, glyph
+rasterization, subpixel layout, a texture atlas. \texttt{PLAN.md} committed to
+\texttt{egui} back in Phase 0 for exactly this reason — rather than build any of that,
+\texttt{egui} (paired with \texttt{egui-wgpu}, which bridges its output into an existing
+\texttt{wgpu} pipeline) does it well already.
+
+\subsection{Using egui as a renderer only, not an input system}
+Most \texttt{egui} integrations route all input (mouse, keyboard) through \texttt{egui}
+itself, letting it decide what's hovered/clicked/focused. Blueboard does the opposite:
+\texttt{winit} input is handled entirely by \texttt{blueboard-app} as before (\S2's pen
+and camera code didn't change), and \texttt{egui} is used purely to lay out and rasterize
+one string of text each frame:
+\begin{lstlisting}
+let raw_input = egui::RawInput {
+    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size_points)),
+    ..Default::default()
+};
+
+ctx.run_ui(raw_input, |ui| {
+    if matches!(content, CommandBarContent::Hidden) { return; }
+    egui::Panel::bottom("command_bar")
+        .exact_size(24.0)
+        .show(ui, |ui| {
+            ui.centered_and_justified(|ui| match content {
+                CommandBarContent::Editing { text } => { ui.monospace(format!(":{text}")); }
+                /* ... */
+            });
+        });
+})
+\end{lstlisting}
+No mouse/keyboard events are ever added to \texttt{RawInput} — just the screen size. This
+keeps \texttt{egui} entirely out of Blueboard's actual interaction model; it's a renderer
+being asked ``lay out this text and hand me triangles,'' nothing more. (\texttt{egui 0.36}
+also unified what used to be separate \texttt{TopBottomPanel}/\texttt{SidePanel} types into
+one \texttt{Panel} type with \texttt{Panel::bottom(id)} — found by reading the installed
+source directly, same as the wgpu API drift in Phase 1, since the version resolved by
+\texttt{cargo add} didn't match older tutorials/docs.)
+
+\subsection{Compositing onto the board: a second render pass}
+\texttt{blueboard-render}'s \texttt{render()} already did one pass (grid + strokes +
+preview, into an MSAA target, resolved to the swapchain). The command bar is a second,
+separate pass on the \emph{same} swapchain texture, after the first has resolved into it:
+\begin{lstlisting}
+let mut egui_pass = encoder
+    .begin_render_pass(&wgpu::RenderPassDescriptor {
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &view,              // the real swapchain texture, not the MSAA one
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,   // keep what the board pass already drew
+                store: wgpu::StoreOp::Store,
+            },
+            /* ... */
+        })],
+        /* ... */
+    })
+    .forget_lifetime();
+self.egui_renderer.render(&mut egui_pass, &clipped_primitives, &screen_descriptor);
+\end{lstlisting}
+\texttt{LoadOp::Load} (instead of \texttt{Clear}) is what makes this a composite rather
+than a replacement — the pass starts from whatever pixels are already there. No MSAA
+target is needed for this pass: \texttt{egui} does its own edge anti-aliasing
+(``feathering'') at the triangle level, so there's nothing for hardware multisampling to
+add here. \texttt{.forget\_lifetime()} converts the pass's borrow-checker-tracked lifetime
+(tied to the \texttt{CommandEncoder} it came from) into \texttt{'static} — required because
+\texttt{egui\_wgpu::Renderer::render} wants to be able to stash resources on the pass for
+its (unused, here) callback mechanism; it doesn't weaken any actual safety guarantee for
+code that, like Blueboard's, never uses callbacks.
+
+\subsection{A crash caught immediately by last round's logging work}
+The very first run of this code panicked:
+\begin{lstlisting}
+thread 'main' panicked at epaint-0.36.2/src/textures.rs:337:
+Dropped TexturesDelta with 1 unapplied deltas. Deltas need to be handled.
+If you want to drop this intentionally call `clear` before dropping.
+\end{lstlisting}
+\texttt{egui}'s \texttt{FullOutput::textures\_delta} tracks texture uploads (the font atlas,
+the first time any text is drawn) that the backend must apply. The code was iterating
+\texttt{\&egui\_output.textures\_delta.set} \emph{by reference} to call
+\texttt{update\_texture} for each one — which never removes anything from the
+\texttt{HashMap}, so when \texttt{egui\_output} went out of scope at the end of the
+function, its \texttt{Drop} implementation still saw entries present and panicked, exactly
+as its own error message explains. The fix is one line, once you know to look for it:
+\begin{lstlisting}
+egui_output.textures_delta.clear();
+\end{lstlisting}
+called after both the \texttt{set} and \texttt{free} loops, before \texttt{egui\_output}
+drops. This is precisely the payoff the crash-resilience/logging work from the previous
+round was built for: the panic showed up immediately, with a clear message, in the log
+file — not as a silent, unexplained disappearance.
+
+\section{Input handling and a real borrow-checker wall}
+\label{sec:input}
+
+\subsection{The conflict}
+\texttt{window\_event} (the \texttt{winit} callback) had, since Phase 1, started like this:
+\begin{lstlisting}
+fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else { return; };
+    match event { /* uses `window` and `renderer` throughout */ }
+}
+\end{lstlisting}
+That destructure borrows \texttt{self.window} and \texttt{self.renderer} — specific
+fields, not all of \texttt{self} — and those borrows stay alive for the rest of the
+function. Rust's borrow checker is smart enough to let other \emph{individual field}
+accesses on \texttt{self} coexist with that (e.g. \texttt{self.camera.pan\_by\_screen\_delta(...)}
+compiles fine alongside it, since it touches a different field). But command dispatch
+needed \texttt{registry.run(self, name, args)} — and that call's signature,
+\texttt{fn run(\&self, app: \&mut App, ...)}, demands an exclusive borrow of \emph{all of}
+\texttt{self}, which directly conflicts with the still-alive \texttt{window}/\texttt{renderer}
+field borrows. The compiler's actual message:
+\begin{lstlisting}
+error[E0502]: cannot borrow `*self` as mutable because it is also borrowed as immutable
+  | let (Some(window), ...) = (&self.window, ...) else { ... };
+  |                            ------------ immutable borrow occurs here
+  | let result = registry.run(self, name, args);
+  |                            ^^^^ mutable borrow occurs here
+\end{lstlisting}
+
+\subsection{The fix: handle keyboard input before the destructure exists}
+Rather than fight this inside the existing match arm, keyboard input is now handled in a
+separate branch, before \texttt{window}/\texttt{renderer} are ever borrowed:
+\begin{lstlisting}
+fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    if let WindowEvent::KeyboardInput { event, .. } = &event {
+        if event.state == ElementState::Pressed {
+            self.handle_key_press(event.clone(), event_loop);
+        }
+        return;
+    }
+
+    let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else { return; };
+    match event { /* unchanged: mouse, resize, redraw */ }
+}
+\end{lstlisting}
+\texttt{handle\_key\_press} is a separate method that calls \texttt{self.window.clone()} —
+an owned \texttt{Arc<Window>}, not a borrow of \texttt{self.window} — specifically so it
+doesn't hold any field-level borrow of \texttt{self} open while it goes on to call
+\texttt{registry.run(self, ...)}. \texttt{Arc::clone} is cheap (an atomic reference-count
+bump, not a deep copy), so this costs nothing meaningful at runtime; it's purely there to
+satisfy the borrow checker by changing \emph{what kind of access} to the window is held.
+
+\subsection{The registry's own self-reference, solved the same way}
+Inside \texttt{handle\_key\_press}, a second, smaller version of the same problem:
+\texttt{self.registry} can't stay borrowed (to call \texttt{.run} on it) while also handing
+out \texttt{self} as \texttt{\&mut App} to that same call. The fix is
+\texttt{std::mem::take}:
+\begin{lstlisting}
+let registry = std::mem::take(&mut self.registry);
+let result = registry.run(self, name, args);
+self.registry = registry;
+\end{lstlisting}
+\texttt{mem::take} replaces \texttt{self.registry} in place with
+\texttt{CommandRegistry::default()} (an empty registry — this only works because
+\texttt{CommandRegistry} implements \texttt{Default}) and returns the \emph{real} one as an
+owned value. For the duration of the \texttt{registry.run(self, ...)} call,
+\texttt{self.registry} genuinely doesn't hold the real registry at all (so there's nothing
+left to conflict with) — then it's put back immediately after. This is a standard, named
+pattern in Rust for exactly this shape of problem (a method stored in a field needing to
+operate on the struct that contains it), not a workaround specific to Blueboard.
+
+\subsection{Typing itself: \texttt{logical\_key} and \texttt{text}}
+\begin{lstlisting}
+match &event.logical_key {
+    Key::Named(NamedKey::Enter) => { /* run the typed command */ }
+    Key::Named(NamedKey::Escape) => { /* cancel */ }
+    Key::Named(NamedKey::Backspace) => { self.command_line_text.pop(); }
+    _ => {
+        if let Some(text) = &event.text {
+            self.command_line_text.extend(text.chars().filter(|c| !c.is_control()));
+        }
+    }
+}
+\end{lstlisting}
+\texttt{winit}'s \texttt{KeyEvent} carries both a \texttt{physical\_key} (which physical
+key was pressed, independent of keyboard layout — what Phases 1-3 used, since
+\texttt{Escape} means the same physical key everywhere) and a \texttt{logical\_key} /
+\texttt{text} (what character that keypress actually produces, accounting for layout —
+needed here, since a command line has to accept arbitrary typed text, not just recognize
+one fixed key). \texttt{text.chars().filter(|c| !c.is\_control())} guards against control
+characters (like the \texttt{"\textbackslash r"} that \texttt{Enter} itself produces as
+text) leaking into the command string if a match arm above happened to miss them.
+
+\section{The config file}
+\label{sec:config}
+File: \texttt{crates/blueboard-app/src/config.rs}.
+\begin{lstlisting}
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub keybindings: HashMap<String, String>,
+    pub theme: Theme,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { keybindings: default_keybindings(), theme: Theme::default() }
+    }
+}
+\end{lstlisting}
+\texttt{\#[serde(default)]} at the struct level means: for any field absent from the parsed
+TOML, use that field's value from \texttt{Config::default()} instead of erroring. This is
+what makes a config file with only a \texttt{[theme]} section (no \texttt{[keybindings]} at
+all) still produce working default keybindings — and, layered with the same attribute on
+the nested \texttt{Theme} struct, a \texttt{[theme]} section overriding only
+\texttt{board\_color} still falls back to default \texttt{grid\_color}/\texttt{stroke\_color}.
+One real limitation, documented in the struct's own doc comment rather than hidden: this
+per-field fallback does \emph{not} apply inside a \texttt{HashMap} field — a
+\texttt{[keybindings]} section present in the file replaces the whole default map, it
+doesn't merge into it key-by-key. Remapping one key currently means re-specifying all of
+them. A known, accepted trade-off for this phase, not an oversight.
+
+\begin{lstlisting}
+pub fn load() -> Config {
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            log::info!("no config file at {}, using defaults", path.display());
+            return Config::default();
+        }
+        Err(err) => {
+            log::warn!("failed to read config file {}: {err}, using defaults", path.display());
+            return Config::default();
+        }
+    };
+    match toml::from_str(&text) {
+        Ok(config) => config,
+        Err(err) => {
+            log::warn!("failed to parse config file {}: {err}, using defaults", path.display());
+            Config::default()
+        }
+    }
+}
+\end{lstlisting}
+Three distinguishable failure paths — no file at all (the common case, logged at
+\texttt{info} since it's entirely expected on first run), a file that exists but can't be
+read (\texttt{warn}, something's actually wrong), and a file that exists and reads but
+doesn't parse as valid TOML (\texttt{warn}, a typo) — all converge on the same
+\texttt{Config::default()} rather than refusing to start the application. A hand-edited
+file should never be able to make the app unusable; this is the same philosophy as
+\texttt{PLAN.md}'s original design note for this file, just applied one level higher (to
+the whole file, not just individual keys within it).
+
+\subsection{Theme colors: from TOML to a GPU uniform}
+Keybindings are consumed entirely within \texttt{blueboard-app} (a
+\texttt{HashMap} lookup from typed character to command name). Theme colors have to reach
+\texttt{blueboard-render}'s shader, which meant adding a second small uniform buffer
+alongside the existing camera one:
+\begin{lstlisting}
+// shader.wgsl
+struct ThemeUniform {
+    grid_color: vec4<f32>,
+    stroke_color: vec4<f32>,
+};
+@group(1) @binding(0)
+var<uniform> theme: ThemeUniform;
+\end{lstlisting}
+\texttt{vec4}, not \texttt{vec3}, for both fields even though only \texttt{.xyz} is used —
+WGSL's uniform-buffer layout rules pad a bare \texttt{vec3<f32>} to 16 bytes anyway (the
+same alignment a \texttt{vec4} needs), so matching that on both the WGSL and Rust side with
+an explicit \texttt{vec4}/\texttt{[f32; 4]} avoids relying on implicit padding rules lining
+up correctly. The board's own clear color didn't need this treatment at all — it's set
+directly in Rust via \texttt{wgpu::LoadOp::Clear(self.board\_clear\_color)}, since it's
+consumed by the render pass setup itself, never by shader code.
+
+\section{Verification}
+Run end to end, not just compiled: typed \texttt{:save test.bbd} and watched it appear
+live in the command bar (confirming the egui pass actually renders legible text); pressed
+Enter and confirmed both the status line (``saved 0 stroke(s) to test.bbd'') and the
+actual file on disk; drew a stroke and exited with \texttt{:q}, confirmed by
+\texttt{"quit command received, exiting"} in the log rather than a silent process
+disappearance.
+
+\subsection{A design risk found mid-test, not a crash}
+During that same testing session, a running instance disappeared with \emph{no} panic
+logged — a clean exit, not a crash. The first draft's default keybindings had bound the
+bare, unmodified \texttt{q} key directly to the quit command, with no confirmation of any
+kind. On the shared display this testing runs on (see Phase 2's verification-methodology
+note), a stray keystroke from unrelated activity landing on the test window was enough to
+close it instantly. Whether or not that's literally what happened, binding a destructive,
+irreversible action to one bare keystroke is a real design flaw independent of the cause —
+it's the exact reason vim itself never bound plain \texttt{q} to quit either. Fixed by
+removing the default binding entirely (\texttt{:q} through the command line still works,
+requiring the deliberate \texttt{:} prefix) and by adding a log line on quit, so a future
+clean exit and a future crash are distinguishable from the log alone rather than both just
+looking like ``the process is gone.''
+
+\section{What's next}
+Phase 5, per \texttt{PLAN.md}: more tools (shapes, text, eraser, selection+move) and
+undo/redo, following the same \texttt{Tool} trait/registry pattern as this phase's
+\texttt{Command} registry — the same addon-friendly shape, applied to what gets drawn
+instead of what gets typed.
+
+\end{document}
