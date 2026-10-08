@@ -1,19 +1,21 @@
-//! The scene graph: the flat list of elements making up a board. Phase 2 only has
-//! strokes; shapes/text/groups arrive in later phases per PLAN.md.
+//! The scene graph: the flat list of elements making up a board. Through Phase 4 the only
+//! element kind was a pen stroke; Phase 5 adds shapes (rect/ellipse/line), all represented
+//! the same way — a [`kurbo::BezPath`] outline — so they share storage, indexing, and
+//! rendering with no extra cases.
 
 use std::collections::HashMap;
 
 use glam::DVec2;
-use kurbo::{BezPath, Shape};
+use kurbo::{BezPath, Shape as _};
 use rstar::{RTree, RTreeObject, AABB};
 
-pub struct Stroke {
+pub struct Element {
     pub id: u64,
     pub path: BezPath,
 }
 
-/// What's actually indexed by the R-tree: just an id and a bounding box, not the stroke
-/// itself — the strokes live in `Scene::strokes`, looked up by id after a spatial query.
+/// What's actually indexed by the R-tree: just an id and a bounding box, not the element
+/// itself — elements live in `Scene::elements`, looked up by id after a spatial query.
 struct IndexedBounds {
     id: u64,
     envelope: AABB<[f64; 2]>,
@@ -30,7 +32,7 @@ impl RTreeObject for IndexedBounds {
 #[derive(Default)]
 pub struct Scene {
     next_id: u64,
-    strokes: HashMap<u64, Stroke>,
+    elements: HashMap<u64, Element>,
     index: RTree<IndexedBounds>,
 }
 
@@ -39,50 +41,50 @@ impl Scene {
         Self::default()
     }
 
-    pub fn add_stroke(&mut self, path: BezPath) -> u64 {
+    pub fn add_element(&mut self, path: BezPath) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.insert_stroke(id, path);
+        self.insert_element(id, path);
         id
     }
 
-    /// Inserts a stroke under a specific id rather than generating one — used when
-    /// loading a saved board ([`crate::file_format`]), so loaded strokes keep the ids
+    /// Inserts an element under a specific id rather than generating one — used when
+    /// loading a saved board ([`crate::file_format`]), so loaded elements keep the ids
     /// they were saved with instead of being renumbered.
-    pub(crate) fn insert_loaded_stroke(&mut self, id: u64, path: BezPath) {
-        self.insert_stroke(id, path);
-        // Any strokes added after loading must not collide with a loaded id.
+    pub(crate) fn insert_loaded_element(&mut self, id: u64, path: BezPath) {
+        self.insert_element(id, path);
+        // Any elements added after loading must not collide with a loaded id.
         self.next_id = self.next_id.max(id + 1);
     }
 
-    fn insert_stroke(&mut self, id: u64, path: BezPath) {
+    fn insert_element(&mut self, id: u64, path: BezPath) {
         let bbox = path.bounding_box();
         let envelope = AABB::from_corners([bbox.x0, bbox.y0], [bbox.x1, bbox.y1]);
         self.index.insert(IndexedBounds { id, envelope });
-        self.strokes.insert(id, Stroke { id, path });
+        self.elements.insert(id, Element { id, path });
     }
 
-    /// Strokes whose bounding box intersects the given board-space rectangle — the
+    /// Elements whose bounding box intersects the given board-space rectangle — the
     /// viewport-culling query `blueboard-render` runs every frame (PLAN.md Phase 2: wired
     /// in now even though boards are still small).
-    pub fn strokes_in_viewport(&self, min: DVec2, max: DVec2) -> impl Iterator<Item = &Stroke> {
+    pub fn elements_in_viewport(&self, min: DVec2, max: DVec2) -> impl Iterator<Item = &Element> {
         let envelope = AABB::from_corners([min.x, min.y], [max.x, max.y]);
         self.index
             .locate_in_envelope_intersecting(envelope)
-            .filter_map(move |entry| self.strokes.get(&entry.id))
+            .filter_map(move |entry| self.elements.get(&entry.id))
     }
 
-    /// Every stroke in the scene, regardless of position — used by
+    /// Every element in the scene, regardless of position — used by
     /// [`crate::file_format`] to save the whole board, not just what's on screen.
-    pub fn all_strokes(&self) -> impl Iterator<Item = &Stroke> {
-        self.strokes.values()
+    pub fn all_elements(&self) -> impl Iterator<Item = &Element> {
+        self.elements.values()
     }
 
     pub fn len(&self) -> usize {
-        self.strokes.len()
+        self.elements.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.strokes.is_empty()
+        self.elements.is_empty()
     }
 }

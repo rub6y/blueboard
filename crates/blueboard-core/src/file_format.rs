@@ -3,8 +3,8 @@
 //! large boards is deferred to PLAN.md's Phase 6, once a real board exists to profile
 //! against.
 //!
-//! The on-disk shape ([`StrokeDocument`]/[`SceneDocument`]) is deliberately a separate
-//! type from [`Scene`]/[`Stroke`], not a direct serialization of the runtime structures —
+//! The on-disk shape ([`ElementDocument`]/[`SceneDocument`]) is deliberately a separate
+//! type from [`Scene`]/[`Element`], not a direct serialization of the runtime structures —
 //! `Scene` also carries the R-tree index, which is derived data that shouldn't be part of
 //! the file (it's rebuilt on load) and would just be dead weight on disk.
 
@@ -21,7 +21,7 @@ use crate::scene::Scene;
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
-struct StrokeDocument {
+struct ElementDocument {
     id: u64,
     path: BezPath,
 }
@@ -29,7 +29,7 @@ struct StrokeDocument {
 #[derive(Serialize, Deserialize)]
 struct SceneDocument {
     version: u32,
-    strokes: Vec<StrokeDocument>,
+    elements: Vec<ElementDocument>,
 }
 
 #[derive(Debug)]
@@ -75,22 +75,22 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// Save every stroke in `scene` (not just what's currently visible) to `path`.
+/// Save every element in `scene` (not just what's currently visible) to `path`.
 pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), SaveError> {
-    let mut strokes: Vec<StrokeDocument> = scene
-        .all_strokes()
-        .map(|stroke| StrokeDocument {
-            id: stroke.id,
-            path: stroke.path.clone(),
+    let mut elements: Vec<ElementDocument> = scene
+        .all_elements()
+        .map(|element| ElementDocument {
+            id: element.id,
+            path: element.path.clone(),
         })
         .collect();
     // Sorted by id so the same scene always serializes to the same bytes — `Scene`
-    // stores strokes in a `HashMap`, whose iteration order isn't stable across runs.
-    strokes.sort_by_key(|stroke| stroke.id);
+    // stores elements in a `HashMap`, whose iteration order isn't stable across runs.
+    elements.sort_by_key(|element| element.id);
 
     let document = SceneDocument {
         version: FORMAT_VERSION,
-        strokes,
+        elements,
     };
 
     let encoded = bincode::serde::encode_to_vec(&document, bincode::config::standard())
@@ -113,8 +113,8 @@ pub fn load(path: impl AsRef<Path>) -> Result<Scene, LoadError> {
     }
 
     let mut scene = Scene::new();
-    for stroke in document.strokes {
-        scene.insert_loaded_stroke(stroke.id, stroke.path);
+    for element in document.elements {
+        scene.insert_loaded_element(element.id, element.path);
     }
     Ok(scene)
 }
@@ -147,8 +147,8 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_scene() {
         let mut scene = Scene::new();
-        scene.add_stroke(sample_path(0.0));
-        scene.add_stroke(sample_path(10.0));
+        scene.add_element(sample_path(0.0));
+        scene.add_element(sample_path(10.0));
 
         let path = temp_bbd_path("round-trips-scene");
         save(&scene, &path).expect("save should succeed");
@@ -157,12 +157,12 @@ mod tests {
 
         assert_eq!(loaded.len(), scene.len());
         let mut original: Vec<_> = scene
-            .all_strokes()
-            .map(|s| (s.id, s.path.clone()))
+            .all_elements()
+            .map(|e| (e.id, e.path.clone()))
             .collect();
         let mut round_tripped: Vec<_> = loaded
-            .all_strokes()
-            .map(|s| (s.id, s.path.clone()))
+            .all_elements()
+            .map(|e| (e.id, e.path.clone()))
             .collect();
         original.sort_by_key(|(id, _)| *id);
         round_tripped.sort_by_key(|(id, _)| *id);
@@ -172,15 +172,15 @@ mod tests {
     #[test]
     fn loaded_scene_continues_ids_after_the_highest_loaded_id() {
         let mut scene = Scene::new();
-        scene.add_stroke(sample_path(0.0)); // id 0
-        scene.add_stroke(sample_path(10.0)); // id 1
+        scene.add_element(sample_path(0.0)); // id 0
+        scene.add_element(sample_path(10.0)); // id 1
 
         let path = temp_bbd_path("continues-ids");
         save(&scene, &path).expect("save should succeed");
         let mut loaded = load(&path).expect("load should succeed");
         std::fs::remove_file(&path).ok();
 
-        let new_id = loaded.add_stroke(sample_path(20.0));
+        let new_id = loaded.add_element(sample_path(20.0));
         assert_eq!(new_id, 2);
     }
 
@@ -199,7 +199,7 @@ mod tests {
     fn rejects_unsupported_version() {
         let document = SceneDocument {
             version: FORMAT_VERSION + 1,
-            strokes: vec![],
+            elements: vec![],
         };
         let encoded =
             bincode::serde::encode_to_vec(&document, bincode::config::standard()).unwrap();

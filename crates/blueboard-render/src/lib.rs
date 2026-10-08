@@ -78,7 +78,7 @@ impl From<ThemeColors> for ThemeUniform {
 }
 
 /// What the `:`-command bar should show this frame — built from `blueboard-app`'s input
-/// state, analogous to `live_stroke_points` for the pen.
+/// state, analogous to [`ScenePreview`] for the active tool.
 pub enum CommandBarContent<'a> {
     /// Not in command mode and no status to show.
     Hidden,
@@ -86,6 +86,22 @@ pub enum CommandBarContent<'a> {
     Editing { text: &'a str },
     /// The result of the last command, shown until replaced by the next one.
     Status { message: &'a str, is_error: bool },
+}
+
+/// What the currently-active tool wants drawn as a live, not-yet-committed preview —
+/// built from `blueboard-app`'s tool state each frame. Two shapes because the pen and
+/// shape tools preview fundamentally differently: the pen shows its *raw*, not-yet-fitted
+/// samples (so the user sees their actual hand motion while drawing), while a shape tool's
+/// preview already *is* the exact path that will be committed, so it's rendered the same
+/// way a committed element is.
+pub enum ScenePreview<'a> {
+    None,
+    /// Raw, not-yet-curve-fitted board-space pointer samples — drawn as a thin line
+    /// strip, deliberately distinct from how a committed stroke renders.
+    RawPoints(&'a [DVec2]),
+    /// An exact path (e.g. a shape tool's in-progress rectangle/ellipse/line) — drawn
+    /// tessellated, identically to a committed element.
+    Path(&'a kurbo::BezPath),
 }
 
 #[repr(C)]
@@ -590,14 +606,14 @@ impl Renderer {
         (buffer, vertices.len() as u32)
     }
 
-    /// Render one frame: the grid, every stroke in `scene` intersecting the camera's
-    /// current viewport, a live raw-polyline preview of `live_stroke_points` if a stroke
-    /// is being drawn right now, and the `:`-command bar on top.
+    /// Render one frame: the grid, every element in `scene` intersecting the camera's
+    /// current viewport, the active tool's live `preview` if any, and the `:`-command bar
+    /// on top.
     pub fn render(
         &mut self,
         camera: &Camera,
         scene: &Scene,
-        live_stroke_points: &[DVec2],
+        preview: ScenePreview<'_>,
         command_bar: CommandBarContent<'_>,
         scale_factor: f32,
     ) -> RenderOutcome {
@@ -640,9 +656,9 @@ impl Renderer {
         let tessellation_tolerance = STROKE_TESSELLATION_TOLERANCE_PX / camera.zoom as f32;
 
         let mut stroke_vertices = Vec::new();
-        for stroke in scene.strokes_in_viewport(board_min, board_max) {
+        for element in scene.elements_in_viewport(board_min, board_max) {
             tessellate_stroke(
-                &stroke.path,
+                &element.path,
                 STROKE_WIDTH,
                 tessellation_tolerance,
                 &mut stroke_vertices,
@@ -651,9 +667,22 @@ impl Renderer {
         let (stroke_buffer, stroke_count) =
             self.upload_vertices("stroke vertices", &stroke_vertices);
 
-        let preview_vertices = preview_line_vertices(live_stroke_points);
+        // The pen's raw preview draws as thin lines; a shape tool's preview draws
+        // tessellated, exactly like a committed element — see `ScenePreview`'s doc comment.
+        let (preview_vertices, preview_pipeline): (Vec<Vertex>, &wgpu::RenderPipeline) =
+            match preview {
+                ScenePreview::None => (Vec::new(), &self.preview_pipeline),
+                ScenePreview::RawPoints(points) => {
+                    (preview_line_vertices(points), &self.preview_pipeline)
+                }
+                ScenePreview::Path(path) => {
+                    let mut verts = Vec::new();
+                    tessellate_stroke(path, STROKE_WIDTH, tessellation_tolerance, &mut verts);
+                    (verts, &self.stroke_pipeline)
+                }
+            };
         let (preview_buffer, preview_count) =
-            self.upload_vertices("stroke preview vertices", &preview_vertices);
+            self.upload_vertices("preview vertices", &preview_vertices);
 
         let view = surface_texture
             .texture
@@ -699,7 +728,7 @@ impl Renderer {
             }
 
             if preview_count > 0 {
-                pass.set_pipeline(&self.preview_pipeline);
+                pass.set_pipeline(preview_pipeline);
                 pass.set_vertex_buffer(0, preview_buffer.slice(..));
                 pass.draw(0..preview_count, 0..1);
             }

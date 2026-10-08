@@ -30,6 +30,7 @@ impl CommandRegistry {
         registry.register(OpenCommand);
         registry.register(ClearCommand);
         registry.register(NewCommand);
+        registry.register(ToolCommand);
         registry.register(QuitCommand);
         registry
     }
@@ -75,7 +76,7 @@ impl Command for SaveCommand {
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
         let path = resolve_board_path(args);
         file_format::save(&app.scene, &path)
-            .map(|()| format!("saved {} stroke(s) to {path}", app.scene.len()))
+            .map(|()| format!("saved {} element(s) to {path}", app.scene.len()))
             .map_err(|err| format!("save to {path} failed: {err}"))
     }
 }
@@ -92,7 +93,7 @@ impl Command for OpenCommand {
             Ok(scene) => {
                 let count = scene.len();
                 app.scene = scene;
-                Ok(format!("loaded {count} stroke(s) from {path}"))
+                Ok(format!("loaded {count} element(s) from {path}"))
             }
             Err(err) => Err(format!("open {path} failed: {err}")),
         }
@@ -108,7 +109,7 @@ impl Command for ClearCommand {
     fn run(&self, app: &mut App, _args: &str) -> Result<String, String> {
         let count = app.scene.len();
         app.scene = Scene::new();
-        Ok(format!("cleared {count} stroke(s)"))
+        Ok(format!("cleared {count} element(s)"))
     }
 }
 
@@ -123,6 +124,22 @@ impl Command for NewCommand {
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
         ClearCommand.run(app, args)
+    }
+}
+
+struct ToolCommand;
+impl Command for ToolCommand {
+    fn name(&self) -> &'static str {
+        "tool"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        let name = args.trim();
+        if app.tools.set_active(name) {
+            Ok(format!("tool: {name}"))
+        } else {
+            Err(format!("unknown tool: {name}"))
+        }
     }
 }
 

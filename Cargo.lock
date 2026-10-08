@@ -191,6 +191,7 @@ dependencies = [
  "blueboard-core",
  "blueboard-render",
  "glam",
+ "kurbo",
  "log",
  "pollster",
  "serde",

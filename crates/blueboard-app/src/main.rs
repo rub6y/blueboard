@@ -1,14 +1,14 @@
-//! winit event loop, egui chrome, the `:`-command line, config loading. See PLAN.md Phase 1-4.
+//! winit event loop, egui chrome, the `:`-command line, config loading. See PLAN.md Phase 1-5.
 //!
 //! Phase 1 added the window, wgpu surface, and pan/zoom camera. Phase 2 added the pen.
-//! Phase 3 added the file format. Phase 4 replaces the temporary `S`/`O` hotkeys with a
-//! real vim-like `:`-command line (text rendered via egui in `blueboard-render`) backed by
-//! a command registry, plus a config file for keybindings and theme colors.
+//! Phase 3 added the file format. Phase 4 added the `:`-command line, a command registry,
+//! and the config file. Phase 5 generalizes drawing into a `Tool` registry (`tools.rs`) —
+//! the pen is now one tool among several (rect/ellipse/line), switchable via `:tool
+//! <name>` or a keybinding, the same pattern Phase 4 established for commands.
 
 use std::sync::Arc;
 
 use blueboard_core::camera::Camera;
-use blueboard_core::fitting::fit_stroke;
 use blueboard_core::scene::Scene;
 use blueboard_render::{CommandBarContent, RenderOutcome, Renderer};
 use glam::DVec2;
@@ -21,36 +21,7 @@ use winit::window::{Window, WindowId};
 mod commands;
 mod config;
 mod logging;
-
-/// How far (in screen pixels, at the zoom level the stroke was drawn at) the fitted curve
-/// is allowed to deviate from the raw pointer samples — see `planning/math.tex`'s curve
-/// fitting section. Converted to board-space units by dividing by the current zoom, so a
-/// stroke looks equally precise regardless of zoom level when it was drawn.
-///
-/// Loose enough to smooth over a pixel or two of real mouse/trackpad jitter rather than
-/// faithfully reproducing it as visible kinks — tightening this past a couple of pixels
-/// trades smoothness for positional fidelity nobody can actually see.
-const PEN_FIT_TOLERANCE_PX: f64 = 2.5;
-
-/// Minimum screen-space distance between recorded pointer samples while drawing.
-/// Pointer-move events arrive far more densely than meaningful hand motion, so most of
-/// that density is jitter, not intent — decimating by distance (rather than keeping every
-/// event) stops redundant near-duplicate points from ever reaching the curve fitter.
-///
-/// Decimation alone only thins point *density*, though — it doesn't touch the *position*
-/// of the points that survive, so real jitter is still baked into each one. That's
-/// invisible at the zoom level a stroke was drawn at (within [`PEN_FIT_TOLERANCE_PX`]) but
-/// becomes visible as small regular kinks once zoomed in further. [`PEN_STREAMLINE_ALPHA`]
-/// below is what actually addresses that.
-const PEN_MIN_SAMPLE_DISTANCE_PX: f64 = 2.0;
-
-/// Exponential-moving-average weight given to each new raw pointer position, applied
-/// *before* decimation — same idea as the "streamline" parameter in
-/// [perfect-freehand](https://github.com/steveruizok/perfect-freehand) (used by tldraw and
-/// Excalidraw's pen tools): pull the recorded point toward a running average of recent
-/// positions instead of recording the raw, jittery position directly. Lower = smoother but
-/// laggier (recorded points trail further behind the actual cursor).
-const PEN_STREAMLINE_ALPHA: f64 = 0.5;
+mod tools;
 
 /// Default path for `:save`/`:open` (and their keybindings) when no path argument is
 /// given.
@@ -63,20 +34,11 @@ struct App {
     camera: Camera,
     scene: Scene,
     panning: bool,
-    drawing: bool,
-    /// Board-space points of the stroke currently being drawn, in order. Cleared (and
-    /// fit to a curve, added to `scene`) when the pen is lifted.
-    current_stroke: Vec<DVec2>,
-    /// Screen-space position of the last *recorded* sample in `current_stroke` (not
-    /// necessarily the last `CursorMoved` event — see [`PEN_MIN_SAMPLE_DISTANCE_PX`]).
-    last_sample_screen: DVec2,
-    /// Running exponential moving average of the cursor position while drawing — see
-    /// [`PEN_STREAMLINE_ALPHA`]. What actually gets decimated/recorded, not the raw cursor.
-    smoothed_cursor: DVec2,
     last_cursor: DVec2,
 
     config: config::Config,
     registry: commands::CommandRegistry,
+    tools: tools::ToolRegistry,
     /// `true` while composing a `:`-command (between pressing `:` and Enter/Escape).
     command_line_active: bool,
     /// Everything typed after `:` so far.
@@ -157,11 +119,12 @@ impl ApplicationHandler for App {
                     CommandBarContent::Hidden
                 };
                 let scale_factor = window.scale_factor() as f32;
+                let preview = self.tools.active_tool().preview();
 
                 match renderer.render(
                     &self.camera,
                     &self.scene,
-                    &self.current_stroke,
+                    preview,
                     command_bar,
                     scale_factor,
                 ) {
@@ -179,29 +142,24 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.drawing = state == ElementState::Pressed;
-                if self.drawing {
-                    self.current_stroke.clear();
-                    self.smoothed_cursor = self.last_cursor;
-                    self.last_sample_screen = self.last_cursor;
-                    let (width, height) = renderer.viewport_size();
-                    let viewport = DVec2::new(width as f64, height as f64);
-                    self.current_stroke
-                        .push(self.camera.screen_to_board(self.last_cursor, viewport));
-                } else if self.current_stroke.len() >= 2 {
-                    let accuracy = PEN_FIT_TOLERANCE_PX / self.camera.zoom;
-                    let raw_points = self.current_stroke.len();
-                    if let Some(path) = fit_stroke(&self.current_stroke, accuracy) {
-                        let id = self.scene.add_stroke(path);
-                        log::info!("stroke {id} committed from {raw_points} raw samples");
-                    } else {
-                        log::warn!("fit_stroke returned None for {raw_points} raw samples");
-                    }
-                    self.current_stroke.clear();
-                    window.request_redraw();
-                } else {
-                    self.current_stroke.clear();
+                let (width, height) = renderer.viewport_size();
+                let viewport = DVec2::new(width as f64, height as f64);
+                let mut ctx = tools::ToolContext {
+                    camera: &self.camera,
+                    scene: &mut self.scene,
+                    viewport,
+                };
+                match state {
+                    ElementState::Pressed => self
+                        .tools
+                        .active_tool_mut()
+                        .on_pointer_down(&mut ctx, self.last_cursor),
+                    ElementState::Released => self
+                        .tools
+                        .active_tool_mut()
+                        .on_pointer_up(&mut ctx, self.last_cursor),
                 }
+                window.request_redraw();
             }
 
             WindowEvent::MouseInput {
@@ -217,18 +175,18 @@ impl ApplicationHandler for App {
                 if self.panning {
                     self.camera.pan_by_screen_delta(cursor - self.last_cursor);
                     window.request_redraw();
-                } else if self.drawing {
-                    self.smoothed_cursor = self.smoothed_cursor.lerp(cursor, PEN_STREAMLINE_ALPHA);
-                    if self.smoothed_cursor.distance(self.last_sample_screen)
-                        >= PEN_MIN_SAMPLE_DISTANCE_PX
-                    {
-                        let (width, height) = renderer.viewport_size();
-                        let viewport = DVec2::new(width as f64, height as f64);
-                        self.current_stroke
-                            .push(self.camera.screen_to_board(self.smoothed_cursor, viewport));
-                        self.last_sample_screen = self.smoothed_cursor;
-                        window.request_redraw();
-                    }
+                } else {
+                    let (width, height) = renderer.viewport_size();
+                    let viewport = DVec2::new(width as f64, height as f64);
+                    let mut ctx = tools::ToolContext {
+                        camera: &self.camera,
+                        scene: &mut self.scene,
+                        viewport,
+                    };
+                    self.tools
+                        .active_tool_mut()
+                        .on_pointer_move(&mut ctx, cursor);
+                    window.request_redraw();
                 }
                 self.last_cursor = cursor;
             }
@@ -266,16 +224,7 @@ impl App {
                     let input = std::mem::take(&mut self.command_line_text);
                     self.command_line_active = false;
                     let (name, args) = input.split_once(' ').unwrap_or((&input, ""));
-                    // `self.registry` can't stay borrowed while `run` also needs `&mut
-                    // self` to apply the command (e.g. replacing the scene) — swap it out
-                    // for the call, then put it back.
-                    let registry = std::mem::take(&mut self.registry);
-                    let result = registry.run(self, name, args);
-                    self.registry = registry;
-                    self.status = Some(match result {
-                        Ok(message) => (message, false),
-                        Err(message) => (message, true),
-                    });
+                    self.run_command(name, args);
                 }
                 Key::Named(NamedKey::Escape) => {
                     self.command_line_active = false;
@@ -301,15 +250,10 @@ impl App {
                     window.request_redraw();
                 }
                 Key::Character(text) => {
-                    let command_name = self.config.keybindings.get(text.as_str()).cloned();
-                    if let Some(command_name) = command_name {
-                        let registry = std::mem::take(&mut self.registry);
-                        let result = registry.run(self, &command_name, "");
-                        self.registry = registry;
-                        self.status = Some(match result {
-                            Ok(message) => (message, false),
-                            Err(message) => (message, true),
-                        });
+                    let binding = self.config.keybindings.get(text.as_str()).cloned();
+                    if let Some(binding) = binding {
+                        let (name, args) = binding.split_once(' ').unwrap_or((&binding, ""));
+                        self.run_command(name, args);
                         window.request_redraw();
                     }
                 }
@@ -324,6 +268,21 @@ impl App {
             log::info!("quit command received, exiting");
             event_loop.exit();
         }
+    }
+
+    /// Runs a command by name (from the command line or a keybinding) and records the
+    /// result as the next status message.
+    fn run_command(&mut self, name: &str, args: &str) {
+        // `self.registry` can't stay borrowed while `run` also needs `&mut self` to apply
+        // the command (e.g. replacing the scene) — swap it out for the call, then put it
+        // back. See `tools.rs`'s doc comment for why `Tool` dispatch doesn't need this.
+        let registry = std::mem::take(&mut self.registry);
+        let result = registry.run(self, name, args);
+        self.registry = registry;
+        self.status = Some(match result {
+            Ok(message) => (message, false),
+            Err(message) => (message, true),
+        });
     }
 }
 

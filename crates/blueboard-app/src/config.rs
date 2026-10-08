@@ -13,8 +13,9 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Single-character key -> command name (no arguments; see `commands.rs`). Reuses the
-    /// command registry's own names rather than a separate keybinding vocabulary.
+    /// Single-character key -> command text, parsed the same way as the `:`-command line
+    /// (a command name, optionally followed by a space and its arguments — e.g. `"tool
+    /// rect"`). Reuses the command registry's own vocabulary rather than a separate one.
     ///
     /// Note: a `[keybindings]` section present in the file *replaces* the default map
     /// entirely rather than merging into it (a limitation of how `serde`'s per-field
@@ -38,10 +39,17 @@ fn default_keybindings() -> HashMap<String, String> {
     // doesn't bind plain `q` to quit either) — `:q` via the command line stays
     // available, requiring the deliberate `:` prefix. A user can still rebind this in
     // their own config if they want the bare shortcut.
-    [("s", "save"), ("o", "open")]
-        .into_iter()
-        .map(|(key, command)| (key.to_string(), command.to_string()))
-        .collect()
+    [
+        ("s", "save"),
+        ("o", "open"),
+        ("p", "tool pen"),
+        ("r", "tool rect"),
+        ("e", "tool ellipse"),
+        ("l", "tool line"),
+    ]
+    .into_iter()
+    .map(|(key, command)| (key.to_string(), command.to_string()))
+    .collect()
 }
 
 #[derive(Deserialize, Clone, Copy)]
