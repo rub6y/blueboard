@@ -5,6 +5,17 @@ struct CameraUniform {
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
+// vec4s, not vec3s, even though only .xyz is used: WGSL's uniform-buffer layout rules
+// pad a bare vec3<f32> to 16 bytes anyway, so using vec4 avoids a layout mismatch with
+// the Rust-side struct for free.
+struct ThemeUniform {
+    grid_color: vec4<f32>,
+    stroke_color: vec4<f32>,
+};
+
+@group(1) @binding(0)
+var<uniform> theme: ThemeUniform;
+
 struct VertexInput {
     @location(0) position: vec2<f32>,
 };
@@ -22,13 +33,11 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_grid(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Muted blue-grey, visible against the board background without competing with
-    // actual strokes.
-    return vec4<f32>(0.3, 0.38, 0.58, 1.0);
+    return theme.grid_color;
 }
 
 @fragment
 fn fs_stroke(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Pen strokes (and their live preview) are drawn in flat white.
-    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    // Also used for the live stroke-preview pipeline — both are "pen" colored.
+    return theme.stroke_color;
 }

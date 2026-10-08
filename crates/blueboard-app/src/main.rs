@@ -1,24 +1,25 @@
 //! winit event loop, egui chrome, the `:`-command line, config loading. See PLAN.md Phase 1-4.
 //!
-//! Phase 1 added the window, wgpu surface, and pan/zoom camera. Phase 2 adds the pen:
-//! left-drag draws a stroke (fit to a vector curve on release), middle-drag pans, scroll
-//! zooms. No tool/command registries yet — this is the one hardcoded tool those later
-//! phases will generalize.
+//! Phase 1 added the window, wgpu surface, and pan/zoom camera. Phase 2 added the pen.
+//! Phase 3 added the file format. Phase 4 replaces the temporary `S`/`O` hotkeys with a
+//! real vim-like `:`-command line (text rendered via egui in `blueboard-render`) backed by
+//! a command registry, plus a config file for keybindings and theme colors.
 
 use std::sync::Arc;
 
 use blueboard_core::camera::Camera;
-use blueboard_core::file_format;
 use blueboard_core::fitting::fit_stroke;
 use blueboard_core::scene::Scene;
-use blueboard_render::{RenderOutcome, Renderer};
+use blueboard_render::{CommandBarContent, RenderOutcome, Renderer};
 use glam::DVec2;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+mod commands;
+mod config;
 mod logging;
 
 /// How far (in screen pixels, at the zoom level the stroke was drawn at) the fitted curve
@@ -51,9 +52,8 @@ const PEN_MIN_SAMPLE_DISTANCE_PX: f64 = 2.0;
 /// laggier (recorded points trail further behind the actual cursor).
 const PEN_STREAMLINE_ALPHA: f64 = 0.5;
 
-/// Where `S`/`O` save/load, for now. Phase 4's `:save`/`:open` commands (with a path
-/// argument) will replace this; until then a fixed, visible-in-the-repo-root path is
-/// enough to test the file format end to end by actually running the app.
+/// Default path for `:save`/`:open` (and their keybindings) when no path argument is
+/// given.
 const DEFAULT_BOARD_PATH: &str = "board.bbd";
 
 #[derive(Default)]
@@ -74,6 +74,17 @@ struct App {
     /// [`PEN_STREAMLINE_ALPHA`]. What actually gets decimated/recorded, not the raw cursor.
     smoothed_cursor: DVec2,
     last_cursor: DVec2,
+
+    config: config::Config,
+    registry: commands::CommandRegistry,
+    /// `true` while composing a `:`-command (between pressing `:` and Enter/Escape).
+    command_line_active: bool,
+    /// Everything typed after `:` so far.
+    command_line_text: String,
+    /// The last command's result, shown in the command bar until the next command
+    /// replaces it. `bool` is "is this an error" (picks the display color).
+    status: Option<(String, bool)>,
+    should_quit: bool,
 }
 
 impl ApplicationHandler for App {
@@ -93,7 +104,11 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
         log::info!("window created at {}x{}", size.width, size.height);
-        let renderer = pollster::block_on(Renderer::new(window.clone(), (size.width, size.height)));
+        let renderer = pollster::block_on(Renderer::new(
+            window.clone(),
+            (size.width, size.height),
+            self.config.theme.into(),
+        ));
         log::info!("renderer initialized");
 
         self.window = Some(window);
@@ -106,6 +121,16 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Handled separately, before the `window`/`renderer` field borrows below: command
+        // dispatch needs a whole `&mut self` (to let a `Command` mutate `self.scene`,
+        // etc.), which can't coexist with those borrows of other fields of `self`.
+        if let WindowEvent::KeyboardInput { event, .. } = &event {
+            if event.state == ElementState::Pressed {
+                self.handle_key_press(event.clone(), event_loop);
+            }
+            return;
+        }
+
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
             return;
         };
@@ -119,7 +144,27 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                match renderer.render(&self.camera, &self.scene, &self.current_stroke) {
+                let command_bar = if self.command_line_active {
+                    CommandBarContent::Editing {
+                        text: &self.command_line_text,
+                    }
+                } else if let Some((message, is_error)) = &self.status {
+                    CommandBarContent::Status {
+                        message,
+                        is_error: *is_error,
+                    }
+                } else {
+                    CommandBarContent::Hidden
+                };
+                let scale_factor = window.scale_factor() as f32;
+
+                match renderer.render(
+                    &self.camera,
+                    &self.scene,
+                    &self.current_stroke,
+                    command_bar,
+                    scale_factor,
+                ) {
                     RenderOutcome::Rendered | RenderOutcome::Skipped => {}
                     RenderOutcome::NeedsReconfigure => {
                         let size = window.inner_size();
@@ -202,38 +247,82 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
 
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(key_code),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => match key_code {
-                KeyCode::Escape => event_loop.exit(),
+            _ => {}
+        }
+    }
+}
 
-                // Temporary save/load bindings — see DEFAULT_BOARD_PATH.
-                KeyCode::KeyS => match file_format::save(&self.scene, DEFAULT_BOARD_PATH) {
-                    Ok(()) => log::info!(
-                        "saved {} stroke(s) to {DEFAULT_BOARD_PATH}",
-                        self.scene.len()
-                    ),
-                    Err(err) => log::error!("save to {DEFAULT_BOARD_PATH} failed: {err}"),
-                },
-                KeyCode::KeyO => match file_format::load(DEFAULT_BOARD_PATH) {
-                    Ok(scene) => {
-                        log::info!("loaded {} stroke(s) from {DEFAULT_BOARD_PATH}", scene.len());
-                        self.scene = scene;
+impl App {
+    /// Keyboard handling lives outside `window_event`'s main match because command
+    /// dispatch needs a whole `&mut self` — see the call site's comment.
+    fn handle_key_press(&mut self, event: winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        if self.command_line_active {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    let input = std::mem::take(&mut self.command_line_text);
+                    self.command_line_active = false;
+                    let (name, args) = input.split_once(' ').unwrap_or((&input, ""));
+                    // `self.registry` can't stay borrowed while `run` also needs `&mut
+                    // self` to apply the command (e.g. replacing the scene) — swap it out
+                    // for the call, then put it back.
+                    let registry = std::mem::take(&mut self.registry);
+                    let result = registry.run(self, name, args);
+                    self.registry = registry;
+                    self.status = Some(match result {
+                        Ok(message) => (message, false),
+                        Err(message) => (message, true),
+                    });
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.command_line_active = false;
+                    self.command_line_text.clear();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.command_line_text.pop();
+                }
+                _ => {
+                    if let Some(text) = &event.text {
+                        self.command_line_text
+                            .extend(text.chars().filter(|c| !c.is_control()));
+                    }
+                }
+            }
+            window.request_redraw();
+        } else {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => event_loop.exit(),
+                Key::Character(text) if text.as_str() == ":" => {
+                    self.command_line_active = true;
+                    self.command_line_text.clear();
+                    window.request_redraw();
+                }
+                Key::Character(text) => {
+                    let command_name = self.config.keybindings.get(text.as_str()).cloned();
+                    if let Some(command_name) = command_name {
+                        let registry = std::mem::take(&mut self.registry);
+                        let result = registry.run(self, &command_name, "");
+                        self.registry = registry;
+                        self.status = Some(match result {
+                            Ok(message) => (message, false),
+                            Err(message) => (message, true),
+                        });
                         window.request_redraw();
                     }
-                    Err(err) => log::error!("load from {DEFAULT_BOARD_PATH} failed: {err}"),
-                },
-
+                }
                 _ => {}
-            },
+            }
+        }
 
-            _ => {}
+        if self.should_quit {
+            // Distinguishes a deliberate `:q` exit from a crash when reading the log
+            // later — a process just disappearing with no line here means something
+            // else happened.
+            log::info!("quit command received, exiting");
+            event_loop.exit();
         }
     }
 }
@@ -242,7 +331,14 @@ fn main() {
     let log_path = logging::init();
     log::info!("blueboard starting, logging to {}", log_path.display());
 
+    let config = config::load();
+    let registry = commands::CommandRegistry::with_builtin_commands();
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App::default();
+    let mut app = App {
+        config,
+        registry,
+        ..Default::default()
+    };
     event_loop.run_app(&mut app).expect("event loop error");
 }

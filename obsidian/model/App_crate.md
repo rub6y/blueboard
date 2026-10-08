@@ -2,11 +2,16 @@
 
 The app crate (`blueboard-app`) runs the winit event loop.
 
-The app crate renders the egui UI chrome.
+The app crate owns the [[Command_line]]'s input handling and state (active/not, typed
+text, last status message) — [[Render_crate]] only renders what the app crate tells it to.
 
-The app crate implements the [[Command_line]].
+The app crate loads the [[Config_file]] at startup, before creating the window, since the
+loaded [[Theme]] is needed to construct the renderer.
 
-The app crate loads the [[Config_file]] at startup.
+The app crate's [[Command_registry]] runs commands via `std::mem::take(&mut self.registry)`
+before the call and restores it after — a `Command::run` needs `&mut App` (the same struct
+that owns the registry), so the registry can't stay borrowed from `self` while also being
+passed `self` mutably.
 
 The app crate depends on [[Core_crate]] and [[Render_crate]].
 

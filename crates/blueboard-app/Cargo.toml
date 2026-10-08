@@ -13,4 +13,6 @@ blueboard-render = { path = "../blueboard-render" }
 glam = "0.34.1"
 log = { version = "0.4.34", features = ["std"] }
 pollster = "1.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.7"
 winit = "0.30.13"

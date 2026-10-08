@@ -2,6 +2,36 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-08 — Phase 4 complete: command line + config
+- Vim-like `:`-command line implemented: [[App_crate]] owns input handling (raw `winit`
+  key events, not an egui widget) and state; [[Render_crate]] renders the bar via
+  `egui`/`egui-wgpu` as a second render pass composited on top of the board.
+- [[Command_registry]] (`blueboard-app/src/commands.rs`) added, with built-in `save`,
+  `open`, `clear`, `new`, and `q` commands — replacing Phase 3's temporary `S`/`O` hotkeys.
+  Lives in the app crate (not core) since `Command::run` needs `&mut App`.
+- [[Config_file]] (`$XDG_CONFIG_HOME/blueboard/config.toml`) added: [[Keybindings]] (single
+  character -> command name) and [[Theme]] colors. Deliberately left out `default_tool` and
+  `autosave_interval` from the original Phase 0 design sketch — no tool registry or
+  autosave implementation exists yet for those fields to configure.
+- [[Theme]] colors reach the GPU via a new small uniform buffer (`ThemeUniform`, bind group
+  1) in `shader.wgsl` — `fs_grid`/`fs_stroke` read from it instead of hardcoded constants.
+- **Bug caught immediately by the new logging infrastructure** (first real payoff of the
+  crash-resilience work): first run panicked on `TexturesDelta` drop
+  ("Dropped TexturesDelta with 1 unapplied deltas") — iterating `.set`/`.free` by reference
+  doesn't drain them; fixed by calling `.clear()` explicitly after use.
+- **A second, more concerning finding from testing**: a background test process exited
+  cleanly (no panic, no crash) right as testing began. Root-caused to a design risk, not
+  necessarily what literally happened: Phase 4's first draft bound the bare, unmodified `q`
+  key directly to quit with zero confirmation — exactly the footgun vim itself avoids by
+  *not* binding plain `q` to quit. Removed the default `q` keybinding entirely; quit stays
+  reachable only via the deliberate `:q` command. Also added a log line on quit
+  ("quit command received, exiting") so a clean exit is now distinguishable from a crash
+  just by reading the log, which is what made this ambiguous in the first place.
+- Verified by running the app: typed `:save test.bbd` live in the command bar (monospace,
+  visible as typed), pressed Enter, saw the status line confirm it and the file actually
+  appear on disk; drew a stroke and quit cleanly via `:q`, confirmed in the log.
+- Milestone tag: `v0.4-commands-and-config` (see [[Git_workflow]]).
+
 ## 2026-10-08 — Phase 3 complete: file format
 - `.bbd` save/load implemented in `blueboard-core/src/file_format.rs`, per
   [[planning_RESEARCH]] §3: [[Scene_graph]] -> `serde` -> `bincode` -> [[Compression]]
