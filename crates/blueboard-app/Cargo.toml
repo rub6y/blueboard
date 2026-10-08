@@ -10,3 +10,8 @@ path = "src/main.rs"
 [dependencies]
 blueboard-core = { path = "../blueboard-core" }
 blueboard-render = { path = "../blueboard-render" }
+env_logger = "0.11.11"
+glam = "0.34.1"
+log = "0.4.34"
+pollster = "1.0.1"
+winit = "0.30.13"

@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+glam = "0.34.1"
+serde = { version = "1.0.229", features = ["derive"] }

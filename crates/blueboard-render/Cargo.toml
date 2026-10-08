@@ -4,4 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-blueboard-core = { path = "../blueboard-core" }
+blueboard-core = { version = "0.1.0", path = "../blueboard-core" }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+glam = "0.34.1"
+raw-window-handle = "0.6.2"
+wgpu = "30.0.1"
