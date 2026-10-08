@@ -36,21 +36,23 @@
               pkgs.vulkan-tools
               pkgs.libxkbcommon
               pkgs.wayland
-              pkgs.xorg.libX11
-              pkgs.xorg.libXcursor
-              pkgs.xorg.libXi
-              pkgs.xorg.libXrandr
-              pkgs.texlive.combined.scheme-small
+              pkgs.libx11
+              pkgs.libxcursor
+              pkgs.libxi
+              pkgs.libxrandr
+              (pkgs.texlive.combine {
+                inherit (pkgs.texlive) scheme-small algorithms algorithmicx;
+              })
             ];
 
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.vulkan-loader
               pkgs.libxkbcommon
               pkgs.wayland
-              pkgs.xorg.libX11
-              pkgs.xorg.libXcursor
-              pkgs.xorg.libXi
-              pkgs.xorg.libXrandr
+              pkgs.libx11
+              pkgs.libxcursor
+              pkgs.libxi
+              pkgs.libxrandr
             ];
           };
         }
