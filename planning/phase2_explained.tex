@@ -1,0 +1,472 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.97}
+\definecolor{codeframe}{rgb}{0.8,0.8,0.82}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  xleftmargin=1em,
+  xrightmargin=1em,
+  aboveskip=1em,
+  belowskip=1em,
+}
+
+\title{Blueboard Phase 2, explained}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{What this document is}
+Phase 2 (\texttt{PLAN.md}, tag-in-progress \texttt{v0.2-vector-pen}) is where Blueboard
+went from "a camera over an empty grid" to an actual whiteboard: you can draw, and what
+you draw is a real vector object, not a bitmap. It took more iteration than Phase 1 —
+three separate rounds of bug-hunting, each found by ruba comparing blueboard's rendering
+directly against Miro's, plus a round of crash-resilience work. This note walks through
+all of it in the order it actually happened, including the Rust syntax and the research
+that shaped each fix. Like the Phase 1 note, it's a companion to the code, not a
+replacement — file references point at the real source.
+
+\tableofcontents
+
+\section{The shape of the problem}
+Drawing a pen stroke well requires four things to happen in order:
+\begin{enumerate}
+  \item \textbf{Catch pointer input} without recording more noise than signal.
+  \item \textbf{Fit a smooth curve} through those points — a real vector object, per the
+    brief, not a pixel trace.
+  \item \textbf{Store it} in a way that supports fast "what's on screen right now"
+    queries, since boards are meant to scale.
+  \item \textbf{Render it} as anti-aliased GPU triangles that look as smooth as what you
+    see in a drawing app you'd actually trust.
+\end{enumerate}
+Each step turned out to have a non-obvious failure mode, found only by looking at the
+rendered result next to Miro's — not by reading the code. That pattern (write it, compare
+against a real reference, fix what the comparison reveals) is the throughline of this
+whole phase.
+
+\section{\texttt{blueboard-core}: fitting and the scene graph}
+
+\subsection{Reusing a curve fitter instead of writing one}
+File: \texttt{crates/blueboard-core/src/fitting.rs}. \texttt{planning/math.tex} derives
+Schneider's classic curve-fitting algorithm (chord-length parameterize, least-squares fit,
+subdivide on error) as the theoretical basis for turning pointer samples into a
+\texttt{BezPath}. Implementing that by hand was the original plan — but \texttt{kurbo}
+0.13 turned out to ship its own general curve-fitting module
+(\texttt{kurbo::fit\_to\_bezpath}), built around a trait:
+\begin{lstlisting}
+pub trait ParamCurveFit {
+    fn sample_pt_tangent(&self, t: f64, sign: f64) -> CurveFitSample;
+    fn sample_pt_deriv(&self, t: f64) -> (Point, Vec2);
+    fn break_cusp(&self, range: Range<f64>) -> Option<f64>;
+}
+\end{lstlisting}
+Rather than reimplement Schneider's method, \texttt{fitting.rs} implements this trait for
+a small \texttt{Polyline} type — the raw pointer samples, treated as a piecewise-linear
+curve parameterized by normalized cumulative arc length — and hands it to kurbo's own
+fitter. Same underlying math as \texttt{math.tex} (arc-length parameterization,
+error-bounded subdivision), but using a maintained implementation instead of a bespoke
+one, per the project's own ``reuse existing utilities'' convention.
+\begin{lstlisting}
+fn sample(&self, s: f64, sign: f64) -> (Point, Vec2) {
+    let mut i = match self
+        .cumulative
+        .binary_search_by(|len| len.partial_cmp(&s).unwrap())
+    {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    i = i.min(self.points.len() - 2);
+    if sign < 0.0 && i > 0 && (self.cumulative[i] - s).abs() < f64::EPSILON {
+        i -= 1;
+    }
+    let (p0, p1) = (self.points[i], self.points[i + 1]);
+    /* ... */
+}
+\end{lstlisting}
+\texttt{binary\_search\_by} is the standard library's binary search, generalized with a
+comparator closure since \texttt{f64} doesn't implement \texttt{Ord} (NaN breaks total
+ordering, so Rust makes you say explicitly how to compare). It returns
+\texttt{Ok(index)} on an exact match or \texttt{Err(insertion\_point)} otherwise — the
+\texttt{match} handles both, and \texttt{saturating\_sub(1)} avoids underflow at index 0
+(an unsigned integer can't go negative; this clamps instead of panicking). The \texttt{sign}
+parameter exists because \texttt{ParamCurveFit} may sample exactly at a breakpoint between
+two input segments, which is ambiguous — \texttt{sign} picks which side's tangent to use,
+so a corner gets a well-defined direction from both sides instead of an arbitrary one.
+
+\subsection{The scene graph and its spatial index}
+File: \texttt{crates/blueboard-core/src/scene.rs}.
+\begin{lstlisting}
+pub struct Scene {
+    next_id: u64,
+    strokes: HashMap<u64, Stroke>,
+    index: RTree<IndexedBounds>,
+}
+
+struct IndexedBounds {
+    id: u64,
+    envelope: AABB<[f64; 2]>,
+}
+
+impl RTreeObject for IndexedBounds {
+    type Envelope = AABB<[f64; 2]>;
+    fn envelope(&self) -> Self::Envelope {
+        self.envelope
+    }
+}
+\end{lstlisting}
+The R-tree (\texttt{rstar}) doesn't index strokes directly — it indexes a tiny
+\texttt{IndexedBounds} struct holding just an id and a bounding box. The actual
+\texttt{Stroke} (with its full \texttt{BezPath}) lives in a separate \texttt{HashMap},
+looked up by id after a spatial query. This split matters: the R-tree's internal nodes
+store copies of whatever you insert, so indexing full strokes would duplicate potentially
+large path data all through the tree; indexing a bounding box is cheap to copy no matter
+how complex the stroke is.
+\begin{lstlisting}
+pub fn strokes_in_viewport(&self, min: DVec2, max: DVec2) -> impl Iterator<Item = &Stroke> {
+    let envelope = AABB::from_corners([min.x, min.y], [max.x, max.y]);
+    self.index
+        .locate_in_envelope_intersecting(envelope)
+        .filter_map(move |entry| self.strokes.get(&entry.id))
+}
+\end{lstlisting}
+\texttt{-> impl Iterator<Item = \&Stroke>} is an \emph{existential return type}: the
+caller gets ``some concrete iterator type that yields \texttt{\&Stroke}'' without that
+type being named — it's actually a chain of \texttt{rstar} and \texttt{filter\_map}
+adapter types nobody wants to spell out. \texttt{move} on the closure captures
+\texttt{self.strokes} by reference into the closure so it outlives the function call,
+which a non-\texttt{move} closure wouldn't guarantee under the borrow checker here. This
+is the viewport-culling query \texttt{blueboard-render} runs every frame (\S\ref{sec:cull}).
+
+\section{\texttt{blueboard-render}: tessellation, and bug hunt \#1}
+
+\subsection{From \texttt{kurbo} paths to GPU triangles}
+File: \texttt{crates/blueboard-render/src/lib.rs}. Two libraries, two path types: the
+scene graph stores \texttt{kurbo::BezPath}, but \texttt{lyon} (the tessellator) has its
+own \texttt{lyon::path::Path}. \texttt{kurbo\_path\_to\_lyon} walks one and replays it on
+the other's builder:
+\begin{lstlisting}
+fn kurbo_path_to_lyon(path: &kurbo::BezPath) -> LyonPath {
+    let mut builder = LyonPath::builder();
+    let mut closed = false;
+    for el in path.elements() {
+        match *el {
+            kurbo::PathEl::MoveTo(p) => { builder.begin(point(p.x as f32, p.y as f32)); }
+            kurbo::PathEl::CurveTo(c1, c2, p) => {
+                builder.cubic_bezier_to(/* ... */);
+            }
+            /* ... */
+        }
+    }
+    if !closed { builder.end(false); }
+    builder.build()
+}
+\end{lstlisting}
+\texttt{path.elements()} returns an iterator over \texttt{kurbo::PathEl} — an enum with
+one variant per SVG-style path command. \texttt{match *el} dereferences each element (the
+iterator yields references; the variants are small \texttt{Copy} data, so dereferencing to
+match by value is cheap and avoids a wall of \texttt{\&PathEl::Foo(ref p)} patterns).
+Tracking \texttt{closed} matters because lyon's builder requires exactly one
+\texttt{end()} call per subpath — calling it twice (once from a \texttt{ClosePath}
+element, once unconditionally afterward) would panic.
+
+\subsection{Tessellating a stroke, and letting bad strokes fail softly}
+\begin{lstlisting}
+fn tessellate_stroke(path: &kurbo::BezPath, width: f32, tolerance: f32, out: &mut Vec<Vertex>) {
+    let lyon_path = kurbo_path_to_lyon(path);
+    let options = StrokeOptions::default()
+        .with_line_width(width)
+        .with_tolerance(tolerance)
+        .with_line_join(lyon::tessellation::LineJoin::Round)
+        .with_start_cap(lyon::tessellation::LineCap::Round)
+        .with_end_cap(lyon::tessellation::LineCap::Round);
+
+    let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
+    let result = tessellator.tessellate_path(&lyon_path, &options, &mut BuffersBuilder::new(
+        &mut buffers,
+        |vertex: StrokeVertex| Vertex { position: vertex.position().to_array() },
+    ));
+    if let Err(err) = result {
+        log::error!("stroke tessellation failed, skipping this stroke: {err:?}");
+        return;
+    }
+    out.extend(buffers.indices.iter().map(|&i| buffers.vertices[i as usize]));
+}
+\end{lstlisting}
+\texttt{BuffersBuilder::new(\&mut buffers, closure)} is \texttt{lyon}'s pattern for
+``build me vertex/index buffers, and here's how to turn the tessellator's internal vertex
+representation into mine'' — the closure itself satisfies lyon's
+\texttt{StrokeVertexConstructor} trait via a blanket impl (\texttt{lyon} implements that
+trait for any \texttt{Fn(StrokeVertex) -> V}), so no explicit trait impl block is needed,
+just a closure. \texttt{round} joins/caps replaced lyon's default \texttt{miter} joins —
+found necessary in bug hunt \#1 below. The \texttt{if let Err(...) \{ log::error!(...);
+return; \}} pattern — rather than the \texttt{.expect(...)} this originally used — is
+Phase 2's crash-resilience pass (\S\ref{sec:crashes}): one malformed stroke now gets
+dropped and logged instead of taking down the whole running app.
+
+\subsection{Viewport culling}
+\label{sec:cull}
+\begin{lstlisting}
+let board_min = camera.screen_to_board(DVec2::ZERO, viewport_f64);
+let board_max = camera.screen_to_board(viewport_f64, viewport_f64);
+let mut stroke_vertices = Vec::new();
+for stroke in scene.strokes_in_viewport(board_min, board_max) {
+    tessellate_stroke(&stroke.path, STROKE_WIDTH, tessellation_tolerance, &mut stroke_vertices);
+}
+\end{lstlisting}
+Every frame, the camera's current viewport corners are converted to board space and used
+to query the scene's R-tree (\S3.2) — only strokes actually on screen get tessellated.
+\texttt{PLAN.md} calls this out explicitly as ``wired in now even though boards are
+small'': the payoff doesn't show up until boards have thousands of strokes, but retrofitting
+spatial culling onto a renderer that assumed ``just loop over everything'' is a much bigger
+change than building it in from the start.
+
+\subsection{Bug hunt \#1: ``the lines look pixelated''}
+\label{sec:bughunt1}
+ruba's first side-by-side comparison against Miro showed visibly jagged, faceted stroke
+edges. Three separate causes, found by elimination:
+
+\paragraph{Cause 1: no anti-aliasing.} The pipeline had \texttt{multisample:
+wgpu::MultisampleState::default()} — sample count 1, meaning every triangle edge is a hard
+binary in/out test at rasterization. Fixed with 4$\times$ MSAA: an offscreen multisampled
+color texture that every pipeline renders into, resolved down into the swapchain's
+single-sample texture at the end of the pass:
+\begin{lstlisting}
+fn create_msaa_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+        sample_count: SAMPLE_COUNT, /* = 4 */
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        /* ... */
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+\end{lstlisting}
+and in the render pass:
+\begin{lstlisting}
+color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+    view: &self.msaa_view,
+    resolve_target: Some(&view),   // the real swapchain texture
+    ops: wgpu::Operations {
+        load: wgpu::LoadOp::Clear(/* board blue */),
+        store: wgpu::StoreOp::Discard,  // only the resolved texture needs to survive
+    },
+    /* ... */
+})],
+\end{lstlisting}
+GPU-side, MSAA renders each pixel at 4 sample locations instead of 1, and a triangle edge
+that only covers some of those samples gets a blended (partially transparent) color at
+that pixel instead of a hard on/off choice — this is literally what removes the
+staircasing. \texttt{StoreOp::Discard} on the multisampled attachment is a minor
+efficiency detail: once it's resolved into the single-sample swapchain texture, the
+4$\times$-larger multisampled data doesn't need to be written back anywhere.
+
+\paragraph{Cause 2: tolerance not scaled by zoom.} \texttt{planning/math.tex} \S3 is
+explicit that flattening tolerance must be in screen-space pixels, dividing by zoom before
+use, so detail automatically tightens when zoomed in. The curve \emph{fit} tolerance
+(\S\ref{sec:bughunt2}) got this right from the start; the \emph{tessellation} tolerance
+passed to lyon was a hardcoded board-space \texttt{0.25}, violating the project's own
+documented design — fine at 100\% zoom (0.25 screen px), visibly coarse once zoomed in
+(0.25 $\times$ zoom screen px of error). Fixed by computing it the same way the fit
+tolerance already was:
+\begin{lstlisting}
+let tessellation_tolerance = STROKE_TESSELLATION_TOLERANCE_PX / camera.zoom as f32;
+\end{lstlisting}
+
+\paragraph{Cause 3: miter joins.} lyon's default \texttt{LineJoin::Miter} produces sharp
+corners at every curve-fit segment boundary; Miro's pen reads as rounded. Switched to
+\texttt{LineJoin::Round} with round caps (\S4.2) — a one-line change, visibly softer
+strokes.
+
+\subsection{Crash resilience: making wgpu's errors recoverable}
+\label{sec:crashes}
+Investigating ``the app sometimes crashes for no reason'' turned up a specific,
+previously-seen clue: Phase 1's shader bug had logged
+\texttt{"Handling wgpu errors as fatal by default"} right before panicking. That's wgpu's
+actual default: any \emph{uncaptured} device error (a validation error not wrapped in an
+explicit error scope) panics the whole process. wgpu provides an escape hatch:
+\begin{lstlisting}
+device.on_uncaptured_error(Arc::new(|error| {
+    log::error!("wgpu uncaptured error: {error}");
+}));
+device.set_device_lost_callback(|reason, message| {
+    log::error!("wgpu device lost: {reason:?}: {message}");
+});
+\end{lstlisting}
+\texttt{Arc<dyn UncapturedErrorHandler>} — \texttt{UncapturedErrorHandler} is defined as a
+blanket trait over any \texttt{Fn(Error) + Send + Sync + 'static}, so an ordinary closure
+satisfies it automatically; \texttt{Arc} (not \texttt{Box}) because wgpu may need to share
+the handler across internal threads. Installing these turns ``the window just vanished''
+into a logged, diagnosable line — the single highest-value change in this whole bug-hunt
+round, since it addresses a whole \emph{class} of potential crash, not one specific bug.
+
+\section{\texttt{blueboard-app}: input handling, and bug hunts \#2 and \#3}
+
+\subsection{Re-mapping input for the pen}
+File: \texttt{crates/blueboard-app/src/main.rs}. Phase 1's left-drag-to-pan had to move:
+left-drag now draws, middle-drag pans, scroll still zooms — a small but deliberate choice,
+since the pen is the thing actually being built this phase.
+
+\subsection{Bug hunt \#2: real mouse jitter becomes fake curvature}
+\label{sec:bughunt2}
+A second comparison against Miro, this time drawing a near-horizontal line specifically,
+showed visible staircase kinks that \S\ref{sec:bughunt1}'s anti-aliasing fix didn't touch
+— a different bug, upstream of rendering entirely. Real pointer input has a pixel or two
+of jitter even moving in a straight line; every \texttt{CursorMoved} event was being
+recorded and fit with a tight 1.5px tolerance, so the curve fitter faithfully reproduced
+the jitter as real direction changes. Worst-case visible on a horizontal line, where the
+jitter is the \emph{entire} vertical variation of the stroke.
+
+Two changes: loosen the fit tolerance (1.5px $\to$ 2.5px, enough to smooth over a pixel or
+two of noise), and \emph{decimate} raw samples by screen-space distance before they reach
+the fitter:
+\begin{lstlisting}
+} else if self.drawing
+    && cursor.distance(self.last_sample_screen) >= PEN_MIN_SAMPLE_DISTANCE_PX
+{
+    /* record point */
+    self.last_sample_screen = cursor;
+}
+\end{lstlisting}
+Pointer-move events arrive far more densely than meaningful hand motion; most of that
+density is jitter. Dropping points closer than 2 screen-px to the last \emph{recorded}
+one (not the last \emph{event}) stops near-stationary noise from ever reaching the fitter.
+
+\subsection{Bug hunt \#3: decimation thins density, not noise}
+A third comparison, zoomed in far past where the stroke was drawn, still showed small
+regular kinks — decimation and a looser tolerance had helped but not solved it. The
+reason: decimation only controls how many points survive, not where they are. Each
+surviving point is still exactly wherever the noisy cursor was; that's invisible within
+the fit tolerance at the zoom level drawn, but zooming in further effectively magnifies
+the same noise.
+
+Researching how other open-source whiteboard/drawing tools solve this led to
+\href{https://github.com/steveruizok/perfect-freehand}{perfect-freehand} (Steve Ruiz),
+used by both \href{https://tldraw.dev/sdk-features/draw-shape}{tldraw} and
+\href{https://github.com/excalidraw/excalidraw/pull/3512}{Excalidraw} for their pen tools.
+Its relevant idea is the \emph{streamline} parameter: pull each incoming point toward a
+running average of recent positions — a live low-pass filter on the input stream itself,
+not just its density. (perfect-freehand's full approach also builds a variable-width
+outline polygon rather than a centerline-plus-width stroke, a bigger architectural
+difference not adopted here — just the streamline idea.)
+\begin{lstlisting}
+self.smoothed_cursor = self.smoothed_cursor.lerp(cursor, PEN_STREAMLINE_ALPHA); // = 0.5
+if self.smoothed_cursor.distance(self.last_sample_screen) >= PEN_MIN_SAMPLE_DISTANCE_PX {
+    /* record self.smoothed_cursor, not the raw cursor */
+}
+\end{lstlisting}
+\texttt{DVec2::lerp(self, other, t)} computes $(1-t)\cdot\text{self} + t\cdot\text{other}$
+— an exponential moving average falls out of calling this every frame with the same
+\texttt{t}: each update pulls the smoothed point halfway toward the new raw sample,
+so old noise decays geometrically rather than being remembered forever.
+\texttt{smoothed\_cursor} is snapped to the raw cursor position on pen-down (no lag at the
+very start of a stroke) and is what gets decimated and fed to the fitter — the raw
+\texttt{cursor} is no longer recorded directly at all. This is the fix that actually
+closed the gap: re-tested the same jittery horizontal line, zoomed in to the same level
+that showed kinks before, and it was smooth.
+
+\subsection{Zoom range}
+\texttt{MAX\_ZOOM} raised from the brief's original 200\% to 400\% in
+\texttt{blueboard-core/src/camera.rs}, after ruba compared directly against how far Miro
+lets you zoom. \texttt{MIN\_ZOOM} (1\%) unchanged.
+
+\subsection{Logging: stderr isn't enough for a GUI app}
+File: \texttt{crates/blueboard-app/src/logging.rs}. The crash-resilience work in
+\S\ref{sec:crashes} converts wgpu errors into log lines — but a log line only helps if
+someone can actually read it, and a GUI app's stderr is easy to lose (closed terminal,
+launched from a desktop icon). Rather than reach for \texttt{env\_logger} (which only
+writes to one target), a small custom \texttt{log::Log} implementation writes every line
+to \emph{both} stderr and a persistent file:
+\begin{lstlisting}
+impl Log for FileAndStderrLogger {
+    fn log(&self, record: &Record) {
+        let line = format!("[{}] {:5} {}: {}", unix_timestamp(), record.level(), record.target(), record.args());
+        eprintln!("{line}");
+        if let Ok(mut file) = self.file.lock() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+    /* ... */
+}
+\end{lstlisting}
+\texttt{Mutex<File>} guards the file handle since \texttt{Log} requires \texttt{Sync} (the
+global logger can be called from any thread); \texttt{.lock()} returning an \texttt{Err}
+(a poisoned mutex, from an earlier panic while holding the lock) is handled by just
+skipping that log line via \texttt{if let Ok(...)} rather than panicking again — a logger
+that can itself cause a crash would defeat the point. The log file lives at
+\texttt{\$XDG\_STATE\_HOME/blueboard/blueboard.log} (falling back to
+\texttt{~/.local/state/...}), matching the XDG convention already used for the config file
+path decided in Phase 0's research — config and runtime state are conventionally separate
+directories, not reused for both.
+\begin{lstlisting}
+fn install_panic_hook(path: PathBuf) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut file) = open_log_file(&path) {
+            let _ = writeln!(file, "[{}] PANIC: {info}", unix_timestamp());
+        }
+        default_hook(info);
+    }));
+}
+\end{lstlisting}
+\texttt{std::panic::take\_hook()} retrieves Rust's current panic hook (by default, the one
+that prints a backtrace-ish message to stderr) and \emph{removes} it, handing back
+ownership; the new hook wraps it, so the original behavior (stderr output) still happens
+via \texttt{default\_hook(info)} at the end — this appends to the log file \emph{in
+addition to}, not instead of, the normal panic message. Combined with
+\S\ref{sec:crashes}'s wgpu error handlers, the two together cover both failure modes this
+phase has actually seen: an uncaptured wgpu error (now logged, not fatal) and an
+unexpected panic anywhere else in the program (now logged to a file that survives a closed
+terminal, even though the panic itself is still fatal — turning an unexplained
+disappearance into a diagnosable one).
+
+\section{Tools and research consulted this phase}
+\begin{description}
+  \item[\texttt{kurbo}'s \texttt{fit} module] (\S2.1) — avoided a hand-rolled Schneider
+    implementation.
+  \item[\texttt{lyon\_tessellation}] (\S4.1--4.2) — stroke tessellation, read directly
+    from its source (as with wgpu in Phase 1) to get the exact 1.0.19 API shape right.
+  \item[\href{https://github.com/steveruizok/perfect-freehand}{perfect-freehand}]
+    (\S\ref{sec:bughunt2}) — the streamline-smoothing concept, the open-source reference
+    point that resolved bug hunt \#3.
+  \item[wgpu's error-scope docs] (\S\ref{sec:crashes}) — \texttt{on\_uncaptured\_error} /
+    \texttt{set\_device\_lost\_callback} as the documented alternative to wgpu's default
+    panic-on-error behavior.
+\end{description}
+
+\section{A verification-methodology lesson}
+Worth recording since it shaped how to read ``verified by running the app'' claims in this
+phase's git history: background test processes were launched with
+\texttt{DISPLAY=:0}, forcing the X11/XWayland backend so \texttt{xdotool} could drive
+them — but \texttt{:0} is ruba's actual live desktop session, not an isolated test
+display. A test run showed a stroke logged (\texttt{"stroke 0 committed from 151 raw
+samples"}) in a session where no synthetic input had been sent yet — real mouse activity
+on the shared display had landed on the test window. Earlier in the phase, screenshots
+that appeared to show stale content from a previous session most likely had the same
+explanation, not a compositor caching bug as first suspected. Background GUI testing on a
+shared display can't be treated as fully isolated; a genuinely clean test needs either a
+dedicated virtual display or a window confirmed to have received no outside input during
+the test window.
+
+\section{What's next}
+Phase 3, per \texttt{PLAN.md}: the \texttt{.bbd} file format — serializing the scene graph
+with \texttt{serde}/\texttt{bincode}, compressing with \texttt{zstd}, and round-trip tests
+from the start, since (per the project's own safety conventions) file-format bugs are the
+kind that can destroy a user's work.
+
+\end{document}
