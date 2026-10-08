@@ -2,6 +2,35 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-08 — Phase 3 complete: file format
+- `.bbd` save/load implemented in `blueboard-core/src/file_format.rs`, per
+  [[planning_RESEARCH]] §3: [[Scene_graph]] -> `serde` -> `bincode` -> [[Compression]]
+  (`zstd`), single compressed blob (no spatial tiling yet — Phase 6, once a real board
+  exists to profile against).
+- Caught a real dependency-ecosystem trap while adding it: `cargo add bincode` resolved to
+  `bincode 3.0.0`, which turned out to be a placeholder/joke package
+  (`compile_error!("https://xkcd.com/2347/")`), not the real crate — the actively
+  maintained bincode is 2.x. Pinned explicitly to `bincode@2`. Worth remembering:
+  `cargo add` picking the nominally-latest version isn't automatically trustworthy,
+  especially for a crate whose maintained line is a major version behind what resolves by
+  default.
+- On-disk schema (`SceneDocument`/`StrokeDocument`) deliberately kept separate from the
+  runtime `Scene`/`Stroke` types — the runtime scene also carries the [[RTree_index]],
+  which is derived data that would be dead weight on disk and gets rebuilt on load anyway.
+- [[Scene_graph]] gained `insert_loaded_stroke` (preserves ids from a loaded file,
+  advancing `next_id` past the highest loaded id) and `all_strokes`/`len`/`is_empty`
+  alongside the existing viewport-filtered query.
+- Four round-trip tests from the start (empty scene, multi-stroke round-trip, id
+  continuation after load, rejecting an unsupported format version) — file-format bugs are
+  the kind that destroy user data, per the project's own safety conventions.
+- [[App_crate]] got temporary `S`/`O` hotkeys (save/load to a fixed `board.bbd` path) so
+  the format could be tested by actually running the app, not just unit tests — standing in
+  until [[Command_line]]'s `:save`/`:open` in Phase 4.
+- Verified end-to-end on a real file: drew two strokes, saved, killed the process entirely,
+  launched a fresh one, loaded, and confirmed the same strokes rendered — not just an
+  in-memory round trip.
+- Milestone tag: `v0.3-file-format` (see [[Git_workflow]]).
+
 ## 2026-10-08 — Streamline smoothing, crash resilience, logging
 - Follow-up to the pen smoothing fix below: a *second* comparison against Miro, zoomed in
   past where a stroke was drawn, still showed small regular kinks — decimation thins point

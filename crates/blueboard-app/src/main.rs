@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use blueboard_core::camera::Camera;
+use blueboard_core::file_format;
 use blueboard_core::fitting::fit_stroke;
 use blueboard_core::scene::Scene;
 use blueboard_render::{RenderOutcome, Renderer};
@@ -49,6 +50,11 @@ const PEN_MIN_SAMPLE_DISTANCE_PX: f64 = 2.0;
 /// positions instead of recording the raw, jittery position directly. Lower = smoother but
 /// laggier (recorded points trail further behind the actual cursor).
 const PEN_STREAMLINE_ALPHA: f64 = 0.5;
+
+/// Where `S`/`O` save/load, for now. Phase 4's `:save`/`:open` commands (with a path
+/// argument) will replace this; until then a fixed, visible-in-the-repo-root path is
+/// enough to test the file format end to end by actually running the app.
+const DEFAULT_BOARD_PATH: &str = "board.bbd";
 
 #[derive(Default)]
 struct App {
@@ -199,12 +205,33 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        physical_key: PhysicalKey::Code(key_code),
                         state: ElementState::Pressed,
                         ..
                     },
                 ..
-            } => event_loop.exit(),
+            } => match key_code {
+                KeyCode::Escape => event_loop.exit(),
+
+                // Temporary save/load bindings — see DEFAULT_BOARD_PATH.
+                KeyCode::KeyS => match file_format::save(&self.scene, DEFAULT_BOARD_PATH) {
+                    Ok(()) => log::info!(
+                        "saved {} stroke(s) to {DEFAULT_BOARD_PATH}",
+                        self.scene.len()
+                    ),
+                    Err(err) => log::error!("save to {DEFAULT_BOARD_PATH} failed: {err}"),
+                },
+                KeyCode::KeyO => match file_format::load(DEFAULT_BOARD_PATH) {
+                    Ok(scene) => {
+                        log::info!("loaded {} stroke(s) from {DEFAULT_BOARD_PATH}", scene.len());
+                        self.scene = scene;
+                        window.request_redraw();
+                    }
+                    Err(err) => log::error!("load from {DEFAULT_BOARD_PATH} failed: {err}"),
+                },
+
+                _ => {}
+            },
 
             _ => {}
         }

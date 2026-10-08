@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bincode = { version = "2", features = ["serde"] }
 glam = "0.34.1"
-kurbo = "0.13.1"
+kurbo = { version = "0.13.1", features = ["serde"] }
 rstar = "0.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
+zstd = "0.14.0"
