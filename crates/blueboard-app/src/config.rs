@@ -49,6 +49,7 @@ fn default_keybindings() -> HashMap<String, String> {
         ("v", "tool select"),
         ("x", "tool eraser"),
         ("d", "delete"),
+        ("c", "color picker"),
         // Same "distinct literal character via Shift" trick as `u`/`U` below — not a
         // modifier binding, just the fact that winit reports Shift+x's logical key as the
         // literal `"X"`.
@@ -97,14 +98,20 @@ impl From<Theme> for ThemeColors {
     }
 }
 
-/// `$XDG_CONFIG_HOME/blueboard/config.toml`, falling back to `~/.config/...`, then the
-/// system temp dir if neither `XDG_CONFIG_HOME` nor `HOME` is set.
-pub fn config_file_path() -> PathBuf {
-    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+/// `$XDG_CONFIG_HOME/blueboard/`, falling back to `~/.config/blueboard/`, then the system
+/// temp dir if neither `XDG_CONFIG_HOME` nor `HOME` is set — shared by `config_file_path`
+/// and `crate::macros`'s own file, which deliberately lives next to `config.toml` rather
+/// than inside it (see that module's doc comment).
+pub fn config_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(std::env::temp_dir);
-    config_dir.join("blueboard").join("config.toml")
+    base.join("blueboard")
+}
+
+pub fn config_file_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
 pub fn load() -> Config {

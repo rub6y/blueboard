@@ -23,6 +23,7 @@ mod color;
 mod commands;
 mod config;
 mod logging;
+mod macros;
 mod tools;
 
 /// Default path for `:save`/`:open` (and their keybindings) when no path argument is
@@ -70,6 +71,10 @@ struct App {
     /// forward real input to egui while this is `true`).
     color_picker_open: bool,
     grid: GridSettings,
+    /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
+    /// their own file — see `macros.rs`'s doc comment for why that's separate from
+    /// `config.toml`. Loaded once at startup in `main()`.
+    macros: macros::Macros,
 }
 
 impl ApplicationHandler for App {
@@ -294,6 +299,25 @@ fn screen_to_egui_points(cursor: DVec2, scale_factor: f64) -> egui::Pos2 {
     )
 }
 
+/// Maps the handful of named keys the color picker's fields actually need (Tab to move
+/// between them, the rest to edit whichever's focused) — not a general winit-to-egui key
+/// mapping, just enough for basic text-field use.
+fn winit_key_to_egui(key: &Key) -> Option<egui::Key> {
+    match key {
+        Key::Named(NamedKey::Tab) => Some(egui::Key::Tab),
+        Key::Named(NamedKey::Backspace) => Some(egui::Key::Backspace),
+        Key::Named(NamedKey::Delete) => Some(egui::Key::Delete),
+        Key::Named(NamedKey::Enter) => Some(egui::Key::Enter),
+        Key::Named(NamedKey::ArrowLeft) => Some(egui::Key::ArrowLeft),
+        Key::Named(NamedKey::ArrowRight) => Some(egui::Key::ArrowRight),
+        Key::Named(NamedKey::ArrowUp) => Some(egui::Key::ArrowUp),
+        Key::Named(NamedKey::ArrowDown) => Some(egui::Key::ArrowDown),
+        Key::Named(NamedKey::Home) => Some(egui::Key::Home),
+        Key::Named(NamedKey::End) => Some(egui::Key::End),
+        _ => None,
+    }
+}
+
 /// What the command line would complete right now, if anything: the fixed text to keep
 /// (prepended to whatever candidate is chosen) and the matching candidates as `(name,
 /// usage)` pairs. Completes the command name itself (nothing typed after it yet), or —
@@ -375,17 +399,49 @@ impl App {
                 }
             }
             window.request_redraw();
+        } else if self.color_picker_open {
+            // Keyboard focus belongs to the picker while it's open — Tab moves between
+            // its fields (hex/R/G/B), text/backspace/arrows edit whichever's focused.
+            // Escape closes it instead of its normal quit-the-app behavior.
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.color_picker_open = false;
+                }
+                _ => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        if let Some(egui_key) = winit_key_to_egui(&event.logical_key) {
+                            renderer.push_egui_event(egui::Event::Key {
+                                key: egui_key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::default(),
+                            });
+                        }
+                        if let Some(text) = &event.text {
+                            let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                            if !typed.is_empty() {
+                                renderer.push_egui_event(egui::Event::Text(typed));
+                            }
+                        }
+                    }
+                }
+            }
+            window.request_redraw();
         } else {
             match &event.logical_key {
-                Key::Named(NamedKey::Escape) if self.color_picker_open => {
-                    self.color_picker_open = false;
-                    window.request_redraw();
-                }
                 Key::Named(NamedKey::Escape) => event_loop.exit(),
                 Key::Character(text) if text.as_str() == ":" => {
                     self.command_line_active = true;
                     self.command_line_text.clear();
                     self.command_completion_index = None;
+                    window.request_redraw();
+                }
+                Key::Character(text)
+                    if text.len() == 1
+                        && text.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
+                {
+                    self.trigger_macro(text.as_str());
                     window.request_redraw();
                 }
                 Key::Character(text) => {
@@ -407,6 +463,30 @@ impl App {
             log::info!("quit command received, exiting");
             event_loop.exit();
         }
+    }
+
+    /// Applies the macro bound to `digit` (a single-character `"0"`-`"9"` string), if
+    /// one's been set via `:m` — switches both the active tool and the current drawing
+    /// color in one keystroke. Silently does nothing for an unset digit, same as an
+    /// unbound regular keybinding already does.
+    fn trigger_macro(&mut self, digit: &str) {
+        let Some(macro_) = self.macros.get(digit) else {
+            return;
+        };
+        let tool = macro_.tool.clone();
+        let color = macro_.color.clone();
+        if !self.tools.set_active(&tool) {
+            self.status = Some((format!("macro {digit}: unknown tool {tool}"), true));
+            return;
+        }
+        match color::parse_color(&color) {
+            Some(color) => self.current_color = color,
+            None => {
+                self.status = Some((format!("macro {digit}: unknown color {color}"), true));
+                return;
+            }
+        }
+        self.status = Some((format!("macro {digit}: {tool} / {color}"), false));
     }
 
     /// Runs a command by name (from the command line or a keybinding) and records the
@@ -438,11 +518,13 @@ fn main() {
 
     let config = config::load();
     let registry = commands::CommandRegistry::with_builtin_commands();
+    let macros = macros::load();
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App {
         config,
         registry,
+        macros,
         // `#[derive(Default)]` would otherwise zero this to black — see the field's doc
         // comment.
         current_color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,

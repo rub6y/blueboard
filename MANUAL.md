@@ -44,6 +44,7 @@ that's the one built-in command whose argument has a fixed, known vocabulary.
 | `:delete` | `:delete` | Deletes whatever the active tool currently has selected (works with `select`, `select-rect`, `select-lasso`; errors "nothing selected" with any other tool, or none). |
 | `:color` | `:color <name\|#hex\|picker>` | Sets the color the pen and shape tools draw their *next* element in (a drawn element's color never changes after the fact), or toggles the interactive color picker — see Color below. |
 | `:grid` | `:grid <show\|hide\|bigger\|smaller\|number>` | Shows/hides the reference grid, or changes its spacing — `bigger`/`smaller` scale it by 1.5x each press; a bare number sets an exact board-space spacing. Runtime only, not saved to the config file. |
+| `:m` | `:m <0-9>` | Binds the active tool and current drawing color to that number key — see Macros below. |
 | `:undo` | `:undo` | Steps back one edit. |
 | `:redo` | `:redo` | Re-applies an edit just undone. |
 | `:help` | `:help` | Lists every command and its usage hint, one line, in the command bar. |
@@ -94,10 +95,32 @@ split.
 
 `:color picker` toggles an interactive picker (the classic saturation/value square + hue
 strip) floating over the board — drag in it to pick a color live, same as typing `:color
-#hex` but visual. It's the one piece of UI in this app that's actually interactive (the
-command bar itself is purely for typing/reading); while it's open, clicks on the canvas go
-to the picker instead of the active tool, and Escape closes the picker rather than
-quitting the app.
+#hex` but visual. Default key `c`. It's the one piece of UI in this app that's actually
+interactive (the command bar itself is purely for typing/reading); while it's open, Tab
+moves between its hex/R/G/B fields, typing edits whichever's focused (double-click a
+field first — a single click just drags its value, egui's own convention), clicks on the
+canvas go to the picker instead of the active tool, and **every key goes to the picker,
+including `c` itself** — so the shortcut only opens it; Escape is the only way to close it
+while it's open.
+
+## Macros
+
+`:m <0-9>` binds the *active tool* and *current drawing color* to that number key.
+Afterward, pressing the digit (outside the command line) switches both at once — e.g.
+switch to `rect`, `:color green`, `:m 3`, and `3` will always bring back rect-with-green
+from then on, even after switching away. Pressing an unset digit does nothing.
+
+Macros are saved to `$XDG_CONFIG_HOME/blueboard/macros.toml` the moment `:m` sets one —
+hand-editable, same shape it's written in:
+
+```toml
+[3]
+tool = "rect"
+color = "#33cc4d"
+```
+
+Deliberately a separate file from `config.toml`, not a section of it — see Config file
+below.
 
 ## Keybindings
 
@@ -116,6 +139,8 @@ they just match the distinct character winit reports for Shift+<key>.
 | `v` | `:tool select` |
 | `x` | `:tool eraser` |
 | `d` | `:delete` |
+| `c` | `:color picker` |
+| `0`-`9` | Whatever tool+color `:m` bound to that digit, if anything (not a regular keybinding — see Macros above). |
 | `X` | `:tool eraser-object` |
 | `V` | `:tool select-rect` |
 | `L` | `:tool select-lasso` |
@@ -148,7 +173,9 @@ refusing to start. Two sections:
 
 Grid visibility/spacing (`:grid`) and the current drawing color (`:color`) are
 runtime-only, not part of this file — they reset to their defaults (grid shown, spacing
-100, color white) every time the app starts.
+100, color white) every time the app starts. Macros (`:m`) *are* persisted, but to their
+own `macros.toml` next to this file, not inside it — folding them in would mean rewriting
+the whole hand-edited config (stripping comments/formatting) every time `:m` runs.
 
 ## File format
 

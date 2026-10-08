@@ -39,3 +39,8 @@ every other tool's default no-ops, reported back as "nothing selected."
 interactive color picker — see [[Render_crate]]. `:grid <show|hide|bigger|smaller|
 number>` controls the reference grid's visibility and spacing.
 
+`:m <0-9>` (key `m` isn't bound to it — only the number keys are, once a macro's set)
+binds the active tool and current color to a number key; pressing that digit afterward
+switches both at once. Persisted to its own `macros.toml` — see [[Config_file]] for why
+that's a separate file, not a `[macros]` section of `config.toml`.
+

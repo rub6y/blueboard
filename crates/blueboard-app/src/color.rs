@@ -28,6 +28,19 @@ pub fn parse_color(input: &str) -> Option<[f32; 3]> {
         .or_else(|| parse_hex(trimmed))
 }
 
+/// The inverse of [`parse_color`]'s hex path — used to write a macro's color back to
+/// `macros.toml` in a form `parse_color` (and a human editing the file) can read, rather
+/// than persisting whichever name/case the user happened to type at `:color`/`:m` time.
+pub fn color_to_hex(color: [f32; 3]) -> String {
+    let channel = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        channel(color[0]),
+        channel(color[1]),
+        channel(color[2])
+    )
+}
+
 fn parse_hex(input: &str) -> Option<[f32; 3]> {
     let hex = input.strip_prefix('#').unwrap_or(input);
     if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -62,5 +75,11 @@ mod tests {
         assert_eq!(parse_color("notacolor"), None);
         assert_eq!(parse_color("#ff00"), None); // too short
         assert_eq!(parse_color("#gggggg"), None); // not hex digits
+    }
+
+    #[test]
+    fn color_to_hex_round_trips_through_parse_color() {
+        let orange = [1.0, 0.5019608, 0.0];
+        assert_eq!(parse_color(&color_to_hex(orange)), Some(orange));
     }
 }

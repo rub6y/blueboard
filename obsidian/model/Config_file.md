@@ -14,3 +14,10 @@ fields are absent — since this is hand-edited and expected to contain typos. O
 limitation: a `[keybindings]` section present in the file replaces the default keybinding
 map entirely rather than merging into it (a consequence of how `serde`'s per-field default
 works), so remapping one key means re-specifying all of them.
+
+Tool+color macros (`:m <number>`, see [[Command_registry]]) are deliberately **not** part
+of this file — they live in a sibling `macros.toml`, written automatically whenever `:m`
+sets one. Folding them into `config.toml` would mean round-tripping the whole file through
+`toml::to_string` on every `:m`, silently stripping any comments/formatting in a
+hand-edited config — a risk a dedicated, app-only-written file doesn't have. `config.toml`
+itself stays read-only to the app, same as always.

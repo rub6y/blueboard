@@ -49,6 +49,7 @@ impl CommandRegistry {
         registry.register(DeleteCommand);
         registry.register(ColorCommand);
         registry.register(GridCommand);
+        registry.register(MacroCommand);
         registry.register(UndoCommand);
         registry.register(RedoCommand);
         registry.register(HelpCommand);
@@ -322,6 +323,40 @@ impl Command for GridCommand {
                 _ => Err(format!("unknown grid command: {arg}")),
             },
         }
+    }
+}
+
+/// Binds the active tool and current drawing color to a number key — pressing that digit
+/// afterward (outside the command line) switches both at once. Persisted to
+/// `macros.toml` (`crate::macros`) right when set, so it survives a restart.
+struct MacroCommand;
+impl Command for MacroCommand {
+    fn name(&self) -> &'static str {
+        "m"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<0-9>"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        let digit = args.trim();
+        if digit.len() != 1 || !digit.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "macro key must be a single digit 0-9, not {digit:?}"
+            ));
+        }
+        let tool = app.tools.active_tool().name().to_string();
+        let color = crate::color::color_to_hex(app.current_color);
+        app.macros.insert(
+            digit.to_string(),
+            crate::macros::Macro {
+                tool: tool.clone(),
+                color: color.clone(),
+            },
+        );
+        crate::macros::save(&app.macros);
+        Ok(format!("macro {digit}: {tool} / {color}"))
     }
 }
 

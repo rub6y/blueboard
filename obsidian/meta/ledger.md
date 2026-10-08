@@ -2,6 +2,39 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Color picker keyboard input, a shortcut, and tool+color macros
+- Color picker: `Renderer::egui_pending_events` only ever carried pointer events before —
+  extended to forward keyboard too (`winit_key_to_egui`, a small mapping covering just
+  what the picker's fields need: Tab, Backspace, Delete, Enter, arrows, Home/End, plus raw
+  text) while it's open, so Tab moves focus between the hex/R/G/B fields and typing edits
+  whichever's focused. Verified by actually double-clicking the R field (a single click
+  just drags a `DragValue`, per egui's own convention — doesn't open text-edit mode),
+  typing `10`, pressing Tab with no further click, and typing `20` straight into what was
+  now the G field — both values took, and the square/hue-strip preview updated live.
+- Default keybinding `c` -> `:color picker`. One real interaction wrinkle worth recording:
+  while the picker is open, *every* key (including `c` itself) routes to its fields, not
+  back to the normal keybinding dispatch — so the toggle can only open it, not close it;
+  Escape is the only way to close while it's open. Deliberate (typing "c" into a hex field
+  shouldn't accidentally close the picker), but worth remembering if this surfaces as a
+  "the shortcut doesn't work" report later — it's working as designed, just one-directional.
+- New `:m <0-9>` command + `blueboard-app/src/macros.rs`: binds the active tool and
+  current drawing color to a number key; pressing that digit afterward (outside the
+  command line) switches both at once via a new `App::trigger_macro`. Persisted to a
+  dedicated `macros.toml` — deliberately *not* folded into `config.toml` (a `[macros]`
+  section there would mean round-tripping the whole hand-edited `Config` struct through
+  `toml::to_string` every time `:m` runs, silently stripping any comments/formatting a
+  user had in it); `config.rs`'s path-resolution logic was factored into a shared
+  `config_dir()` so both files resolve against the same directory without duplicating it.
+  A macro's color is stored as hex (`color::color_to_hex`, the exact inverse of
+  `parse_color`) so a hand-edited `macros.toml` reads the same way a `:color` argument
+  would.
+- One new test in `color.rs` (`color_to_hex` round-trips through `parse_color`) — 32 total
+  across the workspace, all passing. `clippy`/`fmt --check` clean.
+- **Verified by actually running the app**: `:m 3` after switching to `rect` + `:color
+  green` wrote `[3]\ntool = "rect"\ncolor = "#33cc4d"` to `macros.toml`; switching to a
+  different tool/color and then pressing `3` switched back to both in one keystroke,
+  confirmed via the status line (`macro 3: rect / #33cc4d`) and the bar's tool-name label.
+
 ## 2026-10-09 — Fix: newer strokes rendering underneath older ones
 - Caught by ruba right after the color work above landed: a freshly-drawn stroke could
   render *behind* an older one it overlapped, instead of on top. Root cause predates
