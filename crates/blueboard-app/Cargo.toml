@@ -15,6 +15,10 @@ blueboard-render = { path = "../blueboard-render" }
 # since these events cross the crate boundary into `Renderer::push_egui_event`.
 egui = "0.36.2"
 glam = "0.34.1"
+# Decodes `:background image <path>` (PNG/JPEG/etc) into raw RGBA8 pixels for
+# `Renderer::set_background_image` — only `blueboard-app` touches image files, so the
+# decode step lives here rather than in `blueboard-render`.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 kurbo = "0.13.1"
 log = { version = "0.4.34", features = ["std"] }
 pollster = "1.0.1"

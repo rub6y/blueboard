@@ -49,6 +49,7 @@ impl CommandRegistry {
         registry.register(DeleteCommand);
         registry.register(ColorCommand);
         registry.register(GridCommand);
+        registry.register(BackgroundCommand);
         registry.register(MacroCommand);
         registry.register(CameraMacroCommand);
         registry.register(UndoCommand);
@@ -293,7 +294,7 @@ impl Command for GridCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "<show|hide|bigger|smaller|size>"
+        "<show|hide|bigger|smaller|size|style>"
     }
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
@@ -316,6 +317,21 @@ impl Command for GridCommand {
                     (app.grid.spacing / GRID_STEP_FACTOR).clamp(GRID_MIN_SPACING, GRID_MAX_SPACING);
                 Ok(format!("grid spacing: {}", app.grid.spacing))
             }
+            arg if arg.starts_with("style") => {
+                let style_name = arg.strip_prefix("style").unwrap_or("").trim();
+                app.grid.style = match style_name {
+                    "lines" => blueboard_render::GridStyle::Lines,
+                    "horizontal" => blueboard_render::GridStyle::HorizontalOnly,
+                    "hex" => blueboard_render::GridStyle::Hex,
+                    "dots" => blueboard_render::GridStyle::Dots,
+                    other => {
+                        return Err(format!(
+                            "unknown grid style {other:?} (lines|horizontal|hex|dots)"
+                        ));
+                    }
+                };
+                Ok(format!("grid style: {style_name}"))
+            }
             arg => match arg.parse::<f32>() {
                 Ok(spacing) if spacing > 0.0 => {
                     app.grid.spacing = spacing.clamp(GRID_MIN_SPACING, GRID_MAX_SPACING);
@@ -323,6 +339,86 @@ impl Command for GridCommand {
                 }
                 _ => Err(format!("unknown grid command: {arg}")),
             },
+        }
+    }
+}
+
+/// Sets the board's background fill — a solid color, a two-color gradient, or an image
+/// file (PNG/JPEG/etc, decoded via the `image` crate) with a chosen fit mode. Subcommand
+/// style mirrors `:grid`. Solid/gradient settings live entirely in `app.background`
+/// (cheap to recompute every frame — see `BackgroundMode`'s doc comment); an image is
+/// decoded and uploaded to the GPU once, here, via `Renderer::set_background_image`, since
+/// redoing that every frame would be wasteful.
+struct BackgroundCommand;
+impl Command for BackgroundCommand {
+    fn name(&self) -> &'static str {
+        "background"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<color <hex>|gradient <hex> <hex> <deg>|image <path> [zoom|tile]>"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        let mut parts = args.trim().splitn(2, ' ');
+        let subcommand = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim();
+        match subcommand {
+            "color" => {
+                let color = crate::color::parse_color(rest)
+                    .ok_or_else(|| format!("unknown color {rest:?}"))?;
+                app.background = blueboard_render::BackgroundMode::Solid(color);
+                Ok(format!(
+                    "background: solid {}",
+                    crate::color::color_to_hex(color)
+                ))
+            }
+            "gradient" => {
+                let mut words = rest.split_whitespace();
+                let usage = "usage: background gradient <hex> <hex> <deg>";
+                let from = words.next().ok_or(usage)?;
+                let to = words.next().ok_or(usage)?;
+                let angle_deg: f32 = words
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .map_err(|_| "angle must be a number of degrees".to_string())?;
+                let from = crate::color::parse_color(from)
+                    .ok_or_else(|| format!("unknown color {from:?}"))?;
+                let to =
+                    crate::color::parse_color(to).ok_or_else(|| format!("unknown color {to:?}"))?;
+                app.background = blueboard_render::BackgroundMode::Gradient {
+                    from,
+                    to,
+                    angle_deg,
+                };
+                Ok(format!("background: gradient, {angle_deg} deg"))
+            }
+            "image" => {
+                let mut words = rest.split_whitespace();
+                let path = words
+                    .next()
+                    .ok_or("usage: background image <path> [zoom|tile]")?;
+                let fit = match words.next().unwrap_or("zoom") {
+                    "zoom" => blueboard_render::ImageFit::ZoomWithCamera,
+                    "tile" => blueboard_render::ImageFit::Tile,
+                    other => return Err(format!("unknown fit {other:?} (zoom|tile)")),
+                };
+                let decoded =
+                    image::open(path).map_err(|err| format!("failed to open {path}: {err}"))?;
+                let rgba = decoded.to_rgba8();
+                let (width, height) = rgba.dimensions();
+                let renderer = app
+                    .renderer
+                    .as_mut()
+                    .ok_or("renderer not ready yet".to_string())?;
+                renderer.set_background_image(rgba.as_raw(), width, height);
+                app.background = blueboard_render::BackgroundMode::Image(fit);
+                Ok(format!("background: image {path} ({width}x{height})"))
+            }
+            other => Err(format!(
+                "unknown background command: {other:?} (color|gradient|image)"
+            )),
         }
     }
 }

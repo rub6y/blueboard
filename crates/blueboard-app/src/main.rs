@@ -72,6 +72,10 @@ struct App {
     /// forward real input to egui while this is `true`).
     color_picker_open: bool,
     grid: GridSettings,
+    /// What to fill the board's background with — mutated by `:background`. See
+    /// `BackgroundMode`'s doc comment for why `Image`'s pixel data lives in the renderer
+    /// instead of here.
+    background: blueboard_render::BackgroundMode,
     /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
     /// `config.toml`. Loaded once at startup in `main()`.
@@ -178,6 +182,7 @@ impl ApplicationHandler for App {
                     command_bar,
                     active_tool_name,
                     grid: self.grid,
+                    background: self.background,
                     color_picker,
                     scale_factor,
                 }) {
@@ -562,6 +567,7 @@ fn main() {
     log::info!("blueboard starting, logging to {}", log_path.display());
 
     let config = config::load();
+    let board_color = config.theme.board_color;
     let registry = commands::CommandRegistry::with_builtin_commands();
     let macros = macros::load();
     let camera_macros = camera_macros::load();
@@ -575,6 +581,10 @@ fn main() {
         // `#[derive(Default)]` would otherwise zero this to black — see the field's doc
         // comment.
         current_color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+        // `BackgroundMode` has no `Default` impl (deliberately — see its doc comment: an
+        // arbitrary default color would be the wrong kind of silent), so it's set here
+        // from the loaded theme, same as `current_color` above.
+        background: blueboard_render::BackgroundMode::Solid(board_color),
         ..Default::default()
     };
     event_loop.run_app(&mut app).expect("event loop error");

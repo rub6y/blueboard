@@ -69,3 +69,74 @@ fn vs_colored(in: ColoredVertexInput) -> ColoredVertexOutput {
 fn fs_colored(in: ColoredVertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 1.0);
 }
+
+// Background: gradient and image fills. Both draw a 6-vertex quad carrying a `uv` in
+// addition to `position` — a gradient quad is always the full clip-space viewport (uv
+// spans exactly 0..1, `vs_fullscreen`, no camera transform, since a gradient covers the
+// screen regardless of pan/zoom); an image quad is either the same full-viewport shape
+// (tile mode, uv scaled up so `background_sampler`'s repeat wrap tiles it) or a
+// board-space quad sized to the image's native pixels (zoom-with-camera mode,
+// `vs_board_tex`, so it pans/zooms like board content). See `BackgroundMode` in lib.rs.
+struct TexVertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+struct TexVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_fullscreen(in: TexVertexInput) -> TexVertexOutput {
+    var out: TexVertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+@vertex
+fn vs_board_tex(in: TexVertexInput) -> TexVertexOutput {
+    var out: TexVertexOutput;
+    out.clip_position = camera.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+// Own binding group (distinct from `theme`'s group 1): a gradient's two colors + its
+// direction, written fresh each frame `BackgroundMode::Gradient` is active (cheap, a
+// handful of floats) rather than kept in sync with a command like the theme uniform is.
+// `from`/`to` are WGSL reserved identifiers (even though neither is a keyword today) —
+// `from_color`/`to_color` sidestep that rather than relying on them never becoming one.
+struct BgGradientUniform {
+    from_color: vec4<f32>,
+    to_color: vec4<f32>,
+    // Unit vector in uv-space the gradient runs along; see `lib.rs`'s angle-to-`dir`
+    // conversion for why this is precomputed on the CPU side rather than passing the
+    // angle itself and doing trig per-fragment.
+    dir: vec2<f32>,
+    _pad: vec2<f32>,
+};
+
+@group(2) @binding(0)
+var<uniform> bg_gradient: BgGradientUniform;
+
+@fragment
+fn fs_background_gradient(in: TexVertexOutput) -> @location(0) vec4<f32> {
+    let centered = in.uv - vec2<f32>(0.5, 0.5);
+    let t = clamp(dot(centered, bg_gradient.dir) + 0.5, 0.0, 1.0);
+    return mix(bg_gradient.from_color, bg_gradient.to_color, t);
+}
+
+// A separate group (3, not 2 — a module-scope WGSL binding can't be redeclared as a
+// different resource kind at the same group/binding even across disjoint entry points)
+// since this is a texture+sampler pair, not a uniform buffer like `bg_gradient` above.
+@group(3) @binding(0)
+var background_texture: texture_2d<f32>;
+@group(3) @binding(1)
+var background_sampler: sampler;
+
+@fragment
+fn fs_background_image(in: TexVertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(background_texture, background_sampler, in.uv);
+}

@@ -3,10 +3,11 @@
 //! Phase 1 drew a static reference grid so camera pan/zoom had something to confirm
 //! against. Phase 2 adds the real thing: pen strokes from `blueboard-core`'s scene graph,
 //! tessellated by `lyon` into GPU triangles, queried each frame from the scene's R-tree by
-//! viewport (culling is wired in now, per PLAN.md, even though boards are still small —
-//! tessellation *caching* is still future-phase work, not done here). Phase 4 adds a
-//! configurable color theme and the `:`-command bar, rendered with `egui`/`egui-wgpu`
-//! layered on top of the board in a second pass.
+//! viewport. Phase 4 adds a configurable color theme and the `:`-command bar, rendered
+//! with `egui`/`egui-wgpu` layered on top of the board in a second pass. Phase 6 adds
+//! per-element tessellation caching and reused/grown (rather than per-frame-reallocated)
+//! GPU vertex buffers, once profiling against a large synthetic board (PLAN.md) showed
+//! both actually mattered at real board sizes.
 
 use std::sync::Arc;
 
@@ -65,6 +66,20 @@ impl Default for ThemeColors {
 pub struct GridSettings {
     pub visible: bool,
     pub spacing: f32,
+    pub style: GridStyle,
+}
+
+/// Which pure function (`generate_grid_lines` and its siblings) builds this frame's grid
+/// vertices. All four draw through the same `grid_pipeline` (a uniform theme-colored
+/// `LineList`) — a hex cell or a dot is approximated as short line segments rather than
+/// needing a second grid pipeline/shader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GridStyle {
+    #[default]
+    Lines,
+    HorizontalOnly,
+    Hex,
+    Dots,
 }
 
 impl Default for GridSettings {
@@ -72,7 +87,49 @@ impl Default for GridSettings {
         Self {
             visible: true,
             spacing: 100.0,
+            style: GridStyle::Lines,
         }
+    }
+}
+
+/// How a background image fills the board — set with `:background image <path> <fit>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFit {
+    /// Anchored at the board-space origin, sized 1:1 to the image's native pixels — it
+    /// pans and zooms with the board like any other element, a fixed "watermark" rather
+    /// than something that fills the whole canvas.
+    ZoomWithCamera,
+    /// Repeats across the entire viewport at native pixel size, screen-space (not
+    /// board-space) — panning doesn't reveal new image content, the tile just stays
+    /// screen-locked, like a desktop wallpaper.
+    Tile,
+}
+
+/// What to fill the board's background with this frame — owned by `blueboard-app`'s `App`
+/// (the `:background` command mutates it directly) and passed into [`Frame`] each call,
+/// same as [`GridSettings`]. `Image`'s actual pixel data isn't here — it's uploaded once
+/// via [`Renderer::set_background_image`] when the command runs, and lives in the
+/// `Renderer` itself (re-decoding/re-uploading the image every frame would be wasteful);
+/// this variant just selects which already-uploaded image's fit mode to draw with.
+#[derive(Debug, Clone, Copy)]
+pub enum BackgroundMode {
+    Solid([f32; 3]),
+    Gradient {
+        from: [f32; 3],
+        to: [f32; 3],
+        /// Direction the gradient runs, degrees, 0 = left-to-right.
+        angle_deg: f32,
+    },
+    Image(ImageFit),
+}
+
+impl Default for BackgroundMode {
+    /// Just enough of a default to satisfy `App`'s `#[derive(Default)]` in
+    /// `blueboard-app` — always immediately overridden there from the loaded theme's
+    /// board color (same pattern as `current_color`'s own doc comment there), never
+    /// meant to be seen.
+    fn default() -> Self {
+        Self::Solid([0.0, 0.0, 0.0])
     }
 }
 
@@ -170,6 +227,7 @@ pub struct Frame<'a> {
     pub command_bar: CommandBarContent<'a>,
     pub active_tool_name: &'a str,
     pub grid: GridSettings,
+    pub background: BackgroundMode,
     /// `Some(color)` shows the color picker this frame, editing `color` in place; `None`
     /// keeps it closed. Only while open does real pointer/keyboard input reach egui at
     /// all — see `Renderer::egui_pending_events`.
@@ -215,6 +273,103 @@ impl ColorVertex {
             attributes: &Self::ATTRIBS,
         }
     }
+}
+
+/// A background quad's vertex: position plus a texture coordinate — see
+/// `shader.wgsl`'s `vs_fullscreen`/`vs_board_tex`/`fs_background_image` doc comment for
+/// how the two background-image fit modes and the gradient both reuse this one shape.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TexVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
+impl TexVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TexVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+/// Mirrors `BgGradientUniform` in `shader.wgsl` — see that struct's doc comment.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BgGradientUniform {
+    from_color: [f32; 4],
+    to_color: [f32; 4],
+    dir: [f32; 2],
+    _pad: [f32; 2],
+}
+
+/// Six vertices (two triangles) covering the full clip-space viewport, `uv` spanning
+/// `[0, uv_scale]` corner to corner — `uv_scale = [1, 1]` for the gradient (uv read
+/// directly as a 0..1 screen position) and a larger scale for a tiled background image
+/// (uv values beyond 1 wrap via `background_sampler`'s repeat address mode, which is what
+/// actually produces the tiling). uv's Y matches this file's board/screen convention
+/// (down is positive), opposite clip space's Y-up, hence the flip here.
+fn fullscreen_quad_vertices(uv_scale: [f32; 2]) -> [TexVertex; 6] {
+    let [su, sv] = uv_scale;
+    let top_left = TexVertex {
+        position: [-1.0, 1.0],
+        uv: [0.0, 0.0],
+    };
+    let top_right = TexVertex {
+        position: [1.0, 1.0],
+        uv: [su, 0.0],
+    };
+    let bottom_left = TexVertex {
+        position: [-1.0, -1.0],
+        uv: [0.0, sv],
+    };
+    let bottom_right = TexVertex {
+        position: [1.0, -1.0],
+        uv: [su, sv],
+    };
+    [
+        top_left,
+        bottom_left,
+        bottom_right,
+        top_left,
+        bottom_right,
+        top_right,
+    ]
+}
+
+/// A board-space quad anchored at the origin, sized 1:1 to `(image_width, image_height)`
+/// pixels — `BackgroundMode::Image(ImageFit::ZoomWithCamera)`'s geometry, drawn through
+/// `vs_board_tex` so it transforms with the camera like any other board content.
+fn board_image_quad_vertices(image_width: f32, image_height: f32) -> [TexVertex; 6] {
+    let top_left = TexVertex {
+        position: [0.0, 0.0],
+        uv: [0.0, 0.0],
+    };
+    let top_right = TexVertex {
+        position: [image_width, 0.0],
+        uv: [1.0, 0.0],
+    };
+    let bottom_left = TexVertex {
+        position: [0.0, image_height],
+        uv: [0.0, 1.0],
+    };
+    let bottom_right = TexVertex {
+        position: [image_width, image_height],
+        uv: [1.0, 1.0],
+    };
+    [
+        top_left,
+        bottom_left,
+        bottom_right,
+        top_left,
+        bottom_right,
+        top_right,
+    ]
 }
 
 /// Hard cap on grid lines generated per axis, regardless of configured spacing or zoom —
@@ -266,6 +421,126 @@ fn generate_grid_lines(min: DVec2, max: DVec2, spacing: f32) -> Vec<Vertex> {
         y += spacing;
     }
 
+    verts
+}
+
+/// Same idea as [`generate_grid_lines`] but only the horizontal pass — a "lined paper"
+/// variant.
+fn generate_grid_horizontal(min: DVec2, max: DVec2, spacing: f32) -> Vec<Vertex> {
+    if spacing <= 0.0 {
+        return Vec::new();
+    }
+    let width = (max.x - min.x).max(0.0);
+    let height = (max.y - min.y).max(0.0);
+    let spacing = (spacing as f64)
+        .max(width / MAX_GRID_LINES_PER_AXIS)
+        .max(height / MAX_GRID_LINES_PER_AXIS);
+
+    let mut verts = Vec::new();
+    let mut y = (min.y / spacing).floor() * spacing;
+    while y <= max.y {
+        verts.push(Vertex {
+            position: [min.x as f32, y as f32],
+        });
+        verts.push(Vertex {
+            position: [max.x as f32, y as f32],
+        });
+        y += spacing;
+    }
+    verts
+}
+
+/// Hard cap on grid cells generated per axis for the two-dimensional grid styles (hex,
+/// dots) — much smaller than [`MAX_GRID_LINES_PER_AXIS`] since those generate O(rows *
+/// cols) geometry rather than O(rows + cols) for a line grid, at the same zoomed-out
+/// extent.
+const MAX_GRID_POINTS_PER_AXIS: f64 = 150.0;
+
+/// A dot grid: a small "+" cross (two short line segments) at each grid intersection,
+/// rather than a filled circle — the grid only has a `LineList` pipeline to draw through
+/// (see `GridStyle`'s doc comment), and a cross reads clearly as "a dot" at the sizes this
+/// renders at.
+fn generate_grid_dots(min: DVec2, max: DVec2, spacing: f32) -> Vec<Vertex> {
+    if spacing <= 0.0 {
+        return Vec::new();
+    }
+    let width = (max.x - min.x).max(0.0);
+    let height = (max.y - min.y).max(0.0);
+    let spacing = (spacing as f64)
+        .max(width / MAX_GRID_POINTS_PER_AXIS)
+        .max(height / MAX_GRID_POINTS_PER_AXIS);
+    let mark_radius = spacing * 0.08;
+
+    let mut verts = Vec::new();
+    let mut y = (min.y / spacing).floor() * spacing;
+    while y <= max.y {
+        let mut x = (min.x / spacing).floor() * spacing;
+        while x <= max.x {
+            verts.push(Vertex {
+                position: [(x - mark_radius) as f32, y as f32],
+            });
+            verts.push(Vertex {
+                position: [(x + mark_radius) as f32, y as f32],
+            });
+            verts.push(Vertex {
+                position: [x as f32, (y - mark_radius) as f32],
+            });
+            verts.push(Vertex {
+                position: [x as f32, (y + mark_radius) as f32],
+            });
+            x += spacing;
+        }
+        y += spacing;
+    }
+    verts
+}
+
+/// A pointy-top hex grid, each cell's six edges drawn as line segments (shared edges
+/// between neighbors are drawn twice — harmless overdraw under this pipeline's `REPLACE`
+/// blend, simpler than deduplicating). `spacing` is treated as a hex's circumradius * 2,
+/// so it reads on the same scale the other grid styles' "cell size" does.
+fn generate_grid_hex(min: DVec2, max: DVec2, spacing: f32) -> Vec<Vertex> {
+    if spacing <= 0.0 {
+        return Vec::new();
+    }
+    let width = (max.x - min.x).max(0.0);
+    let height = (max.y - min.y).max(0.0);
+    let radius = (spacing as f64 / 2.0)
+        .max(width / MAX_GRID_POINTS_PER_AXIS)
+        .max(height / MAX_GRID_POINTS_PER_AXIS);
+    let hex_width = radius * 3f64.sqrt();
+    let row_height = radius * 1.5;
+
+    let mut verts = Vec::new();
+    let row_start = (min.y / row_height).floor() as i64 - 1;
+    let row_end = (max.y / row_height).ceil() as i64 + 1;
+    for row in row_start..=row_end {
+        let center_y = row as f64 * row_height;
+        let row_offset = if row % 2 != 0 { hex_width / 2.0 } else { 0.0 };
+        let col_start = ((min.x - row_offset) / hex_width).floor() as i64 - 1;
+        let col_end = ((max.x - row_offset) / hex_width).ceil() as i64 + 1;
+        for col in col_start..=col_end {
+            let center_x = col as f64 * hex_width + row_offset;
+            let mut corners = [DVec2::ZERO; 6];
+            for (k, corner) in corners.iter_mut().enumerate() {
+                let angle = std::f64::consts::FRAC_PI_2 + (k as f64) * std::f64::consts::FRAC_PI_3;
+                *corner = DVec2::new(
+                    center_x + radius * angle.cos(),
+                    center_y + radius * angle.sin(),
+                );
+            }
+            for k in 0..6 {
+                let a = corners[k];
+                let b = corners[(k + 1) % 6];
+                verts.push(Vertex {
+                    position: [a.x as f32, a.y as f32],
+                });
+                verts.push(Vertex {
+                    position: [b.x as f32, b.y as f32],
+                });
+            }
+        }
+    }
     verts
 }
 
@@ -570,13 +845,128 @@ fn run_command_bar_ui(
     })
 }
 
+/// A GPU vertex buffer that's grown (reallocated, at 1.5x whatever size was actually
+/// needed, to absorb small repeated growth without reallocating every time) only when new
+/// data doesn't already fit, and just overwritten in place (`queue.write_buffer`)
+/// otherwise — see [`upload_dynamic`]'s doc comment for why this replaced a fresh
+/// `create_buffer_init` every frame (Phase 6 profiling, PLAN.md: measured to dominate
+/// frame cost at any real board size — see the ledger).
+struct DynamicVertexBuffer {
+    buffer: wgpu::Buffer,
+    capacity_bytes: u64,
+}
+
+impl DynamicVertexBuffer {
+    fn new(device: &wgpu::Device, label: &str) -> Self {
+        // Starts at the floor `upload_dynamic` would grow to from empty anyway — avoids a
+        // zero-size buffer (wgpu requires non-zero) without over-allocating up front.
+        let capacity_bytes = 16;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: capacity_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer,
+            capacity_bytes,
+        }
+    }
+}
+
+/// Uploads `vertices` into `target`, growing its buffer only when the data doesn't already
+/// fit (see [`DynamicVertexBuffer`]) rather than allocating a fresh GPU buffer every call
+/// the way `create_buffer_init` would. A free function, not a method on
+/// `DynamicVertexBuffer`, so callers can pass `&self.device`/`&self.queue` (sibling
+/// `Renderer` fields) alongside `&mut self.some_buffer` without the borrow checker
+/// treating `self` as borrowed as a whole the way it would through a method call on one of
+/// its fields.
+fn upload_dynamic<V: bytemuck::Pod + bytemuck::Zeroable>(
+    target: &mut DynamicVertexBuffer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    vertices: &[V],
+) -> u32 {
+    let padded;
+    let vertices = if vertices.is_empty() {
+        padded = [V::zeroed()];
+        &padded[..]
+    } else {
+        vertices
+    };
+    let bytes: &[u8] = bytemuck::cast_slice(vertices);
+    let needed = bytes.len() as u64;
+    if needed > target.capacity_bytes {
+        target.capacity_bytes = needed.saturating_mul(3) / 2;
+        target.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: target.capacity_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+    queue.write_buffer(&target.buffer, 0, bytes);
+    vertices.len() as u32
+}
+
+/// Uploads already-decoded RGBA8 pixels (`4 * width * height` bytes, row-major) as a new
+/// GPU texture — used for background images now; a natural fit for scene-level image
+/// elements too once those exist, so this stays a free function rather than inlined into
+/// `set_background_image`.
+fn upload_rgba_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::Texture {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    texture
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     msaa_view: wgpu::TextureView,
-    board_clear_color: wgpu::Color,
+    /// The pass's `LoadOp::Clear` value — the actual background when `BackgroundMode` is
+    /// `Solid` (recomputed from it fresh each frame, see `render`), otherwise just a
+    /// backdrop underneath the gradient/image quad (which should fully cover it, but the
+    /// pass still needs a valid clear color either way — e.g. before any image has been
+    /// uploaded via `set_background_image`).
+    fallback_clear_color: wgpu::Color,
     grid_pipeline: wgpu::RenderPipeline,
     /// Uniform theme-colored `LineList` — the UI-only overlays (selection boxes, the
     /// eraser cursor), not board content.
@@ -586,6 +976,28 @@ pub struct Renderer {
     colored_stroke_pipeline: wgpu::RenderPipeline,
     /// Per-vertex colored `LineList` — the pen's raw, not-yet-tessellated live preview.
     colored_preview_pipeline: wgpu::RenderPipeline,
+    /// `BackgroundMode::Gradient`'s pipeline: `vs_fullscreen`/`fs_background_gradient`, a
+    /// full-viewport quad, no camera transform (a gradient always covers the screen).
+    background_gradient_pipeline: wgpu::RenderPipeline,
+    /// `BackgroundMode::Image(ImageFit::ZoomWithCamera)`'s pipeline: `vs_board_tex`
+    /// (camera-transformed) / `fs_background_image`.
+    background_image_zoom_pipeline: wgpu::RenderPipeline,
+    /// `BackgroundMode::Image(ImageFit::Tile)`'s pipeline: `vs_fullscreen` (no camera
+    /// transform) / `fs_background_image`, with a scaled-up `uv` relying on
+    /// `background_sampler`'s repeat wrap to tile.
+    background_image_tile_pipeline: wgpu::RenderPipeline,
+    background_gradient_buffer: wgpu::Buffer,
+    background_gradient_bind_group: wgpu::BindGroup,
+    background_texture_bind_group_layout: wgpu::BindGroupLayout,
+    /// Repeat-address, linear-filtered — used by both background-image fit modes (tile
+    /// relies on the repeat wrap; zoom-with-camera never samples outside `[0, 1]` so
+    /// repeat vs. clamp makes no visible difference there).
+    background_sampler: wgpu::Sampler,
+    /// Set by `set_background_image`, read by `render` whenever `BackgroundMode::Image`
+    /// is active; `None` (nothing uploaded yet) draws nothing, falling through to
+    /// `fallback_clear_color`.
+    background_image: Option<BackgroundImage>,
+    background_quad_buffer: DynamicVertexBuffer,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     theme_bind_group: wgpu::BindGroup,
@@ -598,6 +1010,38 @@ pub struct Renderer {
     /// is pure display; `blueboard-app` owns all real input handling otherwise — see
     /// this module's doc comment).
     egui_pending_events: Vec<egui::Event>,
+    grid_buffer: DynamicVertexBuffer,
+    stroke_buffer: DynamicVertexBuffer,
+    colored_preview_buffer: DynamicVertexBuffer,
+    uniform_preview_buffer: DynamicVertexBuffer,
+    /// Per-element tessellated vertices, reused across frames while an element's path,
+    /// color, and the current tessellation tolerance (zoom-dependent — see
+    /// `STROKE_TESSELLATION_TOLERANCE_PX`) all stay the same — which they usually do for
+    /// most elements on any given frame; only an actually-edited element or an
+    /// actually-changed zoom level needs retessellating. Keyed by element id (stable,
+    /// never reused — see `Scene`), pruned of ids no longer in the scene once per frame so
+    /// a deleted element's old vertices don't accumulate forever.
+    tessellation_cache: std::collections::HashMap<u64, CachedTessellation>,
+}
+
+/// The currently-uploaded background image — see `Renderer::background_image`'s doc
+/// comment and `Renderer::set_background_image`.
+struct BackgroundImage {
+    bind_group: wgpu::BindGroup,
+    width: f32,
+    height: f32,
+}
+
+/// One [`Renderer`]'s `tessellation_cache` entry — see that field's doc comment for the
+/// invalidation rule.
+struct CachedTessellation {
+    path: kurbo::BezPath,
+    color: [f32; 3],
+    /// The exact tessellation tolerance this was built with, compared bit-for-bit (not
+    /// "close enough") — the same zoom reliably reproduces the identical `f32` tolerance,
+    /// so this is a correct cache-hit test, not a fuzzy approximation.
+    tolerance_bits: u32,
+    vertices: Vec<ColorVertex>,
 }
 
 impl Renderer {
@@ -809,6 +1253,172 @@ impl Renderer {
             "fs_colored",
         );
 
+        // Background pipelines: a separate pipeline layout each, since they bind group 2
+        // or 3 instead of (or in addition to) the camera/theme groups `build_pipeline`'s
+        // shared layout assumes — see `shader.wgsl`'s background section doc comment for
+        // why the gradient uniform and the image texture+sampler can't share a binding
+        // group despite both being "group 2 or 3 of a background pipeline".
+        let background_gradient_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("background gradient bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let background_gradient_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("background gradient uniform"),
+            size: std::mem::size_of::<BgGradientUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let background_gradient_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("background gradient bind group"),
+            layout: &background_gradient_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: background_gradient_buffer.as_entire_binding(),
+            }],
+        });
+        let background_gradient_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("background gradient pipeline layout"),
+                bind_group_layouts: &[None, None, Some(&background_gradient_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let background_gradient_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("background gradient pipeline"),
+                layout: Some(&background_gradient_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(TexVertex::layout())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_background_gradient"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: SAMPLE_COUNT,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let background_texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("background texture bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let background_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("background sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let background_image_zoom_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("background image zoom pipeline layout"),
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),
+                    None,
+                    None,
+                    Some(&background_texture_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+        let background_image_tile_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("background image tile pipeline layout"),
+                bind_group_layouts: &[
+                    None,
+                    None,
+                    None,
+                    Some(&background_texture_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+        let build_background_image_pipeline =
+            |label: &str, layout: &wgpu::PipelineLayout, vs_entry: &str| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some(vs_entry),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(TexVertex::layout())],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_background_image"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: SAMPLE_COUNT,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+        let background_image_zoom_pipeline = build_background_image_pipeline(
+            "background image zoom pipeline",
+            &background_image_zoom_pipeline_layout,
+            "vs_board_tex",
+        );
+        let background_image_tile_pipeline = build_background_image_pipeline(
+            "background image tile pipeline",
+            &background_image_tile_pipeline_layout,
+            "vs_fullscreen",
+        );
+
         let msaa_view = create_msaa_view(&device, &config);
 
         let egui_ctx = egui::Context::default();
@@ -818,13 +1428,19 @@ impl Renderer {
             egui_wgpu::RendererOptions::default(),
         );
 
+        let grid_buffer = DynamicVertexBuffer::new(&device, "grid vertices");
+        let stroke_buffer = DynamicVertexBuffer::new(&device, "stroke vertices");
+        let colored_preview_buffer = DynamicVertexBuffer::new(&device, "colored preview vertices");
+        let uniform_preview_buffer = DynamicVertexBuffer::new(&device, "uniform preview vertices");
+        let background_quad_buffer = DynamicVertexBuffer::new(&device, "background quad vertices");
+
         Self {
             surface,
             device,
             queue,
             config,
             msaa_view,
-            board_clear_color: wgpu::Color {
+            fallback_clear_color: wgpu::Color {
                 r: theme.board[0] as f64,
                 g: theme.board[1] as f64,
                 b: theme.board[2] as f64,
@@ -834,12 +1450,26 @@ impl Renderer {
             preview_pipeline,
             colored_stroke_pipeline,
             colored_preview_pipeline,
+            background_gradient_pipeline,
+            background_image_zoom_pipeline,
+            background_image_tile_pipeline,
+            background_gradient_buffer,
+            background_gradient_bind_group,
+            background_texture_bind_group_layout,
+            background_sampler,
+            background_image: None,
+            background_quad_buffer,
             camera_buffer,
             camera_bind_group,
             theme_bind_group,
             egui_ctx,
             egui_renderer,
             egui_pending_events: Vec::new(),
+            grid_buffer,
+            stroke_buffer,
+            colored_preview_buffer,
+            uniform_preview_buffer,
+            tessellation_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -862,31 +1492,41 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
-    /// Upload a vertex list as a fresh GPU buffer and return it with its vertex count (0
-    /// vertices still returns a valid, zero-size-safe buffer — `wgpu` requires buffers be
-    /// non-empty, so an empty input gets a single zeroed padding vertex that's never
-    /// drawn). Generic over vertex type since `Vertex` and `ColorVertex` both get this
-    /// same per-frame dynamic-buffer treatment.
-    fn upload_vertices<V: bytemuck::Pod + bytemuck::Zeroable>(
-        &self,
-        label: &str,
-        vertices: &[V],
-    ) -> (wgpu::Buffer, u32) {
-        let padded;
-        let vertices = if vertices.is_empty() {
-            padded = [V::zeroed()];
-            &padded[..]
-        } else {
-            vertices
-        };
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        (buffer, vertices.len() as u32)
+    /// Decodes-and-uploads `rgba` (already-decoded pixels — `blueboard-app` owns the
+    /// `image` crate decode step via `:background image <path>`, this just uploads) as
+    /// the new background image, replacing whatever was uploaded before. Doesn't itself
+    /// switch `BackgroundMode` to `Image` — the caller still needs to set `app.background`
+    /// so the next `render` call actually draws it (same split `set_background_image`'s
+    /// doc comment on `Renderer::background_image` describes).
+    pub fn set_background_image(&mut self, rgba: &[u8], width: u32, height: u32) {
+        let texture = upload_rgba_texture(
+            &self.device,
+            &self.queue,
+            rgba,
+            width,
+            height,
+            "background image",
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("background image bind group"),
+            layout: &self.background_texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.background_sampler),
+                },
+            ],
+        });
+        self.background_image = Some(BackgroundImage {
+            bind_group,
+            width: width as f32,
+            height: height as f32,
+        });
     }
 
     /// Render one frame: the grid, every element in `scene` intersecting the camera's
@@ -903,6 +1543,7 @@ impl Renderer {
             command_bar,
             active_tool_name,
             grid,
+            background,
             color_picker,
             scale_factor,
         } = frame;
@@ -943,18 +1584,30 @@ impl Renderer {
         let board_max = camera.screen_to_board(viewport_f64, viewport_f64);
 
         let grid_vertices = if grid.visible {
-            generate_grid_lines(board_min, board_max, grid.spacing)
+            match grid.style {
+                GridStyle::Lines => generate_grid_lines(board_min, board_max, grid.spacing),
+                GridStyle::HorizontalOnly => {
+                    generate_grid_horizontal(board_min, board_max, grid.spacing)
+                }
+                GridStyle::Hex => generate_grid_hex(board_min, board_max, grid.spacing),
+                GridStyle::Dots => generate_grid_dots(board_min, board_max, grid.spacing),
+            }
         } else {
             Vec::new()
         };
-        let (grid_buffer, grid_count) = self.upload_vertices("grid vertices", &grid_vertices);
+        let grid_count = upload_dynamic(
+            &mut self.grid_buffer,
+            &self.device,
+            &self.queue,
+            "grid vertices",
+            &grid_vertices,
+        );
 
         // Screen-space tolerance -> board-space: tighter flattening the further zoomed in,
         // per planning/math.tex §3, instead of a fixed board-space tolerance that would
         // look increasingly faceted as zoom increases.
         let tessellation_tolerance = STROKE_TESSELLATION_TOLERANCE_PX / camera.zoom as f32;
 
-        let mut stroke_vertices = Vec::new();
         // Sorted by id (draw/creation order) before tessellating: `elements_in_viewport`
         // comes from the R-tree, whose iteration order is spatial, not insertion order —
         // with every element the same color this was invisible, but once elements can
@@ -964,17 +1617,55 @@ impl Renderer {
         let mut visible_elements: Vec<_> =
             scene.elements_in_viewport(board_min, board_max).collect();
         visible_elements.sort_by_key(|element| element.id);
-        for element in visible_elements {
-            tessellate_colored_stroke(
-                &element.path,
-                element.color,
-                STROKE_WIDTH,
-                tessellation_tolerance,
-                &mut stroke_vertices,
-            );
+
+        // Cache hit = same path, color, and tessellation tolerance as last time this id
+        // was tessellated — see `Renderer::tessellation_cache`'s doc comment. Most
+        // elements on most frames hit: panning/zooming-without-changing-zoom doesn't
+        // touch any element's path or color, only which ones are currently visible.
+        let tolerance_bits = tessellation_tolerance.to_bits();
+        let mut stroke_vertices = Vec::new();
+        for element in &visible_elements {
+            let cache_hit = self
+                .tessellation_cache
+                .get(&element.id)
+                .is_some_and(|cached| {
+                    cached.tolerance_bits == tolerance_bits
+                        && cached.color == element.color
+                        && cached.path == element.path
+                });
+            if !cache_hit {
+                let mut vertices = Vec::new();
+                tessellate_colored_stroke(
+                    &element.path,
+                    element.color,
+                    STROKE_WIDTH,
+                    tessellation_tolerance,
+                    &mut vertices,
+                );
+                self.tessellation_cache.insert(
+                    element.id,
+                    CachedTessellation {
+                        path: element.path.clone(),
+                        color: element.color,
+                        tolerance_bits,
+                        vertices,
+                    },
+                );
+            }
+            stroke_vertices.extend_from_slice(&self.tessellation_cache[&element.id].vertices);
         }
-        let (stroke_buffer, stroke_count) =
-            self.upload_vertices("stroke vertices", &stroke_vertices);
+        // Drops any id no longer in the scene (deleted, erased, undone-away) so the cache
+        // doesn't grow unbounded over a long editing session.
+        self.tessellation_cache
+            .retain(|id, _| scene.element(*id).is_some());
+
+        let stroke_count = upload_dynamic(
+            &mut self.stroke_buffer,
+            &self.device,
+            &self.queue,
+            "stroke vertices",
+            &stroke_vertices,
+        );
 
         // The pen's raw preview draws as thin colored lines; a shape tool's preview draws
         // tessellated and colored, exactly like a committed element — see `ScenePreview`'s
@@ -1014,10 +1705,103 @@ impl Renderer {
                     .collect();
             }
         }
-        let (colored_preview_buffer, colored_preview_count) =
-            self.upload_vertices("colored preview vertices", &colored_preview_vertices);
-        let (uniform_preview_buffer, uniform_preview_count) =
-            self.upload_vertices("uniform preview vertices", &uniform_preview_vertices);
+        let colored_preview_count = upload_dynamic(
+            &mut self.colored_preview_buffer,
+            &self.device,
+            &self.queue,
+            "colored preview vertices",
+            &colored_preview_vertices,
+        );
+        let uniform_preview_count = upload_dynamic(
+            &mut self.uniform_preview_buffer,
+            &self.device,
+            &self.queue,
+            "uniform preview vertices",
+            &uniform_preview_vertices,
+        );
+
+        // `BackgroundMode::Solid`'s color *is* the pass's clear color — no extra geometry.
+        // Gradient/image modes still need a valid clear color underneath them (the quad
+        // should fully cover it, but the pass descriptor requires one regardless, and
+        // nothing has been uploaded yet is a real case for `Image`), so they fall back to
+        // `fallback_clear_color`.
+        let clear_color = match background {
+            BackgroundMode::Solid(color) => wgpu::Color {
+                r: color[0] as f64,
+                g: color[1] as f64,
+                b: color[2] as f64,
+                a: 1.0,
+            },
+            BackgroundMode::Gradient { .. } | BackgroundMode::Image(_) => self.fallback_clear_color,
+        };
+
+        // Computed before the pass opens (not inside it): uploading the gradient uniform
+        // / background quad needs `&self.device`/`&self.queue`, which can't coexist with
+        // the pass's borrow of other `self` fields if interleaved with pipeline/bind-group
+        // calls on `pass` itself. `BackgroundDraw` just records which pipeline to use (if
+        // any) — the actual bind group lookup happens again inside the pass block below,
+        // since a borrowed reference into `self.background_image` can't be stashed here
+        // without fighting the pass's own borrow of `self`.
+        enum BackgroundDraw {
+            None,
+            Gradient,
+            Image { zoom_with_camera: bool },
+        }
+        let background_draw = match background {
+            BackgroundMode::Solid(_) => BackgroundDraw::None,
+            BackgroundMode::Gradient {
+                from,
+                to,
+                angle_deg,
+            } => {
+                let radians = (angle_deg as f64).to_radians();
+                let uniform = BgGradientUniform {
+                    from_color: [from[0], from[1], from[2], 1.0],
+                    to_color: [to[0], to[1], to[2], 1.0],
+                    dir: [radians.cos() as f32, radians.sin() as f32],
+                    _pad: [0.0, 0.0],
+                };
+                self.queue.write_buffer(
+                    &self.background_gradient_buffer,
+                    0,
+                    bytemuck::bytes_of(&uniform),
+                );
+                let quad = fullscreen_quad_vertices([1.0, 1.0]);
+                upload_dynamic(
+                    &mut self.background_quad_buffer,
+                    &self.device,
+                    &self.queue,
+                    "background quad vertices",
+                    &quad,
+                );
+                BackgroundDraw::Gradient
+            }
+            BackgroundMode::Image(fit) => match &self.background_image {
+                None => BackgroundDraw::None,
+                Some(image) => {
+                    let (quad, zoom_with_camera) = match fit {
+                        ImageFit::ZoomWithCamera => {
+                            (board_image_quad_vertices(image.width, image.height), true)
+                        }
+                        ImageFit::Tile => {
+                            let uv_scale = [
+                                self.config.width as f32 / image.width.max(1.0),
+                                self.config.height as f32 / image.height.max(1.0),
+                            ];
+                            (fullscreen_quad_vertices(uv_scale), false)
+                        }
+                    };
+                    upload_dynamic(
+                        &mut self.background_quad_buffer,
+                        &self.device,
+                        &self.queue,
+                        "background quad vertices",
+                        &quad,
+                    );
+                    BackgroundDraw::Image { zoom_with_camera }
+                }
+            },
+        };
 
         let view = surface_texture
             .texture
@@ -1037,7 +1821,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: Some(&view),
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.board_clear_color),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         // Only the resolved (single-sample) texture needs to survive the
                         // pass; discarding the multisampled one avoids writing it back.
                         store: wgpu::StoreOp::Discard,
@@ -1052,27 +1836,54 @@ impl Renderer {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, &self.theme_bind_group, &[]);
 
+            match background_draw {
+                BackgroundDraw::None => {}
+                BackgroundDraw::Gradient => {
+                    pass.set_pipeline(&self.background_gradient_pipeline);
+                    pass.set_bind_group(2, &self.background_gradient_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.background_quad_buffer.buffer.slice(..));
+                    pass.draw(0..6, 0..1);
+                }
+                BackgroundDraw::Image { zoom_with_camera } => {
+                    // `background_draw` was only ever set to `Image` when
+                    // `self.background_image` was `Some` at the time (see above) — it
+                    // can't have changed in between (nothing here mutates it).
+                    let image = self
+                        .background_image
+                        .as_ref()
+                        .expect("BackgroundDraw::Image implies background_image was Some");
+                    pass.set_pipeline(if zoom_with_camera {
+                        &self.background_image_zoom_pipeline
+                    } else {
+                        &self.background_image_tile_pipeline
+                    });
+                    pass.set_bind_group(3, &image.bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.background_quad_buffer.buffer.slice(..));
+                    pass.draw(0..6, 0..1);
+                }
+            }
+
             if grid_count > 0 {
                 pass.set_pipeline(&self.grid_pipeline);
-                pass.set_vertex_buffer(0, grid_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.grid_buffer.buffer.slice(..));
                 pass.draw(0..grid_count, 0..1);
             }
 
             if stroke_count > 0 {
                 pass.set_pipeline(&self.colored_stroke_pipeline);
-                pass.set_vertex_buffer(0, stroke_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.stroke_buffer.buffer.slice(..));
                 pass.draw(0..stroke_count, 0..1);
             }
 
             if colored_preview_count > 0 {
                 pass.set_pipeline(colored_preview_pipeline);
-                pass.set_vertex_buffer(0, colored_preview_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.colored_preview_buffer.buffer.slice(..));
                 pass.draw(0..colored_preview_count, 0..1);
             }
 
             if uniform_preview_count > 0 {
                 pass.set_pipeline(&self.preview_pipeline);
-                pass.set_vertex_buffer(0, uniform_preview_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.uniform_preview_buffer.buffer.slice(..));
                 pass.draw(0..uniform_preview_count, 0..1);
             }
         }
