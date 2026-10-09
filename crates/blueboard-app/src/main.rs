@@ -282,6 +282,19 @@ impl ApplicationHandler for App {
                         window.request_redraw();
                     }
                 }
+                // Normally redraws only happen in response to input — fine for a static
+                // board, but a magic window's shell produces output on its *own* schedule
+                // (a background reader thread feeding `ensure_live_terminals`'s channel),
+                // not in response to anything the user does here. Without this, that
+                // output only ever rendered on the user's *next* keystroke (whatever
+                // triggered that redraw), which read as output lagging a full keystroke
+                // behind — this keeps redrawing every frame for as long as any magic
+                // window exists, so output shows up within a frame instead. No effect at
+                // all on a board with none (the common case), since this is gated on
+                // `live_terminals` being non-empty.
+                if !self.live_terminals.is_empty() {
+                    window.request_redraw();
+                }
             }
 
             WindowEvent::MouseInput {
