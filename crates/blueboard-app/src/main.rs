@@ -236,6 +236,7 @@ impl ApplicationHandler for App {
                             cursor: self.text_input_cursor,
                             font_size: self.text_input_font_size as f32,
                             color: text_input_color,
+                            editing_id: self.text_input_editing_id,
                         }
                     }),
                     color_picker,

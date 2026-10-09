@@ -253,6 +253,11 @@ pub struct TextInputPreview<'a> {
     pub cursor: usize,
     pub font_size: f32,
     pub color: [f32; 3],
+    /// `Some(id)` while this composition is re-editing an *existing* text element rather
+    /// than placing a fresh one — `render` skips drawing that element's own committed
+    /// content for as long as this is set, so the live edit preview isn't drawn on top of
+    /// (still-unchanged-in-the-scene) old content underneath it.
+    pub editing_id: Option<u64>,
 }
 
 /// Everything [`Renderer::render`] needs to draw one frame, bundled so the method takes
@@ -1804,7 +1809,14 @@ impl Renderer {
         // A `Text` element's `path` is only its bounding box, not a stroke outline (see
         // `ElementKind`'s doc comment) — it's painted separately, through `egui`, below.
         let mut text_draws: Vec<SceneTextDraw> = Vec::new();
+        let editing_id = text_input.as_ref().and_then(|input| input.editing_id);
         for element in &visible_elements {
+            if Some(element.id) == editing_id {
+                // Being re-edited right now — the live `text_input` preview (painted
+                // below) stands in for it instead, so the still-unchanged scene content
+                // doesn't render underneath/behind it. See `TextInputPreview::editing_id`.
+                continue;
+            }
             let ElementKind::Text { content, font_size } = &element.kind else {
                 let cache_hit = self
                     .tessellation_cache
