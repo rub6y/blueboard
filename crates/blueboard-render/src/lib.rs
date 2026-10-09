@@ -241,6 +241,10 @@ struct SceneTextDraw {
 pub struct TextInputPreview<'a> {
     pub board_pos: DVec2,
     pub content: &'a str,
+    /// Caret position within `content`, as a **character** index — `render` inserts the
+    /// drawn `|` there instead of always at the end, so the arrow/Home/End keys visibly
+    /// move it.
+    pub cursor: usize,
     pub font_size: f32,
     pub color: [f32; 3],
 }
@@ -1622,8 +1626,14 @@ impl Renderer {
                             width: math.width,
                             height: math.height,
                         },
+                        // Not compiled yet (still being typed — compilation only happens
+                        // at commit, see `ensure_math_textures`'s doc comment — or a
+                        // committed span LaTeX failed on): shown with its `$$` delimiters
+                        // put back, so it's visibly "this is meant to be math," not
+                        // indistinguishable from surrounding plain text — and, while
+                        // composing, so the whole typed command stays visible to edit.
                         None => text::TextRun::Text {
-                            text: source,
+                            text: format!("$${source}$$"),
                             bold: false,
                         },
                     }
@@ -1808,14 +1818,21 @@ impl Renderer {
                 color: color_to_color32(element.color),
             });
         }
-        // The in-progress text element (if composing one), painted the same way — a
-        // trailing "|" so there's visible feedback even on an empty/all-math in-progress
-        // string, not a real blinking caret (kept simple, see `TextInputPreview`'s doc
-        // comment on who owns this state).
+        // The in-progress text element (if composing one), painted the same way — a "|"
+        // inserted at `input.cursor` (not a real blinking caret, kept simple, see
+        // `TextInputPreview`'s doc comment) so the arrow/Home/End keys' effect is visible.
         if let Some(input) = &text_input {
             let screen = camera.board_to_screen(input.board_pos, viewport_f64);
-            let mut content = input.content.to_string();
-            content.push('|');
+            let mut content = String::with_capacity(input.content.len() + 1);
+            for (i, c) in input.content.chars().enumerate() {
+                if i == input.cursor {
+                    content.push('|');
+                }
+                content.push(c);
+            }
+            if input.cursor >= input.content.chars().count() {
+                content.push('|');
+            }
             text_draws.push(SceneTextDraw {
                 screen_pos: egui::pos2(
                     (screen.x / scale_factor as f64) as f32,

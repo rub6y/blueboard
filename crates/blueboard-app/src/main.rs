@@ -26,6 +26,7 @@ mod config;
 mod latex;
 mod logging;
 mod macros;
+mod text_edit;
 mod tools;
 
 /// Default path for `:save`/`:open` (and their keybindings) when no path argument is
@@ -86,6 +87,11 @@ struct App {
     /// Raw markdown/math source typed so far for the in-progress text element — parsed
     /// into `MathToken`s only at paint/commit time (see `tools::TextTool`'s doc comment).
     text_input_text: String,
+    /// Caret position within `text_input_text`, as a **character** index (not byte offset
+    /// — `text_edit::insert`/`backspace`/`delete_forward` all operate in char-index terms
+    /// so multi-byte UTF-8 input never splits a character), moved by the arrow/Home/End
+    /// keys and clamped to `[0, text_input_text.chars().count()]`.
+    text_input_cursor: usize,
     /// Board-space point the in-progress text element's top-left corner will be placed at
     /// — captured from the click that started composing.
     text_input_board_pos: DVec2,
@@ -215,6 +221,7 @@ impl ApplicationHandler for App {
                         blueboard_render::TextInputPreview {
                             board_pos: self.text_input_board_pos,
                             content: &self.text_input_text,
+                            cursor: self.text_input_cursor,
                             font_size: tools::DEFAULT_TEXT_FONT_SIZE as f32,
                             color: text_input_color,
                         }
@@ -264,6 +271,7 @@ impl ApplicationHandler for App {
                             self.camera.screen_to_board(self.last_cursor, viewport);
                         self.text_input_active = true;
                         self.text_input_text.clear();
+                        self.text_input_cursor = 0;
                     }
                     window.request_redraw();
                     return;
@@ -491,6 +499,7 @@ impl App {
                 Key::Named(NamedKey::Enter) => {
                     let content = std::mem::take(&mut self.text_input_text);
                     self.text_input_active = false;
+                    self.text_input_cursor = 0;
                     if !content.trim().is_empty() {
                         let before = self.scene.snapshot();
                         self.scene.add_text_element(
@@ -505,15 +514,36 @@ impl App {
                 Key::Named(NamedKey::Escape) => {
                     self.text_input_active = false;
                     self.text_input_text.clear();
+                    self.text_input_cursor = 0;
                 }
                 Key::Named(NamedKey::Backspace) => {
-                    self.text_input_text.pop();
+                    text_edit::backspace(&mut self.text_input_text, &mut self.text_input_cursor);
+                }
+                Key::Named(NamedKey::Delete) => {
+                    text_edit::delete_forward(&mut self.text_input_text, self.text_input_cursor);
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.text_input_cursor = self.text_input_cursor.saturating_sub(1);
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    let len = self.text_input_text.chars().count();
+                    self.text_input_cursor = (self.text_input_cursor + 1).min(len);
+                }
+                Key::Named(NamedKey::Home) => {
+                    self.text_input_cursor = 0;
+                }
+                Key::Named(NamedKey::End) => {
+                    self.text_input_cursor = self.text_input_text.chars().count();
                 }
                 _ => {
                     if let Some(text) = &event.text {
                         let typed: String = text.chars().filter(|c| !c.is_control()).collect();
                         if !typed.is_empty() {
-                            self.text_input_text.push_str(&typed);
+                            text_edit::insert(
+                                &mut self.text_input_text,
+                                &mut self.text_input_cursor,
+                                &typed,
+                            );
                         }
                     }
                 }
