@@ -108,6 +108,7 @@ impl ToolRegistry {
             Box::new(ShapeTool::rect()),
             Box::new(ShapeTool::ellipse()),
             Box::new(ShapeTool::line()),
+            Box::new(TextTool),
             Box::new(SelectionTool::default()),
             Box::new(EraserTool::default()),
             Box::new(EraserObjectTool::default()),
@@ -470,6 +471,36 @@ impl Tool for EraserTool {
         }
     }
 }
+
+/// Places a text element: click to start composing, type, Enter to commit, Escape to
+/// cancel — all handled specially in `main.rs`'s `MouseInput`/keyboard dispatch (App-level
+/// `text_input_*` fields), the same way the color picker bypasses normal tool dispatch,
+/// because that composing state belongs on `App`, not reachable from `ToolContext` (see
+/// this module's doc comment on why a `Tool` never gets `&mut App`). This `Tool` impl
+/// exists only so `text` is a selectable name for `:tool`/keybindings/the status bar —
+/// its pointer handlers are genuinely unreachable in practice, `main.rs` intercepts every
+/// `MouseInput` while this is the active tool before generic dispatch ever runs.
+#[derive(Default)]
+pub struct TextTool;
+
+impl Tool for TextTool {
+    fn name(&self) -> &'static str {
+        "text"
+    }
+
+    fn on_pointer_down(&mut self, _ctx: &mut ToolContext, _screen_pos: DVec2) {}
+    fn on_pointer_move(&mut self, _ctx: &mut ToolContext, _screen_pos: DVec2) {}
+    fn on_pointer_up(&mut self, _ctx: &mut ToolContext, _screen_pos: DVec2) {}
+
+    fn preview(&self) -> ScenePreview<'_> {
+        ScenePreview::None
+    }
+}
+
+/// Default board-space font size for a newly placed text element (`:tool text`'s click) —
+/// comparable in scale to `STROKE_WIDTH` being a few board units, 24 reads as a normal
+/// body-text size at 100% zoom.
+pub const DEFAULT_TEXT_FONT_SIZE: f64 = 24.0;
 
 /// Whole-object eraser: removes entire elements it passes over, via the same
 /// `hit_test`-by-outline `SelectionTool` uses to pick a click target, except every

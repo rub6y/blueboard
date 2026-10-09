@@ -76,6 +76,18 @@ struct App {
     /// `BackgroundMode`'s doc comment for why `Image`'s pixel data lives in the renderer
     /// instead of here.
     background: blueboard_render::BackgroundMode,
+    /// `true` while composing a text element (between a text-tool click and Enter/Escape)
+    /// — same shape as `command_line_active`, see `handle_key_press`'s text-input branch.
+    /// Real pointer/keyboard input bypasses normal tool dispatch while this (or the text
+    /// tool itself, before the first click) is active, same precedent as
+    /// `color_picker_open`.
+    text_input_active: bool,
+    /// Raw markdown/math source typed so far for the in-progress text element — parsed
+    /// into `MathToken`s only at paint/commit time (see `tools::TextTool`'s doc comment).
+    text_input_text: String,
+    /// Board-space point the in-progress text element's top-left corner will be placed at
+    /// — captured from the click that started composing.
+    text_input_board_pos: DVec2,
     /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
     /// `config.toml`. Loaded once at startup in `main()`.
@@ -173,6 +185,9 @@ impl ApplicationHandler for App {
                 let scale_factor = window.scale_factor() as f32;
                 let preview = self.tools.active_tool().preview();
                 let active_tool_name = self.tools.active_tool().name();
+                // Captured before `color_picker`'s mutable borrow of `current_color`
+                // below, since the text-input preview also needs to read it.
+                let text_input_color = self.current_color;
                 let color_picker = self.color_picker_open.then_some(&mut self.current_color);
 
                 match renderer.render(Frame {
@@ -183,6 +198,14 @@ impl ApplicationHandler for App {
                     active_tool_name,
                     grid: self.grid,
                     background: self.background,
+                    text_input: self.text_input_active.then(|| {
+                        blueboard_render::TextInputPreview {
+                            board_pos: self.text_input_board_pos,
+                            content: &self.text_input_text,
+                            font_size: tools::DEFAULT_TEXT_FONT_SIZE as f32,
+                            color: text_input_color,
+                        }
+                    }),
                     color_picker,
                     scale_factor,
                 }) {
@@ -211,6 +234,24 @@ impl ApplicationHandler for App {
                         pressed: state == ElementState::Pressed,
                         modifiers: egui::Modifiers::default(),
                     });
+                    window.request_redraw();
+                    return;
+                }
+
+                // The text tool's only interaction is "click to place, then type" — see
+                // `tools::TextTool`'s doc comment on why this is intercepted here rather
+                // than reaching normal `Tool` dispatch below (same precedent as the color
+                // picker above). A click while already composing is ignored: finish
+                // (Enter/Escape) before starting a new one.
+                if self.tools.active_tool().name() == "text" {
+                    if state == ElementState::Pressed && !self.text_input_active {
+                        let (width, height) = renderer.viewport_size();
+                        let viewport = DVec2::new(width as f64, height as f64);
+                        self.text_input_board_pos =
+                            self.camera.screen_to_board(self.last_cursor, viewport);
+                        self.text_input_active = true;
+                        self.text_input_text.clear();
+                    }
                     window.request_redraw();
                     return;
                 }
@@ -388,6 +429,42 @@ impl App {
         let Some(window) = self.window.clone() else {
             return;
         };
+
+        if self.text_input_active {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    let content = std::mem::take(&mut self.text_input_text);
+                    self.text_input_active = false;
+                    if !content.trim().is_empty() {
+                        let before = self.scene.snapshot();
+                        self.scene.add_text_element(
+                            self.text_input_board_pos,
+                            self.current_color,
+                            content,
+                            tools::DEFAULT_TEXT_FONT_SIZE as f32,
+                        );
+                        self.history.record(before, &self.scene);
+                    }
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.text_input_active = false;
+                    self.text_input_text.clear();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.text_input_text.pop();
+                }
+                _ => {
+                    if let Some(text) = &event.text {
+                        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                        if !typed.is_empty() {
+                            self.text_input_text.push_str(&typed);
+                        }
+                    }
+                }
+            }
+            window.request_redraw();
+            return;
+        }
 
         if self.command_line_active {
             match &event.logical_key {

@@ -8,13 +8,33 @@ use std::collections::HashMap;
 use glam::DVec2;
 use kurbo::{BezPath, ParamCurveNearest, Point, Shape as _};
 use rstar::{RTree, RTreeObject, AABB};
+use serde::{Deserialize, Serialize};
 
 use crate::history::Snapshot;
 
+/// What kind of element this is — every kind still carries a `path` (see `Element::path`'s
+/// doc comment) so hit-testing, the R-tree index, and rendering's culling all stay
+/// kind-agnostic; `kind` only matters for what actually gets *drawn* inside that outline.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub enum ElementKind {
+    /// A pen stroke or shape (rect/ellipse/line) — `path` *is* the visible stroke outline,
+    /// same as before this enum existed.
+    Stroke,
+    /// `content` is the raw markdown/math source (parsed into `text_markup::MathToken`s
+    /// lazily — by `blueboard-render` at paint time and by `text_markup::estimate_size`
+    /// only at placement time — not stored pre-parsed). `path` is just this element's
+    /// bounding-box rectangle, not a stroke outline.
+    Text { content: String, font_size: f32 },
+}
+
 pub struct Element {
     pub id: u64,
+    /// The element's outline: a stroke's actual visible path for `ElementKind::Stroke`, or
+    /// just a bounding-box rectangle for any other kind (`ElementKind::Text`) — see
+    /// `ElementKind`'s doc comment for why every kind still has one.
     pub path: BezPath,
     pub color: [f32; 3],
+    pub kind: ElementKind,
 }
 
 /// What a new element gets if nothing more specific is given (`add_element`, and any
@@ -60,24 +80,64 @@ impl Scene {
     pub fn add_element_with_color(&mut self, path: BezPath, color: [f32; 3]) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.insert_element(id, path, color);
+        self.insert_element(id, path, color, ElementKind::Stroke);
+        id
+    }
+
+    /// Adds a text element: `content` is the raw markdown/math source (see
+    /// `ElementKind::Text`'s doc comment), placed with its top-left corner at `top_left`
+    /// and sized via `text_markup::estimate_size` at `font_size` (board-space units, so
+    /// the bounding box doesn't depend on the camera's current zoom).
+    pub fn add_text_element(
+        &mut self,
+        top_left: DVec2,
+        color: [f32; 3],
+        content: String,
+        font_size: f32,
+    ) -> u64 {
+        let tokens = crate::text_markup::parse(&content);
+        let (width, height) = crate::text_markup::estimate_size(&tokens, font_size);
+        let mut path = BezPath::new();
+        path.move_to((top_left.x, top_left.y));
+        path.line_to((top_left.x + width as f64, top_left.y));
+        path.line_to((top_left.x + width as f64, top_left.y + height as f64));
+        path.line_to((top_left.x, top_left.y + height as f64));
+        path.close_path();
+
+        let id = self.next_id;
+        self.next_id += 1;
+        self.insert_element(id, path, color, ElementKind::Text { content, font_size });
         id
     }
 
     /// Inserts an element under a specific id rather than generating one — used when
     /// loading a saved board ([`crate::file_format`]), so loaded elements keep the ids
     /// they were saved with instead of being renumbered.
-    pub(crate) fn insert_loaded_element(&mut self, id: u64, path: BezPath, color: [f32; 3]) {
-        self.insert_element(id, path, color);
+    pub(crate) fn insert_loaded_element(
+        &mut self,
+        id: u64,
+        path: BezPath,
+        color: [f32; 3],
+        kind: ElementKind,
+    ) {
+        self.insert_element(id, path, color, kind);
         // Any elements added after loading must not collide with a loaded id.
         self.next_id = self.next_id.max(id + 1);
     }
 
-    fn insert_element(&mut self, id: u64, path: BezPath, color: [f32; 3]) {
+    fn insert_element(&mut self, id: u64, path: BezPath, color: [f32; 3], kind: ElementKind) {
         let bbox = path.bounding_box();
         let envelope = AABB::from_corners([bbox.x0, bbox.y0], [bbox.x1, bbox.y1]);
         self.index.insert(IndexedBounds { id, envelope });
-        self.elements.insert(id, Element { id, path, color });
+        self.elements.insert(
+            id,
+            Element {
+                id,
+                path,
+                color,
+                kind,
+            },
+        );
     }
 
     pub fn element(&self, id: u64) -> Option<&Element> {
@@ -102,14 +162,15 @@ impl Scene {
     /// removed and reinserted rather than mutated, since a move changes the bounding box
     /// the old entry was indexed under.
     pub fn set_element_path(&mut self, id: u64, path: BezPath) {
-        // A move doesn't change what color the element was drawn in — read it back from
-        // the existing entry (falling back to the default for an id that, degenerately,
-        // doesn't exist yet) rather than letting `insert_element` reset it.
-        let color = self
+        // A move doesn't change what color/kind the element was, or its text content if
+        // it's a text element — read both back from the existing entry (falling back to
+        // defaults for an id that, degenerately, doesn't exist yet) rather than letting
+        // `insert_element` reset them.
+        let (color, kind) = self
             .elements
             .get(&id)
-            .map(|element| element.color)
-            .unwrap_or(DEFAULT_ELEMENT_COLOR);
+            .map(|element| (element.color, element.kind.clone()))
+            .unwrap_or((DEFAULT_ELEMENT_COLOR, ElementKind::Stroke));
         if let Some(old) = self.elements.get(&id) {
             let old_bbox = old.path.bounding_box();
             let old_envelope =
@@ -119,7 +180,7 @@ impl Scene {
                 envelope: old_envelope,
             });
         }
-        self.insert_element(id, path, color);
+        self.insert_element(id, path, color, kind);
     }
 
     /// The id of the element nearest `point` (board-space), if any lie within `tolerance`
@@ -158,14 +219,21 @@ impl Scene {
     /// A point-in-time copy of this scene's contents for [`crate::history`]. Derived data
     /// (the R-tree) is not copied — [`Scene::restore`] rebuilds it from the elements.
     pub fn snapshot(&self) -> Snapshot {
-        let mut elements: Vec<(u64, BezPath, [f32; 3])> = self
+        let mut elements: Vec<(u64, BezPath, [f32; 3], ElementKind)> = self
             .elements
             .values()
-            .map(|element| (element.id, element.path.clone(), element.color))
+            .map(|element| {
+                (
+                    element.id,
+                    element.path.clone(),
+                    element.color,
+                    element.kind.clone(),
+                )
+            })
             .collect();
         // Sorted by id so the same elements always compare equal regardless of `HashMap`
         // iteration order — same reasoning as `file_format::save`.
-        elements.sort_by_key(|(id, _, _)| *id);
+        elements.sort_by_key(|(id, _, _, _)| *id);
         Snapshot { elements }
     }
 
@@ -180,11 +248,11 @@ impl Scene {
         // `next_id` is never lowered, only raised past the highest restored id: ids are
         // never reused (the same stability rule `insert_loaded_element` follows), and
         // lowering it after e.g. undoing a `clear` would collide with the restored ids.
-        if let Some(highest) = snapshot.elements.iter().map(|(id, _, _)| *id).max() {
+        if let Some(highest) = snapshot.elements.iter().map(|(id, _, _, _)| *id).max() {
             self.next_id = self.next_id.max(highest + 1);
         }
-        for (id, path, color) in snapshot.elements {
-            self.insert_element(id, path, color);
+        for (id, path, color, kind) in snapshot.elements {
+            self.insert_element(id, path, color, kind);
         }
     }
 

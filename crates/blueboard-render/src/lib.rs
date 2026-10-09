@@ -12,7 +12,10 @@
 use std::sync::Arc;
 
 use blueboard_core::camera::Camera;
-use blueboard_core::scene::Scene;
+use blueboard_core::scene::{ElementKind, Scene};
+use kurbo::Shape as _;
+
+mod text;
 use glam::DVec2;
 use lyon::math::point;
 use lyon::path::Path as LyonPath;
@@ -218,6 +221,29 @@ pub enum ScenePreview<'a> {
     MultiSelection(Vec<kurbo::Rect>),
 }
 
+/// One committed `Text` element, ready to paint — built fresh each frame in `render` from
+/// whatever's currently visible (see `ElementKind::Text`), `tokens` already parsed via
+/// `text_markup::parse` (cheap for the short strings a board's text elements realistically
+/// hold) and `screen_pos`/`font_size_px` already converted out of board space, so
+/// `text::paint_tokens` doesn't need the camera at all.
+struct SceneTextDraw {
+    screen_pos: egui::Pos2,
+    tokens: Vec<blueboard_core::text_markup::MathToken>,
+    font_size_px: f32,
+    color: egui::Color32,
+}
+
+/// A text element still being composed (between a text-tool click and Enter/Escape) —
+/// `blueboard-app`'s `App` owns the actual state (see its `text_input_*` fields), this is
+/// just the read-only view passed in each frame so it paints live, same shape
+/// `color_picker` on [`Frame`] already has for the color picker's own App-owned UI state.
+pub struct TextInputPreview<'a> {
+    pub board_pos: DVec2,
+    pub content: &'a str,
+    pub font_size: f32,
+    pub color: [f32; 3],
+}
+
 /// Everything [`Renderer::render`] needs to draw one frame, bundled so the method takes
 /// one argument instead of an ever-growing positional list.
 pub struct Frame<'a> {
@@ -228,6 +254,7 @@ pub struct Frame<'a> {
     pub active_tool_name: &'a str,
     pub grid: GridSettings,
     pub background: BackgroundMode,
+    pub text_input: Option<TextInputPreview<'a>>,
     /// `Some(color)` shows the color picker this frame, editing `color` in place; `None`
     /// keeps it closed. Only while open does real pointer/keyboard input reach egui at
     /// all — see `Renderer::egui_pending_events`.
@@ -746,15 +773,28 @@ const COMPLETION_ROW_HEIGHT: f32 = 20.0;
 /// Always drawn, even with `content: Hidden` — `active_tool_name` on its left makes the
 /// bar a persistent status line (which tool is active), the same idea as vim's own bottom
 /// status line always being present, not just when a command is being typed.
+/// Bundles `run_command_bar_ui`'s read-only per-frame UI content (as opposed to the
+/// input/state params it also takes) — otherwise clippy's `too_many_arguments` kicks in,
+/// same reasoning as [`Frame`] bundling `Renderer::render`'s own growing argument list.
+struct CommandBarInput<'a> {
+    content: &'a CommandBarContent<'a>,
+    active_tool_name: &'a str,
+    text_draws: &'a [SceneTextDraw],
+}
+
 fn run_command_bar_ui(
     ctx: &egui::Context,
     viewport_size: (u32, u32),
     scale_factor: f32,
-    content: &CommandBarContent<'_>,
-    active_tool_name: &str,
+    input: CommandBarInput<'_>,
     events: Vec<egui::Event>,
     mut color_picker: Option<&mut [f32; 3]>,
 ) -> egui::FullOutput {
+    let CommandBarInput {
+        content,
+        active_tool_name,
+        text_draws,
+    } = input;
     let screen_size_points = egui::vec2(
         viewport_size.0 as f32 / scale_factor,
         viewport_size.1 as f32 / scale_factor,
@@ -777,6 +817,20 @@ fn run_command_bar_ui(
     let bar_height = COMMAND_BAR_HEIGHT + completions.map_or(0.0, |_| COMPLETION_ROW_HEIGHT);
 
     ctx.run_ui(raw_input, |ui| {
+        // Scene text painted before the panels below, directly on the background layer —
+        // see `SceneTextDraw`'s doc comment for why this data arrives pre-converted to
+        // screen space/logical points rather than needing the camera here.
+        let painter = ui.painter();
+        for draw in text_draws {
+            text::paint_tokens(
+                painter,
+                draw.screen_pos,
+                &draw.tokens,
+                draw.font_size_px,
+                draw.color,
+            );
+        }
+
         // egui 0.36 unified Top/Bottom/Left/RightPanel into one `Panel` type;
         // `Panel::bottom` is the constructor that used to be `TopBottomPanel::bottom`.
         egui::Panel::bottom("command_bar")
@@ -1544,6 +1598,7 @@ impl Renderer {
             active_tool_name,
             grid,
             background,
+            text_input,
             color_picker,
             scale_factor,
         } = frame;
@@ -1624,35 +1679,71 @@ impl Renderer {
         // touch any element's path or color, only which ones are currently visible.
         let tolerance_bits = tessellation_tolerance.to_bits();
         let mut stroke_vertices = Vec::new();
+        // A `Text` element's `path` is only its bounding box, not a stroke outline (see
+        // `ElementKind`'s doc comment) — it's painted separately, through `egui`, below.
+        let mut text_draws: Vec<SceneTextDraw> = Vec::new();
         for element in &visible_elements {
-            let cache_hit = self
-                .tessellation_cache
-                .get(&element.id)
-                .is_some_and(|cached| {
-                    cached.tolerance_bits == tolerance_bits
-                        && cached.color == element.color
-                        && cached.path == element.path
-                });
-            if !cache_hit {
-                let mut vertices = Vec::new();
-                tessellate_colored_stroke(
-                    &element.path,
-                    element.color,
-                    STROKE_WIDTH,
-                    tessellation_tolerance,
-                    &mut vertices,
-                );
-                self.tessellation_cache.insert(
-                    element.id,
-                    CachedTessellation {
-                        path: element.path.clone(),
-                        color: element.color,
-                        tolerance_bits,
-                        vertices,
-                    },
-                );
-            }
-            stroke_vertices.extend_from_slice(&self.tessellation_cache[&element.id].vertices);
+            let ElementKind::Text { content, font_size } = &element.kind else {
+                let cache_hit = self
+                    .tessellation_cache
+                    .get(&element.id)
+                    .is_some_and(|cached| {
+                        cached.tolerance_bits == tolerance_bits
+                            && cached.color == element.color
+                            && cached.path == element.path
+                    });
+                if !cache_hit {
+                    let mut vertices = Vec::new();
+                    tessellate_colored_stroke(
+                        &element.path,
+                        element.color,
+                        STROKE_WIDTH,
+                        tessellation_tolerance,
+                        &mut vertices,
+                    );
+                    self.tessellation_cache.insert(
+                        element.id,
+                        CachedTessellation {
+                            path: element.path.clone(),
+                            color: element.color,
+                            tolerance_bits,
+                            vertices,
+                        },
+                    );
+                }
+                stroke_vertices.extend_from_slice(&self.tessellation_cache[&element.id].vertices);
+                continue;
+            };
+            let bbox = element.path.bounding_box();
+            let top_left = DVec2::new(bbox.x0, bbox.y0);
+            let screen = camera.board_to_screen(top_left, viewport_f64);
+            text_draws.push(SceneTextDraw {
+                screen_pos: egui::pos2(
+                    (screen.x / scale_factor as f64) as f32,
+                    (screen.y / scale_factor as f64) as f32,
+                ),
+                tokens: blueboard_core::text_markup::parse(content),
+                font_size_px: font_size * camera.zoom as f32 / scale_factor,
+                color: color_to_color32(element.color),
+            });
+        }
+        // The in-progress text element (if composing one), painted the same way — a
+        // trailing "|" so there's visible feedback even on an empty/all-math in-progress
+        // string, not a real blinking caret (kept simple, see `TextInputPreview`'s doc
+        // comment on who owns this state).
+        if let Some(input) = &text_input {
+            let screen = camera.board_to_screen(input.board_pos, viewport_f64);
+            let mut content = input.content.to_string();
+            content.push('|');
+            text_draws.push(SceneTextDraw {
+                screen_pos: egui::pos2(
+                    (screen.x / scale_factor as f64) as f32,
+                    (screen.y / scale_factor as f64) as f32,
+                ),
+                tokens: blueboard_core::text_markup::parse(&content),
+                font_size_px: input.font_size * camera.zoom as f32 / scale_factor,
+                color: color_to_color32(input.color),
+            });
         }
         // Drops any id no longer in the scene (deleted, erased, undone-away) so the cache
         // doesn't grow unbounded over a long editing session.
@@ -1895,8 +1986,11 @@ impl Renderer {
             &self.egui_ctx,
             (self.config.width, self.config.height),
             scale_factor,
-            &command_bar,
-            active_tool_name,
+            CommandBarInput {
+                content: &command_bar,
+                active_tool_name,
+                text_draws: &text_draws,
+            },
             std::mem::take(&mut self.egui_pending_events),
             color_picker,
         );

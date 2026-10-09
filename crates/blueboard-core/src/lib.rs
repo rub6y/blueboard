@@ -8,3 +8,4 @@ mod geometry;
 pub mod history;
 pub mod lasso;
 pub mod scene;
+pub mod text_markup;

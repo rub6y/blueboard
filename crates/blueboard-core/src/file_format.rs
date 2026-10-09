@@ -14,22 +14,23 @@ use std::path::Path;
 use kurbo::BezPath;
 use serde::{Deserialize, Serialize};
 
-use crate::scene::Scene;
+use crate::scene::{ElementKind, Scene};
 
 /// On-disk format version. Bump this whenever `SceneDocument`'s shape changes in a way
 /// that would misread an older file; `load` refuses to read anything else.
 ///
-/// Bumped to 2 for per-element color (`ElementDocument::color`) — a version-1 file has no
-/// such field, so per this format's existing strict-version stance, it's rejected outright
-/// rather than migrated (no default-color backfill code to maintain and potentially get
-/// wrong).
-const FORMAT_VERSION: u32 = 2;
+/// Bumped to 3 for text elements (`ElementDocument::kind`) — a version-2 file has no such
+/// field, so per this format's existing strict-version stance (see the v1->v2 color bump
+/// above), it's rejected outright rather than migrated (no default-kind backfill code to
+/// maintain and potentially get wrong).
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct ElementDocument {
     id: u64,
     path: BezPath,
     color: [f32; 3],
+    kind: ElementKind,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,6 +90,7 @@ pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), SaveError> {
             id: element.id,
             path: element.path.clone(),
             color: element.color,
+            kind: element.kind.clone(),
         })
         .collect();
     // Sorted by id so the same scene always serializes to the same bytes — `Scene`
@@ -121,7 +123,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Scene, LoadError> {
 
     let mut scene = Scene::new();
     for element in document.elements {
-        scene.insert_loaded_element(element.id, element.path, element.color);
+        scene.insert_loaded_element(element.id, element.path, element.color, element.kind);
     }
     Ok(scene)
 }
@@ -174,6 +176,32 @@ mod tests {
         original.sort_by_key(|(id, _, _)| *id);
         round_tripped.sort_by_key(|(id, _, _)| *id);
         assert_eq!(original, round_tripped);
+    }
+
+    #[test]
+    fn text_element_round_trips_with_its_kind() {
+        use crate::scene::ElementKind;
+        use glam::DVec2;
+
+        let mut scene = Scene::new();
+        let id = scene.add_text_element(
+            DVec2::new(5.0, 5.0),
+            [1.0, 1.0, 1.0],
+            "**hi** $$x^2$$".to_string(),
+            24.0,
+        );
+
+        let path = temp_bbd_path("text-element-round-trips");
+        save(&scene, &path).expect("save should succeed");
+        let loaded = load(&path).expect("load should succeed");
+        std::fs::remove_file(&path).ok();
+
+        let element = loaded.element(id).expect("text element should round-trip");
+        assert!(matches!(
+            &element.kind,
+            ElementKind::Text { content, font_size }
+                if content == "**hi** $$x^2$$" && *font_size == 24.0
+        ));
     }
 
     #[test]

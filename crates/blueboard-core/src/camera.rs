@@ -49,6 +49,14 @@ impl Camera {
         (screen - viewport * 0.5) / self.zoom + self.pan
     }
 
+    /// The inverse of [`Camera::screen_to_board`] — board-space to screen-space (physical
+    /// pixels, same unit `screen_to_board` takes). Used to place UI drawn outside the
+    /// GPU's own camera-transformed pipeline (e.g. `blueboard-render`'s `egui`-painted
+    /// scene text) at the right screen position for a given board-space point.
+    pub fn board_to_screen(&self, board: DVec2, viewport: DVec2) -> DVec2 {
+        (board - self.pan) * self.zoom + viewport * 0.5
+    }
+
     /// Board-space -> clip-space transform for the given viewport size (pixels). Flips Y
     /// (board space is Y-down, like screen space; wgpu clip space is Y-up).
     pub fn view_matrix(&self, viewport: Vec2) -> Mat4 {
@@ -89,5 +97,20 @@ mod tests {
 
         let board_after = camera.screen_to_board(anchor_screen, viewport);
         assert!((board_before - board_after).length() < 1e-9);
+    }
+
+    #[test]
+    fn board_to_screen_is_the_inverse_of_screen_to_board() {
+        let camera = Camera {
+            pan: DVec2::new(37.0, -12.0),
+            zoom: 2.5,
+        };
+        let viewport = DVec2::new(800.0, 600.0);
+        let screen = DVec2::new(321.0, 456.0);
+
+        let board = camera.screen_to_board(screen, viewport);
+        let round_tripped = camera.board_to_screen(board, viewport);
+
+        assert!((screen - round_tripped).length() < 1e-9);
     }
 }

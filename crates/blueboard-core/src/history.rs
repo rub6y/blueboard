@@ -17,20 +17,20 @@
 
 use std::collections::VecDeque;
 
-use crate::scene::Scene;
+use crate::scene::{ElementKind, Scene};
 
 /// How many edits the undo stack keeps. The oldest edit silently falls off once this is
 /// exceeded — a deliberate cap so an hours-long session can't grow the stack without
 /// bound; 100 is far past what a single sitting usually needs to walk back through.
 const HISTORY_LIMIT: usize = 100;
 
-/// A copy of a scene's elements: `(id, path, color)` triples sorted by id.
+/// A copy of a scene's elements: `(id, path, color, kind)` tuples sorted by id.
 ///
 /// Opaque to everything outside this crate's `scene`/`history` modules — callers pass it
 /// between [`Scene::snapshot`] and [`History`] without looking inside.
 #[derive(Clone, PartialEq)]
 pub struct Snapshot {
-    pub(crate) elements: Vec<(u64, kurbo::BezPath, [f32; 3])>,
+    pub(crate) elements: Vec<(u64, kurbo::BezPath, [f32; 3], ElementKind)>,
 }
 
 /// The undo and redo stacks for one scene. Lives on the app's `App` struct (see
