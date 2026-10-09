@@ -6,6 +6,10 @@ The theme is loaded once at startup and passed into [[Render_crate]]'s `Renderer
 `ThemeColors`, stored as a GPU uniform buffer — fixed for the process's lifetime, no live
 reload yet.
 
+The theme's `board` color is only the *initial* background value now — see
+[[Background_customization]] for `:background`, which overrides it live (solid/gradient/
+image) without touching the theme uniform itself.
+
 The theme's default values are the colors chosen earlier in the project: deep blue board,
 muted blue-grey grid, white strokes.
 

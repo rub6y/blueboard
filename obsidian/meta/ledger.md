@@ -2,6 +2,54 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Post-Phase-5 feature list: F-key camera macros, background/grid
+ruba asked for five new features beyond the original phase plan (see
+`planning/PLAN.md`'s Phase 5/6): F-key camera macros, background/grid customization, a
+text tool (markdown + basic LaTeX), image paste + resize handles, and a first magic-window
+step. Plan written and approved; shipping one feature per commit, in that order.
+
+- **F-key camera macros**: `crate::camera_macros` mirrors `macros.rs`'s digit-macro
+  pattern exactly — `:fm <1-12>` saves `Camera`'s pan+zoom to `F1`-`F12`, persisted to its
+  own `camera_macros.toml`. `Camera` itself still doesn't derive `Serialize` (kept
+  decoupled from persistence, same relationship `Theme`/`ThemeColors` has) — the macro
+  struct holds plain `[f64;2]`/`f64` fields instead. Verified under Xvfb: `:fm 1`, panned
+  away, `F1` jumped back; `camera_macros.toml` round-tripped the exact saved values.
+- **Background + grid customization**: `:background` sets solid/gradient/image fills;
+  `:grid style` adds horizontal-only/hex/dot variants to the existing line grid.
+  - Grid variants all reuse the *existing* `grid_pipeline` (uniform-colored `LineList`) —
+    a dot is a small "+" cross, a hex cell is its six edges as line segments (shared edges
+    between neighbors double-drawn, harmless under `REPLACE` blend) — no new pipeline
+    needed for any of the four styles.
+  - Background needed real new GPU work: a solid color is still just the pass's
+    `LoadOp::Clear` (now computed per-frame from `BackgroundMode::Solid` instead of a
+    fixed field); gradient and image each got a dedicated pipeline (`vs_fullscreen`/
+    `vs_board_tex` + `fs_background_gradient`/`fs_background_image` in `shader.wgsl`),
+    since neither fits the existing vertex-colored or texture-less pipelines. An image's
+    decoded pixels live in the `Renderer` (`Option<BackgroundImage>`, uploaded once via
+    `set_background_image` when the command runs), not re-decoded/re-uploaded every
+    frame — mirrors how `tessellation_cache` already splits "per-frame cheap state in
+    `Frame`" from "persistent GPU state in `Renderer`."
+  - `ImageFit::ZoomWithCamera` is a board-space quad anchored at the origin, sized 1:1 to
+    the image's native pixels (drawn through the camera transform like any element, so it
+    pans/zooms like a watermark); `ImageFit::Tile` is a full-viewport clip-space quad with
+    `uv` scaled by `viewport_px / image_px`, tiling via the sampler's repeat address mode
+    — no CPU-side tiling math needed.
+  - **Bug caught by the wgpu uncaptured-error log, not the compiler**: naming the
+    gradient uniform's fields `from`/`to` in WGSL failed to parse ("name `from` is a
+    reserved keyword") and silently broke *every* pipeline sharing that shader module
+    (grid/strokes included), not just the gradient one — renamed to `from_color`/
+    `to_color`. Reinforces the Phase-1 lesson already in this ledger: shader-side bugs
+    don't surface until runtime, caught here the same way (reading the uncaptured-error
+    log), not via `cargo build`/clippy.
+  - Verified under Xvfb: solid color, both gradient angles (0°/90°, confirmed the
+    direction matched expectations), all four grid styles, and both image fit modes
+    (tile repeats correctly across the viewport; zoom anchors a small fixed-size image in
+    board space) — screenshotted and visually confirmed each.
+  - Swept the pre-existing uncommitted Phase 6 work (tessellation caching,
+    `DynamicVertexBuffer`) into the same commit as this feature, at ruba's call, since
+    both touched `blueboard-render/src/lib.rs` in overlapping regions and splitting via
+    `git add -p` wasn't worth the mechanical effort.
+
 ## 2026-10-09 — Color picker keyboard input, a shortcut, and tool+color macros
 - Color picker: `Renderer::egui_pending_events` only ever carried pointer events before —
   extended to forward keyboard too (`winit_key_to_egui`, a small mapping covering just
