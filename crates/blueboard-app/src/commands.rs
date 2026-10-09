@@ -50,6 +50,7 @@ impl CommandRegistry {
         registry.register(ColorCommand);
         registry.register(GridCommand);
         registry.register(MacroCommand);
+        registry.register(CameraMacroCommand);
         registry.register(UndoCommand);
         registry.register(RedoCommand);
         registry.register(HelpCommand);
@@ -357,6 +358,41 @@ impl Command for MacroCommand {
         );
         crate::macros::save(&app.macros);
         Ok(format!("macro {digit}: {tool} / {color}"))
+    }
+}
+
+/// Binds the camera's current pan+zoom to a function key (`F1`-`F12`) — pressing that
+/// key afterward (outside the command line) jumps the camera straight back, no tool/color
+/// change (that's `:m`'s job). Persisted to `camera_macros.toml`
+/// (`crate::camera_macros`) right when set, so it survives a restart.
+struct CameraMacroCommand;
+impl Command for CameraMacroCommand {
+    fn name(&self) -> &'static str {
+        "fm"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<1-12>"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        let number: u32 = args
+            .trim()
+            .parse()
+            .map_err(|_| format!("camera macro key must be 1-12, not {:?}", args.trim()))?;
+        if !(1..=12).contains(&number) {
+            return Err(format!("camera macro key must be 1-12, not {number}"));
+        }
+        let key = format!("F{number}");
+        app.camera_macros.insert(
+            key.clone(),
+            crate::camera_macros::CameraMacro {
+                pan: app.camera.pan.to_array(),
+                zoom: app.camera.zoom,
+            },
+        );
+        crate::camera_macros::save(&app.camera_macros);
+        Ok(format!("camera macro {key}: saved"))
     }
 }
 

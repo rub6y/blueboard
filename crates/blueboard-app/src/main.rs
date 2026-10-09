@@ -19,6 +19,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+mod camera_macros;
 mod color;
 mod commands;
 mod config;
@@ -75,6 +76,10 @@ struct App {
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
     /// `config.toml`. Loaded once at startup in `main()`.
     macros: macros::Macros,
+    /// Camera (pan+zoom) macros bound to function keys, set by `:fm <number>` and
+    /// persisted to their own file — see `camera_macros.rs`'s doc comment. Loaded once at
+    /// startup in `main()`.
+    camera_macros: camera_macros::CameraMacros,
 }
 
 impl ApplicationHandler for App {
@@ -318,6 +323,28 @@ fn winit_key_to_egui(key: &Key) -> Option<egui::Key> {
     }
 }
 
+/// `"F1"`-`"F12"` for the function keys this app binds camera macros to, `None` for
+/// anything else (including `F13`+, deliberately left unbound). The string form matches
+/// `camera_macros::CameraMacros`'s key shape, which reads the same way in a hand-edited
+/// `camera_macros.toml` (`[macros."F3"]`) a digit-macro key already does.
+fn function_key_label(key: NamedKey) -> Option<&'static str> {
+    Some(match key {
+        NamedKey::F1 => "F1",
+        NamedKey::F2 => "F2",
+        NamedKey::F3 => "F3",
+        NamedKey::F4 => "F4",
+        NamedKey::F5 => "F5",
+        NamedKey::F6 => "F6",
+        NamedKey::F7 => "F7",
+        NamedKey::F8 => "F8",
+        NamedKey::F9 => "F9",
+        NamedKey::F10 => "F10",
+        NamedKey::F11 => "F11",
+        NamedKey::F12 => "F12",
+        _ => return None,
+    })
+}
+
 /// What the command line would complete right now, if anything: the fixed text to keep
 /// (prepended to whatever candidate is chosen) and the matching candidates as `(name,
 /// usage)` pairs. Completes the command name itself (nothing typed after it yet), or —
@@ -444,6 +471,11 @@ impl App {
                     self.trigger_macro(text.as_str());
                     window.request_redraw();
                 }
+                Key::Named(named) if function_key_label(*named).is_some() => {
+                    // Unwrap is safe: the guard above already confirmed `Some`.
+                    self.trigger_camera_macro(function_key_label(*named).unwrap());
+                    window.request_redraw();
+                }
                 Key::Character(text) => {
                     let binding = self.config.keybindings.get(text.as_str()).cloned();
                     if let Some(binding) = binding {
@@ -489,6 +521,19 @@ impl App {
         self.status = Some((format!("macro {digit}: {tool} / {color}"), false));
     }
 
+    /// Applies the camera macro bound to `key` (e.g. `"F3"`), if one's been set via
+    /// `:fm` — jumps the camera's pan+zoom straight back, no tool/color change (that's
+    /// `trigger_macro`'s job). Silently does nothing for an unbound key, same as
+    /// `trigger_macro`.
+    fn trigger_camera_macro(&mut self, key: &str) {
+        let Some(camera_macro) = self.camera_macros.get(key) else {
+            return;
+        };
+        self.camera.pan = DVec2::from_array(camera_macro.pan);
+        self.camera.zoom = camera_macro.zoom;
+        self.status = Some((format!("camera macro {key}: restored"), false));
+    }
+
     /// Runs a command by name (from the command line or a keybinding) and records the
     /// result as the next status message.
     fn run_command(&mut self, name: &str, args: &str) {
@@ -519,12 +564,14 @@ fn main() {
     let config = config::load();
     let registry = commands::CommandRegistry::with_builtin_commands();
     let macros = macros::load();
+    let camera_macros = camera_macros::load();
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App {
         config,
         registry,
         macros,
+        camera_macros,
         // `#[derive(Default)]` would otherwise zero this to black — see the field's doc
         // comment.
         current_color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
