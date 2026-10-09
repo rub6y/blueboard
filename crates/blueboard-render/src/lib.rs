@@ -222,13 +222,14 @@ pub enum ScenePreview<'a> {
 }
 
 /// One committed `Text` element, ready to paint — built fresh each frame in `render` from
-/// whatever's currently visible (see `ElementKind::Text`), `tokens` already parsed via
-/// `text_markup::parse` (cheap for the short strings a board's text elements realistically
-/// hold) and `screen_pos`/`font_size_px` already converted out of board space, so
-/// `text::paint_tokens` doesn't need the camera at all.
+/// whatever's currently visible (see `ElementKind::Text`), `runs` already parsed via
+/// `text_markup::parse` and resolved against `Renderer::math_textures` (cheap for the
+/// short strings a board's text elements realistically hold), and `screen_pos`/
+/// `font_size_px` already converted out of board space — `text::paint_runs` doesn't need
+/// the camera, or any `Renderer` state, at all.
 struct SceneTextDraw {
     screen_pos: egui::Pos2,
-    tokens: Vec<blueboard_core::text_markup::MathToken>,
+    runs: Vec<text::TextRun>,
     font_size_px: f32,
     color: egui::Color32,
 }
@@ -822,10 +823,10 @@ fn run_command_bar_ui(
         // screen space/logical points rather than needing the camera here.
         let painter = ui.painter();
         for draw in text_draws {
-            text::paint_tokens(
+            text::paint_runs(
                 painter,
                 draw.screen_pos,
-                &draw.tokens,
+                &draw.runs,
                 draw.font_size_px,
                 draw.color,
             );
@@ -1052,6 +1053,13 @@ pub struct Renderer {
     /// `fallback_clear_color`.
     background_image: Option<BackgroundImage>,
     background_quad_buffer: DynamicVertexBuffer,
+    /// Compiled LaTeX math spans, keyed by their exact source string — set by
+    /// `set_math_texture` (`blueboard-app` calls it once per new/uncached source, via
+    /// `blueboard_app::latex`), read by `render` when painting a
+    /// `text_markup::MathToken::Math` run. A source not yet in here (not yet attempted, or
+    /// `blueboard-app` gave up on it) falls back to painting its raw literal text instead
+    /// of an image — see `render`'s text-run resolution.
+    math_textures: std::collections::HashMap<String, MathTexture>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     theme_bind_group: wgpu::BindGroup,
@@ -1082,6 +1090,18 @@ pub struct Renderer {
 /// comment and `Renderer::set_background_image`.
 struct BackgroundImage {
     bind_group: wgpu::BindGroup,
+    width: f32,
+    height: f32,
+}
+
+/// One compiled LaTeX math span, registered with `egui`'s own texture space (not the raw
+/// `wgpu::Texture` — painting it goes through the `egui`-layered pass the same way scene
+/// text already does, see `text::paint_runs`) via `egui_wgpu::Renderer::
+/// register_native_texture`. `width`/`height` are the image's native pixel size, used to
+/// preserve aspect ratio when `text::paint_runs` scales it to the surrounding text's
+/// font size.
+struct MathTexture {
+    texture_id: egui::TextureId,
     width: f32,
     height: f32,
 }
@@ -1512,6 +1532,7 @@ impl Renderer {
             background_texture_bind_group_layout,
             background_sampler,
             background_image: None,
+            math_textures: std::collections::HashMap::new(),
             background_quad_buffer,
             camera_buffer,
             camera_bind_group,
@@ -1581,6 +1602,66 @@ impl Renderer {
             width: width as f32,
             height: height as f32,
         });
+    }
+
+    /// Parses `content` and resolves each `MathToken::Math` against `self.math_textures`
+    /// — a compiled span becomes a `TextRun::Image`, an uncompiled one (not attempted yet,
+    /// or `blueboard-app` gave up on it) falls back to its raw literal source as plain
+    /// text, so a math span is never just silently missing.
+    fn resolve_text_runs(&self, content: &str) -> Vec<text::TextRun> {
+        blueboard_core::text_markup::parse(content)
+            .into_iter()
+            .map(|token| match token {
+                blueboard_core::text_markup::MathToken::Text { text, bold } => {
+                    text::TextRun::Text { text, bold }
+                }
+                blueboard_core::text_markup::MathToken::Math(source) => {
+                    match self.math_textures.get(&source) {
+                        Some(math) => text::TextRun::Image {
+                            texture_id: math.texture_id,
+                            width: math.width,
+                            height: math.height,
+                        },
+                        None => text::TextRun::Text {
+                            text: source,
+                            bold: false,
+                        },
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Uploads a compiled LaTeX math span's pixels and registers them with `egui`'s
+    /// texture space — see `MathTexture`'s doc comment. Called once per new source string;
+    /// re-registering an already-present `key` would leak the old `egui::TextureId`'s GPU
+    /// resources (egui has no "replace" call, only register/free), so this is a plain
+    /// `insert` on the assumption `blueboard-app` only calls it for genuinely new keys
+    /// (true given `has_math_texture`'s gating, but worth noting since nothing here
+    /// enforces it).
+    pub fn set_math_texture(&mut self, key: String, rgba: &[u8], width: u32, height: u32) {
+        let texture = upload_rgba_texture(
+            &self.device,
+            &self.queue,
+            rgba,
+            width,
+            height,
+            "math texture",
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture_id = self.egui_renderer.register_native_texture(
+            &self.device,
+            &view,
+            wgpu::FilterMode::Linear,
+        );
+        self.math_textures.insert(
+            key,
+            MathTexture {
+                texture_id,
+                width: width as f32,
+                height: height as f32,
+            },
+        );
     }
 
     /// Render one frame: the grid, every element in `scene` intersecting the camera's
@@ -1722,7 +1803,7 @@ impl Renderer {
                     (screen.x / scale_factor as f64) as f32,
                     (screen.y / scale_factor as f64) as f32,
                 ),
-                tokens: blueboard_core::text_markup::parse(content),
+                runs: self.resolve_text_runs(content),
                 font_size_px: font_size * camera.zoom as f32 / scale_factor,
                 color: color_to_color32(element.color),
             });
@@ -1740,7 +1821,7 @@ impl Renderer {
                     (screen.x / scale_factor as f64) as f32,
                     (screen.y / scale_factor as f64) as f32,
                 ),
-                tokens: blueboard_core::text_markup::parse(&content),
+                runs: self.resolve_text_runs(&content),
                 font_size_px: input.font_size * camera.zoom as f32 / scale_factor,
                 color: color_to_color32(input.color),
             });

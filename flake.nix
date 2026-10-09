@@ -41,8 +41,19 @@
               pkgs.libxi
               pkgs.libxrandr
               (pkgs.texlive.combine {
-                inherit (pkgs.texlive) scheme-small algorithms algorithmicx;
+                inherit (pkgs.texlive)
+                  scheme-small
+                  algorithms
+                  algorithmicx
+                  standalone
+                  preview
+                  amsmath
+                  amsfonts
+                  ;
               })
+              # `pdftoppm`, to rasterize a compiled LaTeX snippet's PDF into a PNG the text
+              # tool can upload as a GPU texture — see blueboard-app/src/latex.rs.
+              pkgs.poppler-utils
             ];
 
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [

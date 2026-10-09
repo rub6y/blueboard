@@ -23,6 +23,7 @@ mod camera_macros;
 mod color;
 mod commands;
 mod config;
+mod latex;
 mod logging;
 mod macros;
 mod tools;
@@ -88,6 +89,12 @@ struct App {
     /// Board-space point the in-progress text element's top-left corner will be placed at
     /// — captured from the click that started composing.
     text_input_board_pos: DVec2,
+    /// Math spans (`text_markup::MathToken::Math`'s source string) already handed to
+    /// `latex::render_math` this session, success or failure — gates `ensure_math_textures`
+    /// so a broken formula isn't recompiled every single frame. Cleared for nothing: a
+    /// source string is content-addressed, so there's never a reason to retry one that
+    /// already failed except editing it into a different string, which is a new key.
+    latex_attempted: std::collections::HashSet<String>,
     /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
     /// `config.toml`. Loaded once at startup in `main()`.
@@ -155,6 +162,12 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                ensure_math_textures(
+                    &self.scene,
+                    &mut self.latex_attempted,
+                    &mut self.status,
+                    renderer,
+                );
                 let completions: Vec<blueboard_render::Completion> = if self.command_line_active {
                     let (_, candidates) = command_line_completions(
                         &self.command_line_text,
@@ -419,6 +432,49 @@ fn command_line_completions<'a>(
                 .collect(),
         ),
         _ => ("", Vec::new()),
+    }
+}
+
+/// Compiles any new (never-attempted) LaTeX math span found in `scene`'s text elements —
+/// called once per `RedrawRequested`, cheap after the first pass since `attempted` makes
+/// every already-seen source a no-op `HashSet` lookup. Scans every element, not just
+/// what's currently visible, so panning onto previously off-screen text doesn't show raw
+/// unrendered source for a frame.
+///
+/// A free function, not an `App` method, for the same reason `command_line_completions`
+/// above is: its caller already holds `&mut self.renderer` alongside `&self.window`,
+/// which a `&mut self` method call would conflict with.
+fn ensure_math_textures(
+    scene: &Scene,
+    attempted: &mut std::collections::HashSet<String>,
+    status: &mut Option<(String, bool)>,
+    renderer: &mut Renderer,
+) {
+    let mut sources = Vec::new();
+    for element in scene.all_elements() {
+        if let blueboard_core::scene::ElementKind::Text { content, .. } = &element.kind {
+            for token in blueboard_core::text_markup::parse(content) {
+                if let blueboard_core::text_markup::MathToken::Math(source) = token {
+                    sources.push(source);
+                }
+            }
+        }
+    }
+
+    for source in sources {
+        if attempted.contains(&source) {
+            continue;
+        }
+        attempted.insert(source.clone());
+        match latex::render_math(&source) {
+            Ok(rendered) => {
+                renderer.set_math_texture(source, &rendered.rgba, rendered.width, rendered.height);
+            }
+            Err(err) => {
+                log::warn!("failed to render LaTeX span {source:?}: {err}");
+                *status = Some((format!("latex: {err}"), true));
+            }
+        }
     }
 }
 

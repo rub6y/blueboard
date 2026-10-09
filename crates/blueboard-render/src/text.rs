@@ -1,50 +1,54 @@
-//! Paints a [`MathToken`] sequence (`blueboard_core::text_markup`) with `egui`'s painter:
-//! bold via a faux-bold double-paint (this app's fonts have no separate bold weight),
-//! superscript/subscript via a smaller font raised/lowered relative to the baseline, and
-//! `\frac{a}{b}` as a real stacked fraction (numerator over denominator with a divider
-//! line) — the one piece that can't be expressed as a single `egui::text::LayoutJob`
-//! paragraph, which is why this is a hand-rolled left-to-right layout instead of one.
+//! Paints a [`TextRun`] sequence with `egui`'s painter: bold via a faux-bold double-paint
+//! (this app's fonts have no separate bold weight), and a compiled LaTeX math span
+//! (`TextRun::Image`) as a scaled, aspect-preserved image — `lib.rs`'s `render` resolves
+//! `text_markup::MathToken::Math` into one of these from `Renderer::math_textures` before
+//! calling here, so this module never deals with LaTeX/compilation itself, only painting.
 //! Deliberately single-line: no wrapping, matching `text_markup::parse`'s own scope.
 
-use blueboard_core::text_markup::MathToken;
-use egui::{Color32, FontId, Painter, Pos2, Vec2};
+use egui::{Color32, FontId, Painter, Pos2, Rect, Vec2};
 
-/// Relative to `font_size`: how much smaller a superscript/subscript or a fraction's
-/// numerator/denominator render, how far a superscript/subscript shifts off the baseline,
-/// and how much horizontal breathing room a fraction gets on each side.
-const SCRIPT_SCALE: f32 = 0.65;
-const SCRIPT_RAISE: f32 = 0.35;
-const FRAC_SCALE: f32 = 0.8;
-const FRAC_PADDING: f32 = 0.25;
-/// Gap (both sides) between a fraction's numerator/denominator and its divider line.
-const FRAC_LINE_GAP: f32 = 0.08;
-/// How many extra times a faux-bold run is painted, each offset by one more pixel —
-/// see this module's doc comment.
+/// How many extra times a faux-bold run is painted, each offset by one more pixel — see
+/// this module's doc comment.
 const FAUX_BOLD_PASSES: i32 = 2;
+/// A math image is scaled so its height matches `font_size * IMAGE_HEIGHT_RATIO` (aspect
+/// ratio preserved) — matches plain text's own line-height ratio elsewhere in this crate,
+/// so a math span reads as roughly the same visual size as the surrounding text.
+const IMAGE_HEIGHT_RATIO: f32 = 1.3;
 
-/// Paints `tokens` left-to-right starting at `top_left` (the text element's board-space
-/// top-left corner, already converted to screen/logical points by the caller) and returns
-/// the painted bounding size — callers don't need to also call
-/// `text_markup::estimate_size`; this is the real painted size at this `font_size`.
-pub fn paint_tokens(
+/// One resolved piece of a text element, ready to paint — see this module's doc comment
+/// on where `Image` comes from.
+pub enum TextRun {
+    Text {
+        text: String,
+        bold: bool,
+    },
+    Image {
+        texture_id: egui::TextureId,
+        /// Native pixel size, used to preserve aspect ratio when scaled to `font_size`.
+        width: f32,
+        height: f32,
+    },
+}
+
+/// Paints `runs` left-to-right starting at `top_left` (the text element's board-space
+/// top-left corner, already converted to screen/logical points by the caller).
+pub fn paint_runs(
     painter: &Painter,
     top_left: Pos2,
-    tokens: &[MathToken],
+    runs: &[TextRun],
     font_size: f32,
     color: Color32,
-) -> Vec2 {
-    let baseline_y = top_left.y + font_size * 1.0;
+) {
+    let baseline_y = top_left.y + font_size;
     let mut cursor_x = top_left.x;
-    let mut min_y = top_left.y;
-    let mut max_y = top_left.y + font_size * 1.3;
 
-    for token in tokens {
-        match token {
-            MathToken::Text { text, bold } => {
+    for run in runs {
+        match run {
+            TextRun::Text { text, bold } => {
                 let font = FontId::proportional(font_size);
                 let size = paint_run(
                     painter,
-                    pos(cursor_x, baseline_y - font_size),
+                    Pos2::new(cursor_x, baseline_y - font_size),
                     text,
                     font,
                     color,
@@ -52,66 +56,29 @@ pub fn paint_tokens(
                 );
                 cursor_x += size.x;
             }
-            MathToken::Superscript(text) => {
-                let font = FontId::proportional(font_size * SCRIPT_SCALE);
-                let y = baseline_y - font_size - font_size * SCRIPT_RAISE;
-                min_y = min_y.min(y);
-                let size = paint_run(painter, pos(cursor_x, y), text, font, color, false);
-                cursor_x += size.x;
-            }
-            MathToken::Subscript(text) => {
-                let font = FontId::proportional(font_size * SCRIPT_SCALE);
-                let y = baseline_y - font_size + font_size * SCRIPT_RAISE;
-                max_y = max_y.max(y + font_size * SCRIPT_SCALE * 1.3);
-                let size = paint_run(painter, pos(cursor_x, y), text, font, color, false);
-                cursor_x += size.x;
-            }
-            MathToken::Fraction(num, den) => {
-                let frac_font = FontId::proportional(font_size * FRAC_SCALE);
-                let padding = font_size * FRAC_PADDING;
-                let num_size = measure(painter, num, frac_font.clone());
-                let den_size = measure(painter, den, frac_font.clone());
-                let column_width = num_size.x.max(den_size.x) + padding * 2.0;
-                let line_y = baseline_y - font_size * 0.45;
-
-                let num_x = cursor_x + (column_width - num_size.x) * 0.5;
-                let num_y = line_y - font_size * FRAC_LINE_GAP - num_size.y;
-                paint_run(
-                    painter,
-                    pos(num_x, num_y),
-                    num,
-                    frac_font.clone(),
-                    color,
-                    false,
+            TextRun::Image {
+                texture_id,
+                width,
+                height,
+            } => {
+                let draw_height = font_size * IMAGE_HEIGHT_RATIO;
+                let draw_width = width * (draw_height / height.max(1.0));
+                // Centered around the text's vertical midline rather than baseline-aligned
+                // — a math image (a fraction, say) typically extends both above and below
+                // where plain text's baseline would sit.
+                let y = baseline_y - font_size * 0.5 - draw_height * 0.5;
+                let rect =
+                    Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(draw_width, draw_height));
+                painter.image(
+                    *texture_id,
+                    rect,
+                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
                 );
-
-                let den_x = cursor_x + (column_width - den_size.x) * 0.5;
-                let den_y = line_y + font_size * FRAC_LINE_GAP;
-                paint_run(painter, pos(den_x, den_y), den, frac_font, color, false);
-
-                painter.line_segment(
-                    [pos(cursor_x, line_y), pos(cursor_x + column_width, line_y)],
-                    egui::Stroke::new(1.0, color),
-                );
-
-                min_y = min_y.min(num_y);
-                max_y = max_y.max(den_y + den_size.y);
-                cursor_x += column_width;
+                cursor_x += draw_width;
             }
         }
     }
-
-    Vec2::new(cursor_x - top_left.x, max_y - min_y)
-}
-
-fn pos(x: f32, y: f32) -> Pos2 {
-    Pos2::new(x, y)
-}
-
-fn measure(painter: &Painter, text: &str, font: FontId) -> Vec2 {
-    painter
-        .layout_no_wrap(text.to_string(), font, Color32::WHITE)
-        .size()
 }
 
 /// Paints one run of plain text at `pos` (its top-left corner) and returns its size.
