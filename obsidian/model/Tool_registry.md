@@ -5,9 +5,15 @@ trait.
 
 The tool registry holds the [[Vector_pen]] (Phase 2), rect/ellipse/line shape tools, a
 select/move tool (see [[Scene_graph]]'s `hit_test` and `set_element_path`), two eraser
-tools (`eraser` partial / `eraser-object` whole-element), and two multi-select tools:
+tools (`eraser` partial / `eraser-object` whole-element), two multi-select tools:
 `select-rect` (marquee, reuses `Scene::elements_in_viewport`) and `select-lasso`
-(freehand closed loop, see `blueboard_core::lasso`) — text is still a future tool.
+(freehand closed loop, see `blueboard_core::lasso`), and the [[Text_tool]].
+
+The `text` tool is a structural exception: its `Tool` trait methods are unreachable
+no-ops. `main.rs` special-cases `MouseInput`/keyboard dispatch while it's the active tool
+(composing state — the in-progress string, where it's anchored — lives on `App`, which
+`ToolContext` deliberately never exposes to a `Tool`), the same bypass precedent the color
+picker already established for its own App-owned UI state.
 
 `select-rect` and `select-lasso` share their group-move/delete logic via a
 `GroupSelection` helper in `tools.rs`, differing only in how a fresh selection region

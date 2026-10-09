@@ -31,3 +31,12 @@ commit) preserves an element's existing color rather than resetting it; `erase_c
 carries an erased element's color through to every surviving split piece. Undo/redo's
 `Snapshot` had to grow a color field too, for the same reason — without it, every undo
 would silently strip color back to default.
+
+As of the [[Text_tool]], an element also carries a `kind: ElementKind` (`Stroke` or
+`Text`) — the first real kind seam in a model that, until then, was deliberately one
+concrete struct (every shape/pen stroke unified into the same `path: BezPath` outline).
+`Text`'s `path` is just its bounding-box rectangle, not a stroke to render — everything
+that assumed "every element's path is its visible outline" (rendering, mainly) had to
+learn to check `kind` first. `Snapshot`/`ElementDocument` both widened to carry `kind`
+too, mechanically — `kind.clone()` is already enough for `set_element_path` to preserve a
+text element's content/font size across a move, same pattern `color` already followed.

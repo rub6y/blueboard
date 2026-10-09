@@ -2,6 +2,56 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-09 — Text tool: markdown bold + basic LaTeX math subset
+Third of the five post-Phase-5 features (see the entry below this one for the full list
+and plan).
+
+- **`Element` gained its first real `kind` seam** (`ElementKind::Stroke` / `Text`) —
+  `scene.rs`'s own module doc previously described the model as deliberately *one*
+  concrete struct (every shape/pen stroke unified into the same `path: BezPath` outline).
+  A `Text` element's `path` is just its bounding-box rectangle, not a stroke to render.
+  Mechanical fallout, all three call sites moving together as expected going in:
+  `Scene::snapshot`/`restore`, `history::Snapshot`'s tuple, `file_format`'s
+  `ElementDocument` (format version bumped 2->3, old files rejected outright — the
+  format's existing stance, not a new one).
+- **`history.rs`'s memento-pattern choice paid off exactly as its own doc comment
+  predicted**: adding a whole new element kind needed zero new undo logic, only the
+  tuple/struct widening above.
+- **`blueboard_core::text_markup`** (new module): parses `**bold**` and `$$...$$` math
+  (`^`/`_` super/subscript, `\frac{a}{b}`, `\alpha`-style Greek commands, `\mathbb{X}` via
+  Unicode's double-struck block) into a flat `Vec<MathToken>` — pure, unit-tested, no
+  rendering dependency, per this crate's established "stays headlessly testable"
+  convention. Also owns `estimate_size` (a flat character-advance-ratio heuristic) since
+  a text element's board-space bounding box has to be computable without a font shaper
+  (only available in `blueboard-render`, via `egui`).
+- **Real design fork, surfaced to ruba rather than decided silently**: the plan said
+  `\frac{a}{b}` should render as a true stacked fraction (numerator over denominator,
+  divider line), but `egui::text::LayoutJob` — which handles bold/superscript/subscript
+  natively, no custom code — can't express a multi-row fraction inside one text flow.
+  ruba chose the true stacked fraction over an inline `a/b` approximation, so
+  `blueboard-render`'s new `text` module is a hand-rolled left-to-right painter (measures
+  each token via `egui::Painter::layout_no_wrap`, positions it, draws the fraction's
+  divider line directly), not a `LayoutJob`. Bold is faked by repainting the same glyphs
+  offset by a pixel or two — this app's font has no separate bold weight.
+- **`Camera::board_to_screen`** added (`screen_to_board`'s inverse, tested via round-trip)
+  since placing `egui`-painted scene text needs to go board-space -> screen-space, the
+  opposite direction every existing camera call needed.
+- **Text tool interaction is a structural exception** in `tools.rs`: its `Tool` trait
+  methods are unreachable no-ops — `ToolContext` deliberately never exposes `&mut App`
+  (see [[Tool_registry]]'s own doc comment on why), but composing state (the in-progress
+  string, where it's anchored) has to live on `App`. `main.rs` special-cases
+  `MouseInput`/keyboard dispatch while `text` is the active tool, the same bypass
+  precedent the color picker already established.
+- **Known, expected limitation confirmed under Xvfb, not just assumed**: `\mathbb{R}`
+  rendered as a tofu box — `egui`'s bundled font doesn't cover Unicode's mathematical
+  double-struck block. Greek letters rendered fine (different, covered block). Flagged as
+  a known limit going in; this is the confirmation, not a surprise.
+- Verified under Xvfb: typed `**Hello** World` (bold took), `x^2 + y_i` (super/subscript
+  positioned correctly), `\frac{1}{2}` (real stacked fraction with divider line,
+  confirming the design-fork decision rendered as chosen), `\mathbb{R} \alpha \beta`
+  (tofu box + working Greek, as expected), and a cancelled composition via Escape
+  (confirmed nothing committed by diffing the before/after screenshot).
+
 ## 2026-10-09 — Post-Phase-5 feature list: F-key camera macros, background/grid
 ruba asked for five new features beyond the original phase plan (see
 `planning/PLAN.md`'s Phase 5/6): F-key camera macros, background/grid customization, a
