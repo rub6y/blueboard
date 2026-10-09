@@ -53,6 +53,7 @@ impl CommandRegistry {
         registry.register(ColorCommand);
         registry.register(GridCommand);
         registry.register(BackgroundCommand);
+        registry.register(GifCommand);
         registry.register(MacroCommand);
         registry.register(CameraMacroCommand);
         registry.register(UndoCommand);
@@ -333,6 +334,48 @@ fn select_pasted(app: &mut App, ids: &[u64]) {
         app.tools.set_active("select");
     }
     app.tools.active_tool_mut().select_elements(&app.scene, ids);
+}
+
+/// Places an animated GIF: decodes every frame up front, commits a plain `ElementKind::
+/// Image` holding the first frame (so it's selectable/resizable/saved exactly like a
+/// static pasted image, no core/render changes needed for any of that), and registers it
+/// in `app.gif_players` for `crate::gif::advance_players` to cycle frames on — see that
+/// module's doc comment for why animation state lives entirely in `blueboard-app` instead.
+struct GifCommand;
+impl Command for GifCommand {
+    fn name(&self) -> &'static str {
+        "gif"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<path>"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        let path = args.trim();
+        if path.is_empty() {
+            return Err("usage: gif <path>".to_string());
+        }
+        let frames = crate::gif::decode(path).map_err(|err| format!("{path}: {err}"))?;
+        let Some(first) = frames.first() else {
+            return Err(format!("{path}: no frames"));
+        };
+        let cursor_board = cursor_board_position(app)?;
+        let id = app.scene.add_image_element(
+            cursor_board,
+            blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+            first.image.clone(),
+        );
+        let Some(renderer) = app.renderer.as_mut() else {
+            return Err("renderer not ready yet".to_string());
+        };
+        renderer.set_element_texture(id, &first.image.rgba, first.image.width, first.image.height);
+        let frame_count = frames.len();
+        app.gif_players
+            .insert(id, crate::gif::GifPlayer::new(frames));
+        select_pasted(app, &[id]);
+        Ok(format!("playing {path} ({frame_count} frames)"))
+    }
 }
 
 fn cursor_board_position(app: &App) -> Result<glam::DVec2, String> {

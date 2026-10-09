@@ -24,6 +24,7 @@ mod camera_macros;
 mod color;
 mod commands;
 mod config;
+mod gif;
 mod latex;
 mod logging;
 mod macros;
@@ -128,6 +129,9 @@ struct App {
     /// inside one, cleared by Escape or clicking elsewhere (`handle_key_press`'s
     /// top-priority branch, and `MouseInput`'s focus-check, mirror this same shape).
     focused_terminal: Option<u64>,
+    /// GIF elements' frame-timer state, keyed by element id — see `gif.rs`'s doc comment
+    /// on why this lives here rather than in `Scene` (mirrors `live_terminals` above).
+    gif_players: std::collections::HashMap<u64, gif::GifPlayer>,
     /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
     /// `config.toml`. Loaded once at startup in `main()`.
@@ -203,6 +207,11 @@ impl ApplicationHandler for App {
                 );
                 ensure_image_textures(&self.scene, renderer);
                 ensure_live_terminals(&self.scene, &mut self.live_terminals, &mut self.status);
+                for (&id, player) in self.gif_players.iter_mut() {
+                    if let Some(frame) = player.tick() {
+                        renderer.set_element_texture(id, &frame.rgba, frame.width, frame.height);
+                    }
+                }
                 let completions: Vec<blueboard_render::Completion> = if self.command_line_active {
                     let (_, candidates) = command_line_completions(
                         &self.command_line_text,
@@ -292,7 +301,7 @@ impl ApplicationHandler for App {
                 // window exists, so output shows up within a frame instead. No effect at
                 // all on a board with none (the common case), since this is gated on
                 // `live_terminals` being non-empty.
-                if !self.live_terminals.is_empty() {
+                if !self.live_terminals.is_empty() || !self.gif_players.is_empty() {
                     window.request_redraw();
                 }
             }
