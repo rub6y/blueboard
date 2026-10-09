@@ -69,12 +69,19 @@ fn cache_dir() -> PathBuf {
     base.join("blueboard").join("latex_cache")
 }
 
+/// Bumped whenever the *rendered appearance* of a given source string would change for a
+/// reason this module controls (not a reason the source text itself captures) — e.g. v1
+/// rendered in black ink, v2 switched to white-for-tinting (see `compile_and_rasterize`'s
+/// doc comment). Folded into `cache_key` so a stale on-disk entry from an older version
+/// never gets served as if it were the new rendering.
+const CACHE_VERSION: &str = "v2";
+
 /// A stable, filesystem-safe filename for `source` — just needs to not collide in
 /// practice, not be cryptographically strong, so a plain FNV-1a hash is enough.
 fn cache_key(source: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in source.as_bytes() {
-        hash ^= u64::from(*byte);
+    for byte in CACHE_VERSION.bytes().chain(source.bytes()) {
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
@@ -116,10 +123,16 @@ fn compile_and_rasterize(source: &str) -> Result<Vec<u8>, LatexError> {
     let pdf_path = work_dir.join("snippet.pdf");
     let png_path = work_dir.join("snippet.png");
 
+    // Rendered in white ink (not whatever color the element actually wants): the cached
+    // texture is color-independent, and `blueboard-render` tints it to the element's real
+    // color at paint time (multiplying white by any color reproduces it exactly) — so the
+    // same compiled span is reusable regardless of which color an element draws it in, and
+    // a later `:color` change needs no recompile.
     let document = format!(
         "\\documentclass[preview,border=1pt]{{standalone}}\n\
-         \\usepackage{{amsmath,amsfonts}}\n\
+         \\usepackage{{amsmath,amsfonts,xcolor}}\n\
          \\begin{{document}}\n\
+         \\color{{white}}\n\
          $ {source} $\n\
          \\end{{document}}\n"
     );

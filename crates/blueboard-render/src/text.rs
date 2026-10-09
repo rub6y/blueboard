@@ -69,11 +69,15 @@ pub fn paint_runs(
                 let y = baseline_y - font_size * 0.5 - draw_height * 0.5;
                 let rect =
                     Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(draw_width, draw_height));
+                // Rendered in white ink (`blueboard-app::latex`'s doc comment) precisely
+                // so tinting by the element's real `color` here reproduces it exactly —
+                // one compiled texture serves any color, no recompile on a `:color`
+                // change.
                 painter.image(
                     *texture_id,
                     rect,
                     Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
+                    color,
                 );
                 cursor_x += draw_width;
             }
