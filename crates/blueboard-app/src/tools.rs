@@ -462,7 +462,20 @@ impl Tool for SelectionTool {
             }
         }
 
-        self.selected = ctx.scene.hit_test(board, tolerance);
+        // An image reads as "filled" content — its whole box is visibly the thing, unlike
+        // a stroke's bbox which is mostly empty board space — so it's picked by ordinary
+        // point-in-box containment first, before falling back to `hit_test`'s
+        // outline-distance check (which a large, mostly-empty image box would otherwise
+        // make maddening to click). Ties (overlapping images) go to the highest id —
+        // `blueboard-render`'s own "sorted by id = draw order" convention, so this matches
+        // whichever one is actually drawn on top.
+        let image_hit = ctx
+            .scene
+            .elements_in_viewport(board, board)
+            .filter(|element| matches!(element.kind, ElementKind::Image(_)))
+            .max_by_key(|element| element.id)
+            .map(|element| element.id);
+        self.selected = image_hit.or_else(|| ctx.scene.hit_test(board, tolerance));
         self.selected_path = self
             .selected
             .and_then(|id| ctx.scene.element(id))

@@ -2202,12 +2202,11 @@ impl Renderer {
                 pass.draw(0..grid_count, 0..1);
             }
 
-            if stroke_count > 0 {
-                pass.set_pipeline(&self.colored_stroke_pipeline);
-                pass.set_vertex_buffer(0, self.stroke_buffer.buffer.slice(..));
-                pass.draw(0..stroke_count, 0..1);
-            }
-
+            // Drawn before strokes (not after, where this used to sit) — image elements
+            // are meant to be written over (e.g. annotating a pasted reference photo),
+            // which only works if strokes/shapes composite on top of them, not under.
+            // Text renders in the separate `egui` pass below regardless, so it's already
+            // on top of this no matter where it sits here.
             if image_vertex_count > 0 {
                 // Reuses `BackgroundMode::Image(ImageFit::ZoomWithCamera)`'s own
                 // pipeline — both are camera-transformed textured quads, just this one's
@@ -2220,6 +2219,12 @@ impl Renderer {
                         pass.draw(*start..*start + *count, 0..1);
                     }
                 }
+            }
+
+            if stroke_count > 0 {
+                pass.set_pipeline(&self.colored_stroke_pipeline);
+                pass.set_vertex_buffer(0, self.stroke_buffer.buffer.slice(..));
+                pass.draw(0..stroke_count, 0..1);
             }
 
             if colored_preview_count > 0 {

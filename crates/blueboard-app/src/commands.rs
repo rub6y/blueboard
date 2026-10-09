@@ -316,13 +316,23 @@ impl Command for PasteCommand {
             .into_iter()
             .map(|(path, color, kind)| app.scene.add_element_with_kind(affine * path, color, kind))
             .collect();
-        // Selected right away so the paste is immediately draggable (e.g. to nudge it
-        // somewhere exact) without an extra click to select it first.
-        app.tools
-            .active_tool_mut()
-            .select_elements(&app.scene, &pasted_ids);
+        select_pasted(app, &pasted_ids);
         Ok(format!("pasted {} element(s)", pasted_ids.len()))
     }
+}
+
+/// Switches to the `select` tool (if some other tool was active — e.g. `pen`, which was
+/// likely the active tool right before a paste) and selects `ids` on it, so a paste is
+/// immediately visible as selected (handles showing) and draggable, regardless of what
+/// tool was active beforehand. `select_elements` alone isn't enough: it only has an effect
+/// on whichever tool happens to already be active, and most tools (anything but
+/// `select`/`select-rect`/`select-lasso`) just no-op it.
+fn select_pasted(app: &mut App, ids: &[u64]) {
+    let active_name = app.tools.active_tool().name();
+    if !matches!(active_name, "select" | "select-rect" | "select-lasso") {
+        app.tools.set_active("select");
+    }
+    app.tools.active_tool_mut().select_elements(&app.scene, ids);
 }
 
 fn cursor_board_position(app: &App) -> Result<glam::DVec2, String> {
@@ -362,9 +372,7 @@ fn paste_external_image(app: &mut App, cursor_board: glam::DVec2) -> Result<Stri
         return Err("renderer not ready yet".to_string());
     };
     renderer.set_element_texture(id, &image_data.rgba, width, height);
-    app.tools
-        .active_tool_mut()
-        .select_elements(&app.scene, &[id]);
+    select_pasted(app, &[id]);
     Ok(format!("pasted image ({width}x{height})"))
 }
 
