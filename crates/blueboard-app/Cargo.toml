@@ -9,8 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 # OS clipboard image read for `:paste` falling back to an external image (no board
-# elements yanked) — see `commands.rs`'s `PasteCommand`.
-arboard = "3"
+# elements yanked) — see `commands.rs`'s `PasteCommand`. `wayland-data-control` isn't in
+# arboard's default features (only `image-data`, for format decoding, is) — without it,
+# arboard only talks to the clipboard via X11, which doesn't reliably bridge image data
+# copied by a native Wayland app on a Wayland-native session (this machine's actual
+# desktop, per `nixos.md`'s own notes on needing `WAYLAND_DISPLAY` handling for winit).
+arboard = { version = "3", features = ["wayland-data-control"] }
 blueboard-core = { path = "../blueboard-core" }
 blueboard-render = { path = "../blueboard-render" }
 # Only for constructing the handful of input events forwarded to the color picker (see

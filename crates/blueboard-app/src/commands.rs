@@ -342,9 +342,10 @@ fn cursor_board_position(app: &App) -> Result<glam::DVec2, String> {
 fn paste_external_image(app: &mut App, cursor_board: glam::DVec2) -> Result<String, String> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|err| format!("clipboard unavailable: {err}"))?;
-    let image = clipboard
-        .get_image()
-        .map_err(|_| "clipboard is empty".to_string())?;
+    let image = clipboard.get_image().map_err(|err| {
+        log::warn!("arboard clipboard image read failed: {err}");
+        format!("clipboard has no image: {err}")
+    })?;
     let (width, height) = (image.width as u32, image.height as u32);
     let image_data = blueboard_core::scene::ImageData {
         rgba: image.bytes.into_owned(),
