@@ -98,6 +98,14 @@ pub trait Tool {
     fn selected_element(&self) -> Option<u64> {
         None
     }
+
+    /// Every element this tool currently has selected — unlike [`Tool::selected_element`],
+    /// covers the group-select tools too, for `:yank` (`commands.rs`) to copy whatever's
+    /// selected regardless of which selection tool is active. Empty default; overridden by
+    /// `select`/`select-rect`/`select-lasso`.
+    fn selected_elements(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 pub struct ToolRegistry {
@@ -535,6 +543,10 @@ impl Tool for SelectionTool {
     fn selected_element(&self) -> Option<u64> {
         self.selected
     }
+
+    fn selected_elements(&self) -> Vec<u64> {
+        self.selected.into_iter().collect()
+    }
 }
 
 /// Screen-space radius (converted to board-space the same way as every other tolerance in
@@ -852,6 +864,10 @@ impl Tool for SelectRectTool {
     fn delete_selection(&mut self, scene: &mut Scene) -> bool {
         self.group.delete(scene)
     }
+
+    fn selected_elements(&self) -> Vec<u64> {
+        self.group.selected.clone()
+    }
 }
 
 /// Minimum screen-space distance between recorded lasso points — same decimation
@@ -931,5 +947,9 @@ impl Tool for SelectLassoTool {
 
     fn delete_selection(&mut self, scene: &mut Scene) -> bool {
         self.group.delete(scene)
+    }
+
+    fn selected_elements(&self) -> Vec<u64> {
+        self.group.selected.clone()
     }
 }

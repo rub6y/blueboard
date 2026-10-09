@@ -6,6 +6,7 @@
 
 use blueboard_core::file_format;
 use blueboard_core::scene::Scene;
+use kurbo::Shape as _;
 
 use crate::{App, DEFAULT_BOARD_PATH};
 
@@ -47,6 +48,8 @@ impl CommandRegistry {
         registry.register(NewCommand);
         registry.register(ToolCommand);
         registry.register(DeleteCommand);
+        registry.register(YankCommand);
+        registry.register(PasteCommand);
         registry.register(ColorCommand);
         registry.register(GridCommand);
         registry.register(BackgroundCommand);
@@ -240,6 +243,79 @@ impl Command for DeleteCommand {
         } else {
             Err("nothing selected".to_string())
         }
+    }
+}
+
+/// Copies whatever's currently selected (via whichever selection tool is active — `select`,
+/// `select-rect`, or `select-lasso`, see [`crate::tools::Tool::selected_elements`]) into
+/// `app.clipboard`, replacing its previous contents. Bound to `y` by default, vim's yank.
+/// Doesn't touch the scene, so there's nothing for undo to record here — `PasteCommand` is
+/// the half of this pair that does.
+struct YankCommand;
+impl Command for YankCommand {
+    fn name(&self) -> &'static str {
+        "yank"
+    }
+
+    fn run(&self, app: &mut App, _args: &str) -> Result<String, String> {
+        let ids = app.tools.active_tool().selected_elements();
+        if ids.is_empty() {
+            return Err("nothing selected".to_string());
+        }
+        app.clipboard = ids
+            .iter()
+            .filter_map(|id| app.scene.element(*id))
+            .map(|element| (element.path.clone(), element.color, element.kind.clone()))
+            .collect();
+        Ok(format!("yanked {} element(s)", app.clipboard.len()))
+    }
+}
+
+/// Pastes `app.clipboard`'s contents as fresh elements (new ids, originals untouched),
+/// recentered as a group — relative positions between pasted elements are preserved, but
+/// the whole group's combined bounding box is shifted so its center lands at the cursor's
+/// current board position. Bound to `Y` by default: vim's own paste key, lowercase `p`, is
+/// already this app's pen-tool keybinding, so paste sits on yank's shift-variant instead —
+/// same relationship `u`/`U` (undo/redo) already has.
+struct PasteCommand;
+impl Command for PasteCommand {
+    fn name(&self) -> &'static str {
+        "paste"
+    }
+
+    fn run(&self, app: &mut App, _args: &str) -> Result<String, String> {
+        if app.clipboard.is_empty() {
+            return Err("clipboard is empty".to_string());
+        }
+        let Some(renderer) = app.renderer.as_ref() else {
+            return Err("renderer not ready yet".to_string());
+        };
+        let (width, height) = renderer.viewport_size();
+        let viewport = glam::DVec2::new(width as f64, height as f64);
+        let cursor_board = app.camera.screen_to_board(app.last_cursor, viewport);
+
+        let mut combined: Option<kurbo::Rect> = None;
+        for (path, _, _) in &app.clipboard {
+            let bbox = path.bounding_box();
+            combined = Some(match combined {
+                Some(existing) => existing.union(bbox),
+                None => bbox,
+            });
+        }
+        // Unreachable in practice (the emptiness check above already returned), but keeps
+        // this free of an `.unwrap()`.
+        let Some(combined) = combined else {
+            return Err("clipboard is empty".to_string());
+        };
+        let center = combined.center();
+        let delta = glam::DVec2::new(cursor_board.x - center.x, cursor_board.y - center.y);
+        let affine = kurbo::Affine::translate((delta.x, delta.y));
+
+        let clipboard = app.clipboard.clone();
+        for (path, color, kind) in clipboard {
+            app.scene.add_element_with_kind(affine * path, color, kind);
+        }
+        Ok(format!("pasted {} element(s)", app.clipboard.len()))
     }
 }
 

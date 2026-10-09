@@ -78,9 +78,21 @@ impl Scene {
     }
 
     pub fn add_element_with_color(&mut self, path: BezPath, color: [f32; 3]) -> u64 {
+        self.add_element_with_kind(path, color, ElementKind::Stroke)
+    }
+
+    /// Like [`Scene::add_element_with_color`], but for any `kind` — used by `:yank`/paste
+    /// (`blueboard-app`'s `commands.rs`) to duplicate a copied element (of whatever kind
+    /// it originally was) as a fresh one with a new id.
+    pub fn add_element_with_kind(
+        &mut self,
+        path: BezPath,
+        color: [f32; 3],
+        kind: ElementKind,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.insert_element(id, path, color, ElementKind::Stroke);
+        self.insert_element(id, path, color, kind);
         id
     }
 

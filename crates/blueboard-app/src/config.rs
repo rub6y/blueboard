@@ -64,6 +64,11 @@ fn default_keybindings() -> HashMap<String, String> {
         // logical key as the literal `"U"`, which the lookup in `main.rs` matches as-is.
         ("u", "undo"),
         ("U", "redo"),
+        // `y`/`Y` (yank/paste) — same Shift-gives-a-distinct-literal-character trick as
+        // `u`/`U` above, not a modifier binding. Paste isn't bound to vim's own `p`: that's
+        // already this app's pen-tool key, so it sits on yank's shift-variant instead.
+        ("y", "yank"),
+        ("Y", "paste"),
     ]
     .into_iter()
     .map(|(key, command)| (key.to_string(), command.to_string()))

@@ -13,7 +13,7 @@ use blueboard_core::history::History;
 use blueboard_core::scene::{ElementKind, Scene};
 use blueboard_render::{CommandBarContent, Frame, GridSettings, RenderOutcome, Renderer};
 use glam::DVec2;
-use kurbo::Shape as _;
+use kurbo::{BezPath, Shape as _};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -113,6 +113,10 @@ struct App {
     /// source string is content-addressed, so there's never a reason to retry one that
     /// already failed except editing it into a different string, which is a new key.
     latex_attempted: std::collections::HashSet<String>,
+    /// Elements copied by `:yank` (`y`), ready for `:paste` (`Y`) — path/color/kind
+    /// triples, not ids: a paste creates fresh elements with new ids, the originals are
+    /// untouched. Replaced wholesale by the next `:yank`, not merged into.
+    clipboard: Vec<(BezPath, [f32; 3], ElementKind)>,
     /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
     /// `config.toml`. Loaded once at startup in `main()`.
