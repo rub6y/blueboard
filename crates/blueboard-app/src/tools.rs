@@ -346,14 +346,17 @@ impl Tool for ShapeTool {
 
 /// Screen-space radius (at the zoom level a click happens at, same conversion pattern as
 /// [`PEN_FIT_TOLERANCE_PX`]) within which a click counts as hitting an element's outline —
-/// loose enough to forgive clicking a pixel or two off a thin stroke.
+/// used by the whole-object eraser's hit-test, where a tight tolerance matters more (not
+/// accidentally erasing a neighboring element) than forgiveness. See
+/// [`SELECTION_CLICK_TOLERANCE_PX`] for the selection tools' own, deliberately looser,
+/// version of this.
 const SELECT_HIT_TOLERANCE_PX: f64 = 6.0;
 
-/// Click-to-select, drag-to-move. Unlike `ShapeTool`, a drag here never creates anything
-/// — it mutates an existing element's path, and only on release: `on_pointer_move` can't
-/// safely commit to the scene itself (see `main.rs`'s tool-dispatch comment — only pointer
-/// down/up are snapshotted for undo), so a move is previewed from the original path and
-/// applied in one step in `on_pointer_up`.
+/// Like [`SELECT_HIT_TOLERANCE_PX`], but for the selection tools' click-to-select and
+/// resize-handle hit-testing — deliberately larger, since a selection click needs to be
+/// easy to land rather than needing to land precisely on a thin outline.
+const SELECTION_CLICK_TOLERANCE_PX: f64 = 14.0;
+
 /// Captured at the pointer-down that started a resize gesture — everything needed to
 /// recompute the dragged path/font size fresh from the original each `on_pointer_move`,
 /// same anti-drift reasoning as `SelectionTool::drag` for a move.
@@ -367,6 +370,11 @@ struct ResizeDrag {
     original_font_size: Option<f32>,
 }
 
+/// Click-to-select, drag-to-move. Unlike `ShapeTool`, a drag here never creates anything —
+/// it mutates an existing element's path, and only on release: `on_pointer_move` can't
+/// safely commit to the scene itself (see `main.rs`'s tool-dispatch comment — only pointer
+/// down/up are snapshotted for undo), so a move is previewed from the original path and
+/// applied in one step in `on_pointer_up`.
 #[derive(Default)]
 pub struct SelectionTool {
     selected: Option<u64>,
@@ -399,10 +407,10 @@ impl Tool for SelectionTool {
 
     fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
         let board = ctx.screen_to_board(screen_pos);
-        let tolerance = SELECT_HIT_TOLERANCE_PX / ctx.camera.zoom;
+        let tolerance = SELECTION_CLICK_TOLERANCE_PX / ctx.camera.zoom;
 
-        // A handle on the *already*-selected element takes priority over re-hit-testing —
-        // clicking a handle resizes, it never re-selects/deselects.
+        // A handle on the *already*-selected element takes priority over everything below
+        // — clicking a handle resizes, it never re-selects/deselects/moves.
         if let Some(path) = &self.selected_path {
             let bbox = path.bounding_box();
             let handle = resize::handle_points(bbox)
@@ -424,6 +432,17 @@ impl Tool for SelectionTool {
                 });
                 self.drag = None;
                 self.dragging_path = None;
+                return;
+            }
+            // Not a handle — but anywhere inside the already-selected element's bounding
+            // box still grabs it to move, not just a click landing exactly on its outline.
+            // Makes an already-selected box an easy, forgiving drag target instead of a
+            // thin line you have to re-aim at.
+            if bbox.contains(Point::new(board.x, board.y)) {
+                self.drag = Some((path.clone(), board));
+                self.dragging_path = None;
+                self.resize = None;
+                self.dragging_font_size = None;
                 return;
             }
         }
@@ -686,7 +705,7 @@ impl GroupSelection {
     /// about to be drawn) and returns `false`.
     fn begin(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) -> bool {
         let board = ctx.screen_to_board(screen_pos);
-        let tolerance = SELECT_HIT_TOLERANCE_PX / ctx.camera.zoom;
+        let tolerance = SELECTION_CLICK_TOLERANCE_PX / ctx.camera.zoom;
         let hit_already_selected = ctx
             .scene
             .hit_test(board, tolerance)
