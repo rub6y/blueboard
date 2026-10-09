@@ -23,7 +23,13 @@ use crate::scene::{ElementKind, Scene};
 /// field, so per this format's existing strict-version stance (see the v1->v2 color bump
 /// above), it's rejected outright rather than migrated (no default-kind backfill code to
 /// maintain and potentially get wrong).
-const FORMAT_VERSION: u32 = 3;
+///
+/// Bumped to 4 for image elements (`ElementKind::Image`, a new trailing enum variant) —
+/// technically a v3 file would probably still decode fine (bincode encodes existing
+/// variants the same way regardless of new ones added after them), but bumped anyway for
+/// consistency with this format's existing policy of treating every `ElementKind` change
+/// as a deliberate version checkpoint, not something to rely on happening to work.
+const FORMAT_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct ElementDocument {
@@ -176,6 +182,39 @@ mod tests {
         original.sort_by_key(|(id, _, _)| *id);
         round_tripped.sort_by_key(|(id, _, _)| *id);
         assert_eq!(original, round_tripped);
+    }
+
+    #[test]
+    fn image_element_round_trips_with_its_pixels() {
+        use crate::scene::{ElementKind, ImageData};
+        use glam::DVec2;
+
+        let mut scene = Scene::new();
+        let rgba = vec![1u8, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+        let id = scene.add_image_element(
+            DVec2::new(10.0, 10.0),
+            [1.0, 1.0, 1.0],
+            ImageData {
+                rgba: rgba.clone(),
+                width: 2,
+                height: 2,
+            },
+        );
+
+        let path = temp_bbd_path("image-element-round-trips");
+        save(&scene, &path).expect("save should succeed");
+        let loaded = load(&path).expect("load should succeed");
+        std::fs::remove_file(&path).ok();
+
+        let element = loaded.element(id).expect("image element should round-trip");
+        match &element.kind {
+            ElementKind::Image(image) => {
+                assert_eq!(image.rgba, rgba);
+                assert_eq!(image.width, 2);
+                assert_eq!(image.height, 2);
+            }
+            _ => panic!("expected ElementKind::Image"),
+        }
     }
 
     #[test]

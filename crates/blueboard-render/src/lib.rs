@@ -385,24 +385,28 @@ fn fullscreen_quad_vertices(uv_scale: [f32; 2]) -> [TexVertex; 6] {
     ]
 }
 
-/// A board-space quad anchored at the origin, sized 1:1 to `(image_width, image_height)`
-/// pixels — `BackgroundMode::Image(ImageFit::ZoomWithCamera)`'s geometry, drawn through
-/// `vs_board_tex` so it transforms with the camera like any other board content.
-fn board_image_quad_vertices(image_width: f32, image_height: f32) -> [TexVertex; 6] {
+/// A board-space quad anchored at `origin`, sized 1:1 to `(image_width, image_height)`
+/// pixels — drawn through `vs_board_tex` so it transforms with the camera like any other
+/// board content. `BackgroundMode::Image(ImageFit::ZoomWithCamera)` calls this with
+/// `origin` fixed at the board's own origin (one single global background); per-element
+/// images (`ElementKind::Image`, in `render`) call it with each element's own bbox
+/// top-left instead.
+fn board_image_quad_vertices(origin: DVec2, image_width: f32, image_height: f32) -> [TexVertex; 6] {
+    let (ox, oy) = (origin.x as f32, origin.y as f32);
     let top_left = TexVertex {
-        position: [0.0, 0.0],
+        position: [ox, oy],
         uv: [0.0, 0.0],
     };
     let top_right = TexVertex {
-        position: [image_width, 0.0],
+        position: [ox + image_width, oy],
         uv: [1.0, 0.0],
     };
     let bottom_left = TexVertex {
-        position: [0.0, image_height],
+        position: [ox, oy + image_height],
         uv: [0.0, 1.0],
     };
     let bottom_right = TexVertex {
-        position: [image_width, image_height],
+        position: [ox + image_width, oy + image_height],
         uv: [1.0, 1.0],
     };
     [
@@ -1100,6 +1104,14 @@ pub struct Renderer {
     /// `blueboard-app` gave up on it) falls back to painting its raw literal text instead
     /// of an image — see `render`'s text-run resolution.
     math_textures: std::collections::HashMap<String, MathTexture>,
+    /// Pasted `ElementKind::Image` elements' uploaded textures, keyed by element id — set
+    /// by `set_element_texture` (`blueboard-app` calls it once per element: synchronously
+    /// at paste time for a fresh paste, or once per id via `ensure_image_textures` after
+    /// loading a saved board). An element not yet in here (its scene data exists but
+    /// hasn't been uploaded yet) simply isn't drawn that frame — never a crash, just a
+    /// one-frame gap that `ensure_image_textures` closes on the next redraw.
+    element_textures: std::collections::HashMap<u64, ElementTexture>,
+    image_quad_buffer: DynamicVertexBuffer,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     theme_bind_group: wgpu::BindGroup,
@@ -1132,6 +1144,13 @@ struct BackgroundImage {
     bind_group: wgpu::BindGroup,
     width: f32,
     height: f32,
+}
+
+/// One pasted image element's uploaded texture — see `Renderer::element_textures`'s doc
+/// comment. Structurally identical to `BackgroundImage`; kept as a separate type anyway
+/// since conceptually one is a single global slot and the other a per-element cache.
+struct ElementTexture {
+    bind_group: wgpu::BindGroup,
 }
 
 /// One compiled LaTeX math span, registered with `egui`'s own texture space (not the raw
@@ -1547,6 +1566,7 @@ impl Renderer {
         let colored_preview_buffer = DynamicVertexBuffer::new(&device, "colored preview vertices");
         let uniform_preview_buffer = DynamicVertexBuffer::new(&device, "uniform preview vertices");
         let background_quad_buffer = DynamicVertexBuffer::new(&device, "background quad vertices");
+        let image_quad_buffer = DynamicVertexBuffer::new(&device, "image element vertices");
 
         Self {
             surface,
@@ -1573,6 +1593,8 @@ impl Renderer {
             background_sampler,
             background_image: None,
             math_textures: std::collections::HashMap::new(),
+            element_textures: std::collections::HashMap::new(),
+            image_quad_buffer,
             background_quad_buffer,
             camera_buffer,
             camera_bind_group,
@@ -1642,6 +1664,46 @@ impl Renderer {
             width: width as f32,
             height: height as f32,
         });
+    }
+
+    /// Whether element `id` already has an uploaded texture — `ensure_image_textures`
+    /// (`blueboard-app`) checks this before bothering to re-upload an already-cached
+    /// image, e.g. on every frame after loading a board full of them.
+    pub fn has_element_texture(&self, id: u64) -> bool {
+        self.element_textures.contains_key(&id)
+    }
+
+    /// Uploads a pasted image element's pixels and registers them for the main board pass
+    /// (reusing the same texture bind-group layout/sampler `set_background_image` does —
+    /// both are plain camera-transformed-or-not textured quads, see `shader.wgsl`'s
+    /// background section). Called once per element: synchronously at paste time, or via
+    /// `ensure_image_textures` after loading a board that already has image elements.
+    pub fn set_element_texture(&mut self, id: u64, rgba: &[u8], width: u32, height: u32) {
+        let texture = upload_rgba_texture(
+            &self.device,
+            &self.queue,
+            rgba,
+            width,
+            height,
+            "image element",
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("image element bind group"),
+            layout: &self.background_texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.background_sampler),
+                },
+            ],
+        });
+        self.element_textures
+            .insert(id, ElementTexture { bind_group });
     }
 
     /// Parses `content` and resolves each `MathToken::Math` against `self.math_textures`
@@ -1806,9 +1868,15 @@ impl Renderer {
         // touch any element's path or color, only which ones are currently visible.
         let tolerance_bits = tessellation_tolerance.to_bits();
         let mut stroke_vertices = Vec::new();
-        // A `Text` element's `path` is only its bounding box, not a stroke outline (see
-        // `ElementKind`'s doc comment) — it's painted separately, through `egui`, below.
+        // A `Text`/`Image` element's `path` is only its bounding box, not a stroke
+        // outline (see `ElementKind`'s doc comment) — each is painted through its own
+        // separate path below, not tessellated as a stroke.
         let mut text_draws: Vec<SceneTextDraw> = Vec::new();
+        let mut image_quads: Vec<TexVertex> = Vec::new();
+        // (vertex start, vertex count, element id) per image — one draw call each, since
+        // each binds its own texture; built alongside `image_quads` so the vertex offsets
+        // line up once everything's uploaded as one combined buffer.
+        let mut image_draw_ranges: Vec<(u32, u32, u64)> = Vec::new();
         let editing_id = text_input.as_ref().and_then(|input| input.editing_id);
         for element in &visible_elements {
             if Some(element.id) == editing_id {
@@ -1817,50 +1885,76 @@ impl Renderer {
                 // doesn't render underneath/behind it. See `TextInputPreview::editing_id`.
                 continue;
             }
-            let ElementKind::Text { content, font_size } = &element.kind else {
-                let cache_hit = self
-                    .tessellation_cache
-                    .get(&element.id)
-                    .is_some_and(|cached| {
-                        cached.tolerance_bits == tolerance_bits
-                            && cached.color == element.color
-                            && cached.path == element.path
+            match &element.kind {
+                ElementKind::Text { content, font_size } => {
+                    let bbox = element.path.bounding_box();
+                    let top_left = DVec2::new(bbox.x0, bbox.y0);
+                    let screen = camera.board_to_screen(top_left, viewport_f64);
+                    text_draws.push(SceneTextDraw {
+                        screen_pos: egui::pos2(
+                            (screen.x / scale_factor as f64) as f32,
+                            (screen.y / scale_factor as f64) as f32,
+                        ),
+                        runs: self.resolve_text_runs(content),
+                        font_size_px: font_size * camera.zoom as f32 / scale_factor,
+                        color: color_to_color32(element.color),
                     });
-                if !cache_hit {
-                    let mut vertices = Vec::new();
-                    tessellate_colored_stroke(
-                        &element.path,
-                        element.color,
-                        STROKE_WIDTH,
-                        tessellation_tolerance,
-                        &mut vertices,
-                    );
-                    self.tessellation_cache.insert(
-                        element.id,
-                        CachedTessellation {
-                            path: element.path.clone(),
-                            color: element.color,
-                            tolerance_bits,
-                            vertices,
-                        },
-                    );
                 }
-                stroke_vertices.extend_from_slice(&self.tessellation_cache[&element.id].vertices);
-                continue;
-            };
-            let bbox = element.path.bounding_box();
-            let top_left = DVec2::new(bbox.x0, bbox.y0);
-            let screen = camera.board_to_screen(top_left, viewport_f64);
-            text_draws.push(SceneTextDraw {
-                screen_pos: egui::pos2(
-                    (screen.x / scale_factor as f64) as f32,
-                    (screen.y / scale_factor as f64) as f32,
-                ),
-                runs: self.resolve_text_runs(content),
-                font_size_px: font_size * camera.zoom as f32 / scale_factor,
-                color: color_to_color32(element.color),
-            });
+                ElementKind::Image(_) => {
+                    // Not yet uploaded (just loaded from a saved board, this frame) —
+                    // `ensure_image_textures` (`blueboard-app`) closes this gap on the
+                    // next redraw; nothing to draw this one.
+                    if self.element_textures.contains_key(&element.id) {
+                        let bbox = element.path.bounding_box();
+                        let top_left = DVec2::new(bbox.x0, bbox.y0);
+                        let width = (bbox.x1 - bbox.x0) as f32;
+                        let height = (bbox.y1 - bbox.y0) as f32;
+                        let quad = board_image_quad_vertices(top_left, width, height);
+                        let start = image_quads.len() as u32;
+                        image_quads.extend_from_slice(&quad);
+                        image_draw_ranges.push((start, quad.len() as u32, element.id));
+                    }
+                }
+                ElementKind::Stroke => {
+                    let cache_hit =
+                        self.tessellation_cache
+                            .get(&element.id)
+                            .is_some_and(|cached| {
+                                cached.tolerance_bits == tolerance_bits
+                                    && cached.color == element.color
+                                    && cached.path == element.path
+                            });
+                    if !cache_hit {
+                        let mut vertices = Vec::new();
+                        tessellate_colored_stroke(
+                            &element.path,
+                            element.color,
+                            STROKE_WIDTH,
+                            tessellation_tolerance,
+                            &mut vertices,
+                        );
+                        self.tessellation_cache.insert(
+                            element.id,
+                            CachedTessellation {
+                                path: element.path.clone(),
+                                color: element.color,
+                                tolerance_bits,
+                                vertices,
+                            },
+                        );
+                    }
+                    stroke_vertices
+                        .extend_from_slice(&self.tessellation_cache[&element.id].vertices);
+                }
+            }
         }
+        let image_vertex_count = upload_dynamic(
+            &mut self.image_quad_buffer,
+            &self.device,
+            &self.queue,
+            "image element vertices",
+            &image_quads,
+        );
         // The in-progress text element (if composing one), painted the same way — a "|"
         // inserted at `input.cursor` (not a real blinking caret, kept simple, see
         // `TextInputPreview`'s doc comment) so the arrow/Home/End keys' effect is visible.
@@ -1889,6 +1983,8 @@ impl Renderer {
         // Drops any id no longer in the scene (deleted, erased, undone-away) so the cache
         // doesn't grow unbounded over a long editing session.
         self.tessellation_cache
+            .retain(|id, _| scene.element(*id).is_some());
+        self.element_textures
             .retain(|id, _| scene.element(*id).is_some());
 
         let stroke_count = upload_dynamic(
@@ -2016,9 +2112,10 @@ impl Renderer {
                 None => BackgroundDraw::None,
                 Some(image) => {
                     let (quad, zoom_with_camera) = match fit {
-                        ImageFit::ZoomWithCamera => {
-                            (board_image_quad_vertices(image.width, image.height), true)
-                        }
+                        ImageFit::ZoomWithCamera => (
+                            board_image_quad_vertices(DVec2::ZERO, image.width, image.height),
+                            true,
+                        ),
                         ImageFit::Tile => {
                             let uv_scale = [
                                 self.config.width as f32 / image.width.max(1.0),
@@ -2109,6 +2206,20 @@ impl Renderer {
                 pass.set_pipeline(&self.colored_stroke_pipeline);
                 pass.set_vertex_buffer(0, self.stroke_buffer.buffer.slice(..));
                 pass.draw(0..stroke_count, 0..1);
+            }
+
+            if image_vertex_count > 0 {
+                // Reuses `BackgroundMode::Image(ImageFit::ZoomWithCamera)`'s own
+                // pipeline — both are camera-transformed textured quads, just this one's
+                // quad/bind-group vary per element instead of being a single global slot.
+                pass.set_pipeline(&self.background_image_zoom_pipeline);
+                pass.set_vertex_buffer(0, self.image_quad_buffer.buffer.slice(..));
+                for (start, count, id) in &image_draw_ranges {
+                    if let Some(texture) = self.element_textures.get(id) {
+                        pass.set_bind_group(3, &texture.bind_group, &[]);
+                        pass.draw(*start..*start + *count, 0..1);
+                    }
+                }
             }
 
             if colored_preview_count > 0 {

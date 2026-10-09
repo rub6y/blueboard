@@ -8,6 +8,9 @@ name = "blueboard"
 path = "src/main.rs"
 
 [dependencies]
+# OS clipboard image read for `:paste` falling back to an external image (no board
+# elements yanked) — see `commands.rs`'s `PasteCommand`.
+arboard = "3"
 blueboard-core = { path = "../blueboard-core" }
 blueboard-render = { path = "../blueboard-render" }
 # Only for constructing the handful of input events forwarded to the color picker (see

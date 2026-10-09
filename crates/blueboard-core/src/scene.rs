@@ -4,6 +4,7 @@
 //! rendering with no extra cases.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use glam::DVec2;
 use kurbo::{BezPath, ParamCurveNearest, Point, Shape as _};
@@ -11,6 +12,19 @@ use rstar::{RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
 
 use crate::history::Snapshot;
+
+/// A pasted image's decoded pixels — `Arc`'d (not a plain `Vec`) so copying an
+/// `ElementKind::Image` around (a `Snapshot`, a `:yank`'d clipboard entry) is a cheap
+/// pointer clone, never a pixel-buffer copy, the same concern `ElementKind::Text`'s own
+/// doc comment on `Snapshot` cost raised for images specifically back when only text
+/// existed. `rgba` is `4 * width * height` bytes, row-major, straight from the OS
+/// clipboard or a saved `.bbd` — never re-decoded from PNG/JPEG on this crate's side.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageData {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
 
 /// What kind of element this is — every kind still carries a `path` (see `Element::path`'s
 /// doc comment) so hit-testing, the R-tree index, and rendering's culling all stay
@@ -25,6 +39,12 @@ pub enum ElementKind {
     /// only at placement time — not stored pre-parsed). `path` is just this element's
     /// bounding-box rectangle, not a stroke outline.
     Text { content: String, font_size: f32 },
+    /// A pasted image. `path` is its bounding-box rectangle (1 board unit = 1 source
+    /// pixel at paste time — see `Scene::add_image_element`), resizable afterward like
+    /// any other element's bbox (`blueboard_core::resize`); unlike `Text`, there's no
+    /// separate "intrinsic size" field that also needs rescaling, since an image has no
+    /// analog to font size — the bbox *is* its only size.
+    Image(Arc<ImageData>),
 }
 
 pub struct Element {
@@ -130,6 +150,18 @@ impl Scene {
         let path = text_bbox_path(DVec2::new(bbox.x0, bbox.y0), &content, font_size);
         self.set_element_path_and_kind(id, path, ElementKind::Text { content, font_size });
         true
+    }
+
+    /// Adds an image element: `center` is where its bounding box's *center* lands (not its
+    /// top-left, unlike `add_text_element` — `:paste`'s own "recenter the pasted group's
+    /// combined bbox at the cursor" convention, applied to a single-element paste), sized
+    /// 1 board unit per source pixel. `color` isn't meaningful for an image (nothing reads
+    /// it) but `Element` still requires one; callers pass `DEFAULT_ELEMENT_COLOR`.
+    pub fn add_image_element(&mut self, center: DVec2, color: [f32; 3], image: ImageData) -> u64 {
+        let half = DVec2::new(image.width as f64, image.height as f64) / 2.0;
+        let top_left = center - half;
+        let path = image_bbox_path(top_left, image.width as f64, image.height as f64);
+        self.add_element_with_kind(path, color, ElementKind::Image(Arc::new(image)))
     }
 
     /// Inserts an element under a specific id rather than generating one — used when
@@ -322,11 +354,21 @@ impl Scene {
 fn text_bbox_path(top_left: DVec2, content: &str, font_size: f32) -> BezPath {
     let tokens = crate::text_markup::parse(content);
     let (width, height) = crate::text_markup::estimate_size(&tokens, font_size);
+    rect_path(top_left, width as f64, height as f64)
+}
+
+/// `ElementKind::Image`'s bounding-box path — same shape `text_bbox_path` builds, just
+/// without a font to measure first.
+fn image_bbox_path(top_left: DVec2, width: f64, height: f64) -> BezPath {
+    rect_path(top_left, width, height)
+}
+
+fn rect_path(top_left: DVec2, width: f64, height: f64) -> BezPath {
     let mut path = BezPath::new();
     path.move_to((top_left.x, top_left.y));
-    path.line_to((top_left.x + width as f64, top_left.y));
-    path.line_to((top_left.x + width as f64, top_left.y + height as f64));
-    path.line_to((top_left.x, top_left.y + height as f64));
+    path.line_to((top_left.x + width, top_left.y));
+    path.line_to((top_left.x + width, top_left.y + height));
+    path.line_to((top_left.x, top_left.y + height));
     path.close_path();
     path
 }

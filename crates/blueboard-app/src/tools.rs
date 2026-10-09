@@ -437,7 +437,7 @@ impl Tool for SelectionTool {
                     .and_then(|id| ctx.scene.element(id))
                     .and_then(|element| match &element.kind {
                         ElementKind::Text { font_size, .. } => Some(*font_size),
-                        ElementKind::Stroke => None,
+                        ElementKind::Stroke | ElementKind::Image(_) => None,
                     });
                 self.resize = Some(ResizeDrag {
                     handle,
@@ -508,7 +508,7 @@ impl Tool for SelectionTool {
                                     content: content.clone(),
                                     font_size,
                                 }),
-                                ElementKind::Stroke => None,
+                                ElementKind::Stroke | ElementKind::Image(_) => None,
                             })
                     }
                     _ => None,

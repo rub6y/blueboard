@@ -190,6 +190,7 @@ impl ApplicationHandler for App {
                     &mut self.status,
                     renderer,
                 );
+                ensure_image_textures(&self.scene, renderer);
                 let completions: Vec<blueboard_render::Completion> = if self.command_line_active {
                     let (_, candidates) = command_line_completions(
                         &self.command_line_text,
@@ -500,6 +501,25 @@ fn ensure_math_textures(
             Err(err) => {
                 log::warn!("failed to render LaTeX span {source:?}: {err}");
                 *status = Some((format!("latex: {err}"), true));
+            }
+        }
+    }
+}
+
+/// Uploads any `ElementKind::Image` element whose texture isn't already in the renderer's
+/// cache — unlike `ensure_math_textures`, this covers exactly one case: a board loaded via
+/// `:open` has image elements (with their pixels already in `Scene`'s own data, restored
+/// by `file_format::load`) but no GPU textures for them yet, since those are renderer-side
+/// state that was never saved/loaded. A freshly *pasted* image already got its texture
+/// uploaded synchronously at paste time (`commands.rs`'s `paste_external_image`), so this
+/// is a no-op for it by the time this next runs. Called once per `RedrawRequested`, cheap
+/// after the first pass since `Renderer::has_element_texture` makes every already-uploaded
+/// id a no-op `HashMap` lookup.
+fn ensure_image_textures(scene: &Scene, renderer: &mut Renderer) {
+    for element in scene.all_elements() {
+        if let blueboard_core::scene::ElementKind::Image(image) = &element.kind {
+            if !renderer.has_element_texture(element.id) {
+                renderer.set_element_texture(element.id, &image.rgba, image.width, image.height);
             }
         }
     }

@@ -283,16 +283,16 @@ impl Command for PasteCommand {
         "paste"
     }
 
+    /// `app.clipboard` (`:yank`'d board elements) wins if it's non-empty; otherwise falls
+    /// back to whatever image is on the *OS* clipboard (e.g. copied from a browser, a
+    /// screenshot tool) — one `Y` covers both "paste what I copied on the board" and
+    /// "paste what I copied outside it," rather than needing a second keybinding for the
+    /// external-image case.
     fn run(&self, app: &mut App, _args: &str) -> Result<String, String> {
+        let cursor_board = cursor_board_position(app)?;
         if app.clipboard.is_empty() {
-            return Err("clipboard is empty".to_string());
+            return paste_external_image(app, cursor_board);
         }
-        let Some(renderer) = app.renderer.as_ref() else {
-            return Err("renderer not ready yet".to_string());
-        };
-        let (width, height) = renderer.viewport_size();
-        let viewport = glam::DVec2::new(width as f64, height as f64);
-        let cursor_board = app.camera.screen_to_board(app.last_cursor, viewport);
 
         let mut combined: Option<kurbo::Rect> = None;
         for (path, _, _) in &app.clipboard {
@@ -302,8 +302,8 @@ impl Command for PasteCommand {
                 None => bbox,
             });
         }
-        // Unreachable in practice (the emptiness check above already returned), but keeps
-        // this free of an `.unwrap()`.
+        // Unreachable (the emptiness check above already returned), but keeps this free
+        // of an `.unwrap()`.
         let Some(combined) = combined else {
             return Err("clipboard is empty".to_string());
         };
@@ -323,6 +323,48 @@ impl Command for PasteCommand {
             .select_elements(&app.scene, &pasted_ids);
         Ok(format!("pasted {} element(s)", pasted_ids.len()))
     }
+}
+
+fn cursor_board_position(app: &App) -> Result<glam::DVec2, String> {
+    let Some(renderer) = app.renderer.as_ref() else {
+        return Err("renderer not ready yet".to_string());
+    };
+    let (width, height) = renderer.viewport_size();
+    let viewport = glam::DVec2::new(width as f64, height as f64);
+    Ok(app.camera.screen_to_board(app.last_cursor, viewport))
+}
+
+/// Reads an image off the *OS* clipboard (via `arboard`, already RGBA8 — no decode step
+/// needed, unlike `:background image <path>`'s file-based `image`-crate decode), pastes
+/// it centered at `cursor_board`, uploads its texture immediately (unlike `latex`'s
+/// deferred-to-next-redraw compile, this is cheap and synchronous — no process to spawn),
+/// and selects it, same as a board-object paste.
+fn paste_external_image(app: &mut App, cursor_board: glam::DVec2) -> Result<String, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| format!("clipboard unavailable: {err}"))?;
+    let image = clipboard
+        .get_image()
+        .map_err(|_| "clipboard is empty".to_string())?;
+    let (width, height) = (image.width as u32, image.height as u32);
+    let image_data = blueboard_core::scene::ImageData {
+        rgba: image.bytes.into_owned(),
+        width,
+        height,
+    };
+
+    let id = app.scene.add_image_element(
+        cursor_board,
+        blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+        image_data.clone(),
+    );
+    let Some(renderer) = app.renderer.as_mut() else {
+        return Err("renderer not ready yet".to_string());
+    };
+    renderer.set_element_texture(id, &image_data.rgba, width, height);
+    app.tools
+        .active_tool_mut()
+        .select_elements(&app.scene, &[id]);
+    Ok(format!("pasted image ({width}x{height})"))
 }
 
 /// Sets the color the pen and shape tools draw their next element in, or toggles the

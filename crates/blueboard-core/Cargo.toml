@@ -8,5 +8,5 @@ bincode = { version = "2", features = ["serde"] }
 glam = "0.34.1"
 kurbo = { version = "0.13.1", features = ["serde"] }
 rstar = "0.13.0"
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 zstd = "0.14.0"
