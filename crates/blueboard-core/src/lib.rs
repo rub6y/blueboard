@@ -7,5 +7,6 @@ pub mod fitting;
 mod geometry;
 pub mod history;
 pub mod lasso;
+pub mod resize;
 pub mod scene;
 pub mod text_markup;

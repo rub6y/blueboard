@@ -11,10 +11,11 @@ use blueboard_core::camera::Camera;
 use blueboard_core::erase;
 use blueboard_core::fitting::fit_stroke;
 use blueboard_core::lasso;
-use blueboard_core::scene::Scene;
+use blueboard_core::resize::{self, ResizeHandle};
+use blueboard_core::scene::{ElementKind, Scene};
 use blueboard_render::ScenePreview;
 use glam::DVec2;
-use kurbo::{Affine, BezPath, Shape as _};
+use kurbo::{Affine, BezPath, Point, Shape as _};
 
 /// How far (in screen pixels, at the zoom level the stroke was drawn at) the fitted curve
 /// is allowed to deviate from the raw pointer samples — see `planning/math.tex`'s curve
@@ -87,6 +88,15 @@ pub trait Tool {
     /// override it.
     fn delete_selection(&mut self, _scene: &mut Scene) -> bool {
         false
+    }
+
+    /// The single element this tool currently has selected, if any and if it only ever
+    /// has one (the group-select tools have *a* selection but not *a single element*, so
+    /// they stay at the `None` default) — used by `main.rs`'s Enter-to-edit-text gesture
+    /// to find what to re-open, without needing a general multi-element query no other
+    /// caller needs yet.
+    fn selected_element(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -344,13 +354,26 @@ const SELECT_HIT_TOLERANCE_PX: f64 = 6.0;
 /// safely commit to the scene itself (see `main.rs`'s tool-dispatch comment — only pointer
 /// down/up are snapshotted for undo), so a move is previewed from the original path and
 /// applied in one step in `on_pointer_up`.
+/// Captured at the pointer-down that started a resize gesture — everything needed to
+/// recompute the dragged path/font size fresh from the original each `on_pointer_move`,
+/// same anti-drift reasoning as `SelectionTool::drag` for a move.
+struct ResizeDrag {
+    handle: ResizeHandle,
+    original_path: BezPath,
+    original_bbox: kurbo::Rect,
+    /// `Some(font_size)` if the selected element is `ElementKind::Text` — resizing scales
+    /// it by the drag's geometric-mean scale factor alongside the bounding box; `None` for
+    /// every other kind, which only resizes geometrically.
+    original_font_size: Option<f32>,
+}
+
 #[derive(Default)]
 pub struct SelectionTool {
     selected: Option<u64>,
     /// The selected element's current path, kept in sync on select and after a committed
-    /// move. This exists so [`Tool::preview`] can show the selection box at rest, without
-    /// needing scene access — `preview`'s signature deliberately has none, see `tools.rs`'s
-    /// module doc comment on why `Tool` doesn't take `&mut App`.
+    /// move/resize. This exists so [`Tool::preview`] can show the selection box at rest,
+    /// without needing scene access — `preview`'s signature deliberately has none, see
+    /// `tools.rs`'s module doc comment on why `Tool` doesn't take `&mut App`.
     selected_path: Option<BezPath>,
     /// Set from pointer-down until release: the selected element's path *as it was when
     /// grabbed*, and the board-space point it was grabbed at. `on_pointer_move` always
@@ -360,6 +383,13 @@ pub struct SelectionTool {
     /// The in-progress dragged path, recomputed each `on_pointer_move`; `None` while not
     /// dragging, distinct from `selected_path` being `Some` but at rest.
     dragging_path: Option<BezPath>,
+    /// `Some` instead of `drag` while a resize-handle drag is in progress (the two are
+    /// mutually exclusive — a pointer-down either grabs a handle or doesn't).
+    resize: Option<ResizeDrag>,
+    /// The in-progress resized font size (only set when `resize.original_font_size` is
+    /// `Some`) — mirrors `dragging_path`'s "recomputed fresh each move, committed on up"
+    /// shape.
+    dragging_font_size: Option<f32>,
 }
 
 impl Tool for SelectionTool {
@@ -370,6 +400,34 @@ impl Tool for SelectionTool {
     fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
         let board = ctx.screen_to_board(screen_pos);
         let tolerance = SELECT_HIT_TOLERANCE_PX / ctx.camera.zoom;
+
+        // A handle on the *already*-selected element takes priority over re-hit-testing —
+        // clicking a handle resizes, it never re-selects/deselects.
+        if let Some(path) = &self.selected_path {
+            let bbox = path.bounding_box();
+            let handle = resize::handle_points(bbox)
+                .into_iter()
+                .find(|(_, point)| (board - DVec2::new(point.x, point.y)).length() <= tolerance);
+            if let Some((handle, _)) = handle {
+                let original_font_size = self
+                    .selected
+                    .and_then(|id| ctx.scene.element(id))
+                    .and_then(|element| match &element.kind {
+                        ElementKind::Text { font_size, .. } => Some(*font_size),
+                        ElementKind::Stroke => None,
+                    });
+                self.resize = Some(ResizeDrag {
+                    handle,
+                    original_path: path.clone(),
+                    original_bbox: bbox,
+                    original_font_size,
+                });
+                self.drag = None;
+                self.dragging_path = None;
+                return;
+            }
+        }
+
         self.selected = ctx.scene.hit_test(board, tolerance);
         self.selected_path = self
             .selected
@@ -377,17 +435,58 @@ impl Tool for SelectionTool {
             .map(|element| element.path.clone());
         self.drag = self.selected_path.clone().map(|path| (path, board));
         self.dragging_path = None;
+        self.resize = None;
+        self.dragging_font_size = None;
     }
 
     fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        let board = ctx.screen_to_board(screen_pos);
+        if let Some(resize) = &self.resize {
+            let new_bbox = resize::resized_rect(
+                resize.handle,
+                resize.original_bbox,
+                Point::new(board.x, board.y),
+            );
+            let affine = resize::scale_affine(resize.original_bbox, new_bbox);
+            self.dragging_path = Some(affine * &resize.original_path);
+            self.dragging_font_size = resize.original_font_size.map(|original| {
+                let factor = resize::uniform_scale_factor(resize.original_bbox, new_bbox);
+                (original as f64 * factor) as f32
+            });
+            return;
+        }
         let Some((original, grabbed_at)) = &self.drag else {
             return;
         };
-        let delta = ctx.screen_to_board(screen_pos) - *grabbed_at;
+        let delta = board - *grabbed_at;
         self.dragging_path = Some(Affine::translate((delta.x, delta.y)) * original);
     }
 
     fn on_pointer_up(&mut self, ctx: &mut ToolContext, _screen_pos: DVec2) {
+        if let (Some(id), Some(resize)) = (self.selected, self.resize.take()) {
+            if let Some(path) = self.dragging_path.take() {
+                let kind = match (resize.original_font_size, self.dragging_font_size.take()) {
+                    (Some(_), Some(font_size)) => {
+                        ctx.scene
+                            .element(id)
+                            .and_then(|element| match &element.kind {
+                                ElementKind::Text { content, .. } => Some(ElementKind::Text {
+                                    content: content.clone(),
+                                    font_size,
+                                }),
+                                ElementKind::Stroke => None,
+                            })
+                    }
+                    _ => None,
+                };
+                match kind {
+                    Some(kind) => ctx.scene.set_element_path_and_kind(id, path.clone(), kind),
+                    None => ctx.scene.set_element_path(id, path.clone()),
+                }
+                self.selected_path = Some(path);
+            }
+            return;
+        }
         if let (Some(id), Some(path)) = (self.selected, self.dragging_path.take()) {
             ctx.scene.set_element_path(id, path.clone());
             self.selected_path = Some(path);
@@ -397,7 +496,7 @@ impl Tool for SelectionTool {
 
     fn preview(&self) -> ScenePreview<'_> {
         match self.dragging_path.as_ref().or(self.selected_path.as_ref()) {
-            Some(path) => ScenePreview::Selection(path.bounding_box()),
+            Some(path) => ScenePreview::SelectionWithHandles(path.bounding_box()),
             None => ScenePreview::None,
         }
     }
@@ -409,7 +508,13 @@ impl Tool for SelectionTool {
         self.selected_path = None;
         self.drag = None;
         self.dragging_path = None;
+        self.resize = None;
+        self.dragging_font_size = None;
         scene.remove_element(id)
+    }
+
+    fn selected_element(&self) -> Option<u64> {
+        self.selected
     }
 }
 

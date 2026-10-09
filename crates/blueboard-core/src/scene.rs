@@ -95,19 +95,29 @@ impl Scene {
         content: String,
         font_size: f32,
     ) -> u64 {
-        let tokens = crate::text_markup::parse(&content);
-        let (width, height) = crate::text_markup::estimate_size(&tokens, font_size);
-        let mut path = BezPath::new();
-        path.move_to((top_left.x, top_left.y));
-        path.line_to((top_left.x + width as f64, top_left.y));
-        path.line_to((top_left.x + width as f64, top_left.y + height as f64));
-        path.line_to((top_left.x, top_left.y + height as f64));
-        path.close_path();
-
+        let path = text_bbox_path(top_left, &content, font_size);
         let id = self.next_id;
         self.next_id += 1;
         self.insert_element(id, path, color, ElementKind::Text { content, font_size });
         id
+    }
+
+    /// Updates an existing text element's content/font size, recomputing its bounding box
+    /// from the *same top-left corner* it already had (so editing a text element's words
+    /// doesn't make it jump) — used by the selection tool's edit-in-place, as opposed to
+    /// `add_text_element`'s fresh placement. No-op (returns `false`) if `id` isn't a
+    /// `Text` element.
+    pub fn set_text_content(&mut self, id: u64, content: String, font_size: f32) -> bool {
+        let Some(element) = self.elements.get(&id) else {
+            return false;
+        };
+        if !matches!(element.kind, ElementKind::Text { .. }) {
+            return false;
+        }
+        let bbox = element.path.bounding_box();
+        let path = text_bbox_path(DVec2::new(bbox.x0, bbox.y0), &content, font_size);
+        self.set_element_path_and_kind(id, path, ElementKind::Text { content, font_size });
+        true
     }
 
     /// Inserts an element under a specific id rather than generating one — used when
@@ -162,15 +172,26 @@ impl Scene {
     /// removed and reinserted rather than mutated, since a move changes the bounding box
     /// the old entry was indexed under.
     pub fn set_element_path(&mut self, id: u64, path: BezPath) {
-        // A move doesn't change what color/kind the element was, or its text content if
-        // it's a text element — read both back from the existing entry (falling back to
-        // defaults for an id that, degenerately, doesn't exist yet) rather than letting
-        // `insert_element` reset them.
-        let (color, kind) = self
+        // A move doesn't change what kind/content the element was — read it back from the
+        // existing entry rather than letting `set_element_path_and_kind` reset it to the
+        // `Stroke` default for an id that, degenerately, doesn't exist yet.
+        let kind = self
             .elements
             .get(&id)
-            .map(|element| (element.color, element.kind.clone()))
-            .unwrap_or((DEFAULT_ELEMENT_COLOR, ElementKind::Stroke));
+            .map(|element| element.kind.clone())
+            .unwrap_or(ElementKind::Stroke);
+        self.set_element_path_and_kind(id, path, kind);
+    }
+
+    /// Like [`Scene::set_element_path`], but also replaces `kind` — used by resize, which
+    /// (for a text element) scales `font_size` alongside the bounding box, not just moves
+    /// the path. Color is still preserved from the existing entry either way.
+    pub fn set_element_path_and_kind(&mut self, id: u64, path: BezPath, kind: ElementKind) {
+        let color = self
+            .elements
+            .get(&id)
+            .map(|element| element.color)
+            .unwrap_or(DEFAULT_ELEMENT_COLOR);
         if let Some(old) = self.elements.get(&id) {
             let old_bbox = old.path.bounding_box();
             let old_envelope =
@@ -279,6 +300,23 @@ impl Scene {
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
     }
+}
+
+/// A closed rectangle `BezPath` sized via `text_markup::estimate_size`, anchored with its
+/// top-left corner at `top_left` — the bounding-box path every `Text` element uses in
+/// place of a real stroke outline (see `ElementKind::Text`'s doc comment). Shared by
+/// `add_text_element` (a fresh placement) and `set_text_content` (re-editing in place, same
+/// top-left as before).
+fn text_bbox_path(top_left: DVec2, content: &str, font_size: f32) -> BezPath {
+    let tokens = crate::text_markup::parse(content);
+    let (width, height) = crate::text_markup::estimate_size(&tokens, font_size);
+    let mut path = BezPath::new();
+    path.move_to((top_left.x, top_left.y));
+    path.line_to((top_left.x + width as f64, top_left.y));
+    path.line_to((top_left.x + width as f64, top_left.y + height as f64));
+    path.line_to((top_left.x, top_left.y + height as f64));
+    path.close_path();
+    path
 }
 
 #[cfg(test)]

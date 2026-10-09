@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use blueboard_core::camera::Camera;
 use blueboard_core::history::History;
-use blueboard_core::scene::Scene;
+use blueboard_core::scene::{ElementKind, Scene};
 use blueboard_render::{CommandBarContent, Frame, GridSettings, RenderOutcome, Renderer};
 use glam::DVec2;
+use kurbo::Shape as _;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -95,6 +96,17 @@ struct App {
     /// Board-space point the in-progress text element's top-left corner will be placed at
     /// — captured from the click that started composing.
     text_input_board_pos: DVec2,
+    /// Font size the in-progress text element will commit at — `tools::
+    /// DEFAULT_TEXT_FONT_SIZE` for a fresh placement, or the existing element's own font
+    /// size when re-editing one (see `text_input_editing_id`), so re-editing doesn't reset
+    /// a size the user may have resized via the selection tool's handles.
+    text_input_font_size: f64,
+    /// `Some(id)` while the in-progress composition is *editing an existing* text element
+    /// (entered via the selection tool's Enter-to-edit) rather than placing a brand new
+    /// one — committing then calls `Scene::set_text_content` on this id instead of
+    /// `add_text_element`, and committing to an empty string deletes it. Always `None`
+    /// when `text_input_active` is `false`.
+    text_input_editing_id: Option<u64>,
     /// Math spans (`text_markup::MathToken::Math`'s source string) already handed to
     /// `latex::render_math` this session, success or failure — gates `ensure_math_textures`
     /// so a broken formula isn't recompiled every single frame. Cleared for nothing: a
@@ -222,7 +234,7 @@ impl ApplicationHandler for App {
                             board_pos: self.text_input_board_pos,
                             content: &self.text_input_text,
                             cursor: self.text_input_cursor,
-                            font_size: tools::DEFAULT_TEXT_FONT_SIZE as f32,
+                            font_size: self.text_input_font_size as f32,
                             color: text_input_color,
                         }
                     }),
@@ -272,6 +284,8 @@ impl ApplicationHandler for App {
                         self.text_input_active = true;
                         self.text_input_text.clear();
                         self.text_input_cursor = 0;
+                        self.text_input_font_size = tools::DEFAULT_TEXT_FONT_SIZE;
+                        self.text_input_editing_id = None;
                     }
                     window.request_redraw();
                     return;
@@ -500,21 +514,39 @@ impl App {
                     let content = std::mem::take(&mut self.text_input_text);
                     self.text_input_active = false;
                     self.text_input_cursor = 0;
-                    if !content.trim().is_empty() {
-                        let before = self.scene.snapshot();
-                        self.scene.add_text_element(
-                            self.text_input_board_pos,
-                            self.current_color,
-                            content,
-                            tools::DEFAULT_TEXT_FONT_SIZE as f32,
-                        );
-                        self.history.record(before, &self.scene);
+                    let editing_id = self.text_input_editing_id.take();
+                    let before = self.scene.snapshot();
+                    match (editing_id, content.trim().is_empty()) {
+                        (Some(id), true) => {
+                            // Edited down to nothing: delete rather than leave an
+                            // unchanged stale element behind — matches "clearing a text
+                            // field's content and confirming" in most editors.
+                            self.scene.remove_element(id);
+                        }
+                        (Some(id), false) => {
+                            self.scene.set_text_content(
+                                id,
+                                content,
+                                self.text_input_font_size as f32,
+                            );
+                        }
+                        (None, true) => {}
+                        (None, false) => {
+                            self.scene.add_text_element(
+                                self.text_input_board_pos,
+                                self.current_color,
+                                content,
+                                self.text_input_font_size as f32,
+                            );
+                        }
                     }
+                    self.history.record(before, &self.scene);
                 }
                 Key::Named(NamedKey::Escape) => {
                     self.text_input_active = false;
                     self.text_input_text.clear();
                     self.text_input_cursor = 0;
+                    self.text_input_editing_id = None;
                 }
                 Key::Named(NamedKey::Backspace) => {
                     text_edit::backspace(&mut self.text_input_text, &mut self.text_input_cursor);
@@ -626,6 +658,26 @@ impl App {
         } else {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => event_loop.exit(),
+                // Re-opens the selection tool's currently-selected text element for
+                // editing, in the same composing UI `tool text`'s click-to-place uses —
+                // see `tools::Tool::selected_element`'s doc comment on why this needs that
+                // query instead of reaching into `SelectionTool` directly.
+                Key::Named(NamedKey::Enter) => {
+                    if let Some(id) = self.tools.active_tool().selected_element() {
+                        if let Some(element) = self.scene.element(id) {
+                            if let ElementKind::Text { content, font_size } = &element.kind {
+                                let bbox = element.path.bounding_box();
+                                self.text_input_board_pos = DVec2::new(bbox.x0, bbox.y0);
+                                self.text_input_text = content.clone();
+                                self.text_input_cursor = self.text_input_text.chars().count();
+                                self.text_input_font_size = *font_size as f64;
+                                self.text_input_editing_id = Some(id);
+                                self.text_input_active = true;
+                                window.request_redraw();
+                            }
+                        }
+                    }
+                }
                 Key::Character(text) if text.as_str() == ":" => {
                     self.command_line_active = true;
                     self.command_line_text.clear();

@@ -207,6 +207,12 @@ pub enum ScenePreview<'a> {
     /// as a plain outline (not tessellated like `Path`) so it reads as "this is marked,"
     /// not as content on the board.
     Selection(kurbo::Rect),
+    /// The single-selection tool's indicator, with drag handles at each corner/edge
+    /// midpoint — see `blueboard_core::resize`'s doc comment for the shared geometry.
+    /// Distinct from plain `Selection` (used by the group-select tools, which don't offer
+    /// resize) so the handle affordance doesn't show up where there's no resize gesture
+    /// to go with it.
+    SelectionWithHandles(kurbo::Rect),
     /// Either eraser's cursor: a board-space circle outline showing what's about to be
     /// erased (and, for the partial eraser, exactly how big a bite the next erase will
     /// take) — same plain-outline treatment as `Selection`.
@@ -701,6 +707,31 @@ fn selection_rect_vertices(rect: kurbo::Rect) -> Vec<Vertex> {
                     position: corners[(i + 1) % 4],
                 },
             ]
+        })
+        .collect()
+}
+
+/// Screen-space half-size of each resize-handle square — converted to board-space via
+/// `zoom` (see `selection_handle_vertices`) so handles stay a usable, constant size
+/// regardless of zoom level, unlike the selection rect itself.
+const HANDLE_HALF_SIZE_PX: f64 = 4.0;
+
+/// Build eight small square outlines (`LineList` segments), one at each corner/edge
+/// midpoint of `rect` — `ScenePreview::SelectionWithHandles`'s resize-handle affordance.
+/// Handle positions come from `blueboard_core::resize::handle_points`, the same geometry
+/// `blueboard-app`'s hit-testing uses, so a drawn handle and a clickable one never drift
+/// apart.
+fn selection_handle_vertices(rect: kurbo::Rect, zoom: f64) -> Vec<Vertex> {
+    let half = HANDLE_HALF_SIZE_PX / zoom;
+    blueboard_core::resize::handle_points(rect)
+        .into_iter()
+        .flat_map(|(_, center)| {
+            selection_rect_vertices(kurbo::Rect::new(
+                center.x - half,
+                center.y - half,
+                center.x + half,
+                center.y + half,
+            ))
         })
         .collect()
 }
@@ -1882,6 +1913,10 @@ impl Renderer {
             }
             ScenePreview::Selection(rect) => {
                 uniform_preview_vertices = selection_rect_vertices(rect);
+            }
+            ScenePreview::SelectionWithHandles(rect) => {
+                uniform_preview_vertices = selection_rect_vertices(rect);
+                uniform_preview_vertices.extend(selection_handle_vertices(rect, camera.zoom));
             }
             ScenePreview::EraseCursor { center, radius } => {
                 uniform_preview_vertices = erase_cursor_vertices(center, radius);
