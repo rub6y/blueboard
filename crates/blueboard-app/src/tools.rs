@@ -134,6 +134,7 @@ impl ToolRegistry {
             Box::new(ShapeTool::ellipse()),
             Box::new(ShapeTool::line()),
             Box::new(TextTool),
+            Box::new(MagicWindowTool::default()),
             Box::new(SelectionTool::default()),
             Box::new(EraserTool::default()),
             Box::new(EraserObjectTool::default()),
@@ -437,7 +438,9 @@ impl Tool for SelectionTool {
                     .and_then(|id| ctx.scene.element(id))
                     .and_then(|element| match &element.kind {
                         ElementKind::Text { font_size, .. } => Some(*font_size),
-                        ElementKind::Stroke | ElementKind::Image(_) => None,
+                        ElementKind::Stroke
+                        | ElementKind::Image(_)
+                        | ElementKind::MagicWindow { .. } => None,
                     });
                 self.resize = Some(ResizeDrag {
                     handle,
@@ -521,7 +524,9 @@ impl Tool for SelectionTool {
                                     content: content.clone(),
                                     font_size,
                                 }),
-                                ElementKind::Stroke | ElementKind::Image(_) => None,
+                                ElementKind::Stroke
+                                | ElementKind::Image(_)
+                                | ElementKind::MagicWindow { .. } => None,
                             })
                     }
                     _ => None,
@@ -669,6 +674,69 @@ impl Tool for TextTool {
 /// comparable in scale to `STROKE_WIDTH` being a few board units, 24 reads as a normal
 /// body-text size at 100% zoom.
 pub const DEFAULT_TEXT_FONT_SIZE: f64 = 24.0;
+
+/// Shell command a freshly drawn magic window spawns — see `ElementKind::MagicWindow`'s
+/// doc comment on why only this string, not a live process, lives in the scene.
+pub const DEFAULT_MAGIC_WINDOW_SHELL: &str = "bash";
+
+/// Drag-to-draw a magic-window rect, same gesture shape as `ShapeTool`'s rect — commits an
+/// `ElementKind::MagicWindow` placeholder on release; spawning the actual shell happens
+/// later, in `main.rs`'s `ensure_live_terminals` (same "commit the element, let a per-frame
+/// `ensure_*` step catch up the runtime-only state" split `ElementKind::Image` already
+/// uses for GPU textures).
+#[derive(Default)]
+pub struct MagicWindowTool {
+    drag_start: Option<DVec2>,
+    drag_current: Option<DVec2>,
+}
+
+impl Tool for MagicWindowTool {
+    fn name(&self) -> &'static str {
+        "magic-window"
+    }
+
+    fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        let board = ctx.screen_to_board(screen_pos);
+        self.drag_start = Some(board);
+        self.drag_current = Some(board);
+    }
+
+    fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        if self.drag_start.is_some() {
+            self.drag_current = Some(ctx.screen_to_board(screen_pos));
+        }
+    }
+
+    fn on_pointer_up(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
+        let Some(start) = self.drag_start.take() else {
+            return;
+        };
+        let end = ctx.screen_to_board(screen_pos);
+        self.drag_current = None;
+        let top_left = DVec2::new(start.x.min(end.x), start.y.min(end.y));
+        let size = (end - start).abs();
+        if size.x < 10.0 || size.y < 10.0 {
+            return; // too small a drag to mean "place a window here"
+        }
+        ctx.scene.add_magic_window_element(
+            top_left,
+            size.x,
+            size.y,
+            DEFAULT_MAGIC_WINDOW_SHELL.to_string(),
+            ctx.color,
+        );
+    }
+
+    fn preview(&self) -> ScenePreview<'_> {
+        match (self.drag_start, self.drag_current) {
+            (Some(start), Some(current)) => ScenePreview::Selection(kurbo::Rect::from_points(
+                (start.x, start.y),
+                (current.x, current.y),
+            )),
+            _ => ScenePreview::None,
+        }
+    }
+}
 
 /// Whole-object eraser: removes entire elements it passes over, via the same
 /// `hit_test`-by-outline `SelectionTool` uses to pick a click target, except every

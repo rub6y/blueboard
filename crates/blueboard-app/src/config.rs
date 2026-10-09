@@ -47,6 +47,7 @@ fn default_keybindings() -> HashMap<String, String> {
         ("e", "tool ellipse"),
         ("l", "tool line"),
         ("t", "tool text"),
+        ("m", "tool magic-window"),
         ("v", "tool select"),
         ("x", "tool eraser"),
         ("d", "delete"),

@@ -13,7 +13,7 @@ use blueboard_core::history::History;
 use blueboard_core::scene::{ElementKind, Scene};
 use blueboard_render::{CommandBarContent, Frame, GridSettings, RenderOutcome, Renderer};
 use glam::DVec2;
-use kurbo::{BezPath, Shape as _};
+use kurbo::{BezPath, Point, Shape as _};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -27,6 +27,7 @@ mod config;
 mod latex;
 mod logging;
 mod macros;
+mod terminal;
 mod text_edit;
 mod tools;
 
@@ -117,6 +118,16 @@ struct App {
     /// triples, not ids: a paste creates fresh elements with new ids, the originals are
     /// untouched. Replaced wholesale by the next `:yank`, not merged into.
     clipboard: Vec<(BezPath, [f32; 3], ElementKind)>,
+    /// Magic windows' live process/PTY/parsed-grid state, keyed by element id — see
+    /// `ElementKind::MagicWindow`'s doc comment on why this lives here, not in `Scene`.
+    /// Populated by `ensure_live_terminals` (once per redraw) for any `MagicWindow`
+    /// element missing an entry; dropped (killing the child) when the element is deleted
+    /// — see `ensure_live_terminals`'s own doc comment.
+    live_terminals: std::collections::HashMap<u64, terminal::LiveTerminal>,
+    /// The magic window currently receiving keyboard input, if any — set by clicking
+    /// inside one, cleared by Escape or clicking elsewhere (`handle_key_press`'s
+    /// top-priority branch, and `MouseInput`'s focus-check, mirror this same shape).
+    focused_terminal: Option<u64>,
     /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
     /// `config.toml`. Loaded once at startup in `main()`.
@@ -191,6 +202,7 @@ impl ApplicationHandler for App {
                     renderer,
                 );
                 ensure_image_textures(&self.scene, renderer);
+                ensure_live_terminals(&self.scene, &mut self.live_terminals, &mut self.status);
                 let completions: Vec<blueboard_render::Completion> = if self.command_line_active {
                     let (_, candidates) = command_line_completions(
                         &self.command_line_text,
@@ -223,6 +235,21 @@ impl ApplicationHandler for App {
                 let active_tool_name = self.tools.active_tool().name();
                 // Captured before `color_picker`'s mutable borrow of `current_color`
                 // below, since the text-input preview also needs to read it.
+                let terminal_draws: Vec<blueboard_render::TerminalDraw> = self
+                    .scene
+                    .all_elements()
+                    .filter_map(|element| {
+                        if !matches!(element.kind, ElementKind::MagicWindow { .. }) {
+                            return None;
+                        }
+                        let live = self.live_terminals.get(&element.id)?;
+                        let bbox = element.path.bounding_box();
+                        Some(blueboard_render::TerminalDraw {
+                            board_rect: bbox,
+                            lines: live.lines(),
+                        })
+                    })
+                    .collect();
                 let text_input_color = self.current_color;
                 let color_picker = self.color_picker_open.then_some(&mut self.current_color);
 
@@ -244,6 +271,7 @@ impl ApplicationHandler for App {
                             editing_id: self.text_input_editing_id,
                         }
                     }),
+                    terminal_draws: &terminal_draws,
                     color_picker,
                     scale_factor,
                 }) {
@@ -274,6 +302,31 @@ impl ApplicationHandler for App {
                     });
                     window.request_redraw();
                     return;
+                }
+
+                // Clicking inside a magic window focuses it (all further keystrokes route
+                // to its shell — see `handle_key_press`'s top-priority branch); clicking
+                // outside one while a magic window is focused un-focuses it and falls
+                // through to normal dispatch for this click, same as `tool text`'s
+                // one-mode-owns-input-at-a-time shape.
+                if state == ElementState::Pressed {
+                    let (width, height) = renderer.viewport_size();
+                    let viewport = DVec2::new(width as f64, height as f64);
+                    let board = self.camera.screen_to_board(self.last_cursor, viewport);
+                    let hit = self.scene.all_elements().find(|element| {
+                        matches!(element.kind, ElementKind::MagicWindow { .. })
+                            && element
+                                .path
+                                .bounding_box()
+                                .contains(Point::new(board.x, board.y))
+                    });
+                    if let Some(element) = hit {
+                        self.focused_terminal = Some(element.id);
+                        window.request_redraw();
+                        return;
+                    } else if self.focused_terminal.take().is_some() {
+                        window.request_redraw();
+                    }
                 }
 
                 // The text tool's only interaction is "click to place, then type" — see
@@ -515,6 +568,40 @@ fn ensure_math_textures(
 /// is a no-op for it by the time this next runs. Called once per `RedrawRequested`, cheap
 /// after the first pass since `Renderer::has_element_texture` makes every already-uploaded
 /// id a no-op `HashMap` lookup.
+/// Spawns a shell for any `MagicWindow` element without a `live_terminals` entry yet
+/// (freshly drawn, or — since the live process is never saved — reopened from a file) and
+/// pumps every live one's PTY output into its grid. Also drops any entry whose element no
+/// longer exists (deleted/erased/undone-away), which kills its child process via
+/// `LiveTerminal`'s `Drop`. Called once per `RedrawRequested`, mirroring `ensure_math_
+/// textures`/`ensure_image_textures`'s own "catch up runtime-only state" shape.
+fn ensure_live_terminals(
+    scene: &Scene,
+    live_terminals: &mut std::collections::HashMap<u64, terminal::LiveTerminal>,
+    status: &mut Option<(String, bool)>,
+) {
+    live_terminals.retain(|id, _| scene.element(*id).is_some());
+    for element in scene.all_elements() {
+        if let blueboard_core::scene::ElementKind::MagicWindow { shell } = &element.kind {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                live_terminals.entry(element.id)
+            {
+                match terminal::LiveTerminal::spawn(shell) {
+                    Ok(live) => {
+                        entry.insert(live);
+                    }
+                    Err(err) => {
+                        log::warn!("failed to spawn magic window shell {shell:?}: {err}");
+                        *status = Some((format!("magic window: {err}"), true));
+                    }
+                }
+            }
+        }
+    }
+    for live in live_terminals.values_mut() {
+        live.pump();
+    }
+}
+
 fn ensure_image_textures(scene: &Scene, renderer: &mut Renderer) {
     for element in scene.all_elements() {
         if let blueboard_core::scene::ElementKind::Image(image) = &element.kind {
@@ -532,6 +619,36 @@ impl App {
         let Some(window) = self.window.clone() else {
             return;
         };
+
+        if let Some(id) = self.focused_terminal {
+            if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                self.focused_terminal = None;
+            } else if let Some(live) = self.live_terminals.get_mut(&id) {
+                // A small, not remotely exhaustive key-to-bytes mapping — enough for
+                // ordinary shell use (typing, Enter, Backspace, arrows), not full
+                // terminal-input fidelity (no Ctrl-key combos, no function keys). Matches
+                // this module's own "basic subset" scope.
+                match &event.logical_key {
+                    Key::Named(NamedKey::Enter) => live.write_input(b"\r"),
+                    Key::Named(NamedKey::Backspace) => live.write_input(&[0x7f]),
+                    Key::Named(NamedKey::Tab) => live.write_input(b"\t"),
+                    Key::Named(NamedKey::ArrowUp) => live.write_input(b"\x1b[A"),
+                    Key::Named(NamedKey::ArrowDown) => live.write_input(b"\x1b[B"),
+                    Key::Named(NamedKey::ArrowRight) => live.write_input(b"\x1b[C"),
+                    Key::Named(NamedKey::ArrowLeft) => live.write_input(b"\x1b[D"),
+                    _ => {
+                        if let Some(text) = &event.text {
+                            let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                            if !typed.is_empty() {
+                                live.write_input(typed.as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+            window.request_redraw();
+            return;
+        }
 
         if self.text_input_active {
             match &event.logical_key {

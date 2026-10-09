@@ -29,6 +29,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 kurbo = "0.13.1"
 log = { version = "0.4.34", features = ["std"] }
 pollster = "1.0.1"
+# Spawns the real shell behind a magic window (`terminal.rs`); `vte` parses its output
+# (just the ANSI/VT escape-sequence state machine, not a full terminal emulator like
+# `alacritty_terminal` — deliberately minimal, see `terminal.rs`'s doc comment).
+portable-pty = "0.9"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.7"
+vte = "0.15"
 winit = "0.30.13"

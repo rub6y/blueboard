@@ -29,7 +29,7 @@ use crate::scene::{ElementKind, Scene};
 /// variants the same way regardless of new ones added after them), but bumped anyway for
 /// consistency with this format's existing policy of treating every `ElementKind` change
 /// as a deliberate version checkpoint, not something to rely on happening to work.
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 struct ElementDocument {

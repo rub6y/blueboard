@@ -45,6 +45,13 @@ pub enum ElementKind {
     /// separate "intrinsic size" field that also needs rescaling, since an image has no
     /// analog to font size — the bbox *is* its only size.
     Image(Arc<ImageData>),
+    /// A magic window: an embedded shell inside this rect. `shell` is just the command to
+    /// run (e.g. `"bash"`) — deliberately the *only* thing persisted. The live process/PTY
+    /// is runtime-only state owned by `blueboard-app` (`terminal.rs`'s `LiveTerminal`,
+    /// keyed by element id, outside `Scene` entirely), never saved and never
+    /// auto-respawned just because a saved board gets reopened — same "what's saved vs.
+    /// what's rebuilt" split the R-tree index already has.
+    MagicWindow { shell: String },
 }
 
 pub struct Element {
@@ -162,6 +169,20 @@ impl Scene {
         let top_left = center - half;
         let path = image_bbox_path(top_left, image.width as f64, image.height as f64);
         self.add_element_with_kind(path, color, ElementKind::Image(Arc::new(image)))
+    }
+
+    /// Adds a magic-window placeholder rect — see `ElementKind::MagicWindow`'s doc
+    /// comment for why this is just the rect + shell command, no live process here.
+    pub fn add_magic_window_element(
+        &mut self,
+        top_left: DVec2,
+        width: f64,
+        height: f64,
+        shell: String,
+        color: [f32; 3],
+    ) -> u64 {
+        let path = image_bbox_path(top_left, width, height);
+        self.add_element_with_kind(path, color, ElementKind::MagicWindow { shell })
     }
 
     /// Inserts an element under a specific id rather than generating one — used when
