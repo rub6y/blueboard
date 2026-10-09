@@ -106,6 +106,13 @@ pub trait Tool {
     fn selected_elements(&self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// Replaces whatever this tool currently has selected with `ids` — used by
+    /// `PasteCommand` (`commands.rs`) to select the freshly pasted elements, so they're
+    /// immediately draggable without an extra click. No-op default; overridden by
+    /// `select`/`select-rect`/`select-lasso`, the same tools [`Tool::selected_elements`]
+    /// covers.
+    fn select_elements(&mut self, _scene: &Scene, _ids: &[u64]) {}
 }
 
 pub struct ToolRegistry {
@@ -547,6 +554,18 @@ impl Tool for SelectionTool {
     fn selected_elements(&self) -> Vec<u64> {
         self.selected.into_iter().collect()
     }
+
+    fn select_elements(&mut self, scene: &Scene, ids: &[u64]) {
+        self.selected = ids.first().copied();
+        self.selected_path = self
+            .selected
+            .and_then(|id| scene.element(id))
+            .map(|element| element.path.clone());
+        self.drag = None;
+        self.dragging_path = None;
+        self.resize = None;
+        self.dragging_font_size = None;
+    }
 }
 
 /// Screen-space radius (converted to board-space the same way as every other tolerance in
@@ -756,14 +775,10 @@ impl GroupSelection {
 
     /// Replaces the selection with `ids`, reading each one's current path from the scene
     /// — how a freshly-drawn marquee/lasso region becomes the new selection.
-    fn set_selected(&mut self, ctx: &ToolContext, ids: Vec<u64>) {
+    fn set_selected(&mut self, scene: &Scene, ids: Vec<u64>) {
         self.selected_paths = ids
             .iter()
-            .filter_map(|&id| {
-                ctx.scene
-                    .element(id)
-                    .map(|element| (id, element.path.clone()))
-            })
+            .filter_map(|&id| scene.element(id).map(|element| (id, element.path.clone())))
             .collect();
         self.selected = ids;
     }
@@ -848,7 +863,7 @@ impl Tool for SelectRectTool {
             .elements_in_viewport(min, max)
             .map(|e| e.id)
             .collect();
-        self.group.set_selected(ctx, ids);
+        self.group.set_selected(ctx.scene, ids);
     }
 
     fn preview(&self) -> ScenePreview<'_> {
@@ -867,6 +882,10 @@ impl Tool for SelectRectTool {
 
     fn selected_elements(&self) -> Vec<u64> {
         self.group.selected.clone()
+    }
+
+    fn select_elements(&mut self, scene: &Scene, ids: &[u64]) {
+        self.group.set_selected(scene, ids.to_vec());
     }
 }
 
@@ -928,7 +947,7 @@ impl Tool for SelectLassoTool {
         }
         self.drawing = false;
         let ids = lasso::elements_touching_loop(ctx.scene, &self.loop_points);
-        self.group.set_selected(ctx, ids);
+        self.group.set_selected(ctx.scene, ids);
         self.loop_points.clear();
     }
 
@@ -951,5 +970,9 @@ impl Tool for SelectLassoTool {
 
     fn selected_elements(&self) -> Vec<u64> {
         self.group.selected.clone()
+    }
+
+    fn select_elements(&mut self, scene: &Scene, ids: &[u64]) {
+        self.group.set_selected(scene, ids.to_vec());
     }
 }

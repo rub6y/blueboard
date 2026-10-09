@@ -312,10 +312,16 @@ impl Command for PasteCommand {
         let affine = kurbo::Affine::translate((delta.x, delta.y));
 
         let clipboard = app.clipboard.clone();
-        for (path, color, kind) in clipboard {
-            app.scene.add_element_with_kind(affine * path, color, kind);
-        }
-        Ok(format!("pasted {} element(s)", app.clipboard.len()))
+        let pasted_ids: Vec<u64> = clipboard
+            .into_iter()
+            .map(|(path, color, kind)| app.scene.add_element_with_kind(affine * path, color, kind))
+            .collect();
+        // Selected right away so the paste is immediately draggable (e.g. to nudge it
+        // somewhere exact) without an extra click to select it first.
+        app.tools
+            .active_tool_mut()
+            .select_elements(&app.scene, &pasted_ids);
+        Ok(format!("pasted {} element(s)", pasted_ids.len()))
     }
 }
 
