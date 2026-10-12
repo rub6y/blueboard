@@ -17,6 +17,20 @@ const NAMED_COLORS: &[(&str, [f32; 3])] = &[
     ("grey", [0.6, 0.6, 0.6]),
 ];
 
+/// [`NAMED_COLORS`]' names starting with `prefix` — the "recommended/default colors" the
+/// command line's completion offers for `:color`/`:background color`/`:background
+/// gradient`'s hex-ish arguments, shared so all three present the same list. Matching is
+/// plain-prefix (not `parse_color`'s case-insensitive exact match), consistent with every
+/// other completion in this module — names are stored lowercase and typed lowercase in
+/// practice.
+pub fn name_completions(prefix: &str) -> Vec<(&'static str, &'static str)> {
+    NAMED_COLORS
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .map(|&(name, _)| (name, ""))
+        .collect()
+}
+
 /// Parses a `:color` argument: a name from [`NAMED_COLORS`] (case-insensitive), or a
 /// `#rrggbb`/`rrggbb` hex triplet. `None` if it's neither.
 pub fn parse_color(input: &str) -> Option<[f32; 3]> {

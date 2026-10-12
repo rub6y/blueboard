@@ -25,11 +25,6 @@ use lyon::tessellation::{
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use wgpu::util::DeviceExt;
 
-/// Board-space width of a pen stroke. Fixed in board space (not screen space), so a
-/// stroke scales with the board under zoom — like real ink, rather than staying a
-/// constant number of screen pixels regardless of zoom level.
-pub const STROKE_WIDTH: f32 = 2.5;
-
 /// Stroke tessellation's flattening tolerance, in *screen-space* pixels — see
 /// `planning/math.tex` §3: tolerance must be screen-space and divided by zoom before use,
 /// so curve flattening tightens automatically as the user zooms in, instead of a fixed
@@ -64,7 +59,7 @@ impl Default for ThemeColors {
 /// What to draw the reference grid as this frame — owned by `blueboard-app`'s `App` (the
 /// `:grid` command mutates it directly) and passed into [`Renderer::render`] each call,
 /// same as everything else about a frame. Board-space, same units as everything else
-/// (`STROKE_WIDTH`, element paths, ...), not screen pixels.
+/// (stroke width, element paths, ...), not screen pixels.
 #[derive(Debug, Clone, Copy)]
 pub struct GridSettings {
     pub visible: bool,
@@ -198,10 +193,12 @@ pub enum ScenePreview<'a> {
         color: [f32; 3],
     },
     /// An exact path (e.g. a shape tool's in-progress rectangle/ellipse/line), in the
-    /// color it'll commit in — drawn tessellated, identically to a committed element.
+    /// color and width it'll commit in — drawn tessellated, identically to a committed
+    /// element.
     Path {
         path: &'a kurbo::BezPath,
         color: [f32; 3],
+        width: f32,
     },
     /// The selection tool's selected-element indicator: a board-space bounding box, drawn
     /// as a plain outline (not tessellated like `Path`) so it reads as "this is marked,"
@@ -271,10 +268,25 @@ pub struct Frame<'a> {
     pub grid: GridSettings,
     pub background: BackgroundMode,
     pub text_input: Option<TextInputPreview<'a>>,
-    /// `Some(color)` shows the color picker this frame, editing `color` in place; `None`
-    /// keeps it closed. Only while open does real pointer/keyboard input reach egui at
-    /// all — see `Renderer::egui_pending_events`.
-    pub color_picker: Option<&'a mut [f32; 3]>,
+    /// The current drawing color, always live (not only while the picker's open) — the
+    /// status bar's hex indicator reads it every frame, and the picker (when open, see
+    /// `color_picker_open`) edits it in place.
+    pub color: &'a mut [f32; 3],
+    /// Whether the interactive color picker window is open this frame — toggled by
+    /// `:color picker` or by clicking the status bar's hex indicator. Real pointer/
+    /// keyboard input only reaches egui while this (or `tool_picker_open`) is open, or
+    /// the click physically lands in the status bar strip — see
+    /// `Renderer::point_in_command_bar` and `Renderer::egui_pending_events`.
+    pub color_picker_open: &'a mut bool,
+    /// Every registered tool's name, in registry order — populates the tool-picker grid.
+    pub tool_names: &'a [&'static str],
+    /// Whether the tool-picker grid window is open this frame — toggled by clicking the
+    /// status bar's tool-name indicator.
+    pub tool_picker_open: &'a mut bool,
+    /// `Some(name)` if a tool-picker grid button was clicked this frame — `blueboard-app`
+    /// reads it right after `Renderer::render` returns and switches the active tool,
+    /// then it's done (not persisted; a fresh `None` each frame otherwise).
+    pub tool_picked: &'a mut Option<&'static str>,
     pub scale_factor: f32,
 }
 
@@ -825,6 +837,18 @@ struct CommandBarInput<'a> {
     content: &'a CommandBarContent<'a>,
     active_tool_name: &'a str,
     text_draws: &'a [SceneTextDraw],
+    tool_names: &'a [&'static str],
+}
+
+/// `run_command_bar_ui`'s mutable out-params, bundled for the same `too_many_arguments`
+/// reason [`CommandBarInput`] bundles its read-only ones — these are written *during* the
+/// UI closure (a click flips `*color_picker_open`, picking a tool sets `*tool_picked`,
+/// ...) rather than just read, so they can't join that struct's `&'a` (shared) fields.
+struct CommandBarOutputs<'a> {
+    color: &'a mut [f32; 3],
+    color_picker_open: &'a mut bool,
+    tool_picker_open: &'a mut bool,
+    tool_picked: &'a mut Option<&'static str>,
 }
 
 fn run_command_bar_ui(
@@ -833,12 +857,19 @@ fn run_command_bar_ui(
     scale_factor: f32,
     input: CommandBarInput<'_>,
     events: Vec<egui::Event>,
-    mut color_picker: Option<&mut [f32; 3]>,
+    outputs: CommandBarOutputs<'_>,
 ) -> egui::FullOutput {
+    let CommandBarOutputs {
+        color,
+        color_picker_open,
+        tool_picker_open,
+        tool_picked,
+    } = outputs;
     let CommandBarInput {
         content,
         active_tool_name,
         text_draws,
+        tool_names,
     } = input;
     let screen_size_points = egui::vec2(
         viewport_size.0 as f32 / scale_factor,
@@ -904,7 +935,29 @@ fn run_command_bar_ui(
                         });
                     }
                     ui.horizontal(|ui| {
-                        ui.colored_label(egui::Color32::GRAY, active_tool_name);
+                        // Flat-looking but clickable (`selectable_label(false, ..)` reads
+                        // as a plain label until hovered/clicked, unlike `ui.button`'s
+                        // permanent border) — opens the tool-picker grid / color picker
+                        // below, the same toggle `:tool`/`:color picker` already drive.
+                        if ui.selectable_label(false, active_tool_name).clicked() {
+                            *tool_picker_open = !*tool_picker_open;
+                        }
+                        ui.separator();
+                        let hex = format!(
+                            "#{:02x}{:02x}{:02x}",
+                            (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        );
+                        if ui
+                            .selectable_label(
+                                false,
+                                egui::RichText::new(hex).color(color_to_color32(*color)),
+                            )
+                            .clicked()
+                        {
+                            *color_picker_open = !*color_picker_open;
+                        }
                         ui.separator();
                         match content {
                             CommandBarContent::Hidden => {}
@@ -924,10 +977,31 @@ fn run_command_bar_ui(
                 });
             });
 
-        // The one interactive piece of UI this module owns — see
-        // `Renderer::egui_pending_events`'s doc comment: real input is forwarded here
-        // only while this is open.
-        if let Some(color) = color_picker.as_deref_mut() {
+        // Grid of every registered tool, opened by clicking the status bar's tool-name
+        // indicator — picking one writes `tool_picked` for `blueboard-app` to apply
+        // (this crate doesn't own `ToolRegistry`, just the names it was handed) and
+        // closes the grid, same "pick and dismiss" shape a dropdown menu has.
+        if *tool_picker_open {
+            egui::Window::new("Tools")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    egui::Grid::new("tool_picker_grid").show(ui, |ui| {
+                        const COLUMNS: usize = 4;
+                        for (i, name) in tool_names.iter().enumerate() {
+                            if ui.button(*name).clicked() {
+                                *tool_picked = Some(*name);
+                                *tool_picker_open = false;
+                            }
+                            if (i + 1) % COLUMNS == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                });
+        }
+
+        if *color_picker_open {
             let mut color32 = color_to_color32(*color);
             egui::Window::new("Color")
                 .collapsible(false)
@@ -1170,6 +1244,10 @@ struct MathTexture {
 struct CachedTessellation {
     path: kurbo::BezPath,
     color: [f32; 3],
+    /// Compared on cache-hit alongside `path`/`color` — a resize that only changes stroke
+    /// width (scaling it via `uniform_scale_factor` without otherwise touching the path)
+    /// would otherwise hit a stale cache entry built at the old width.
+    width: f32,
     /// The exact tessellation tolerance this was built with, compared bit-for-bit (not
     /// "close enough") — the same zoom reliably reproduces the identical `f32` tolerance,
     /// so this is a correct cache-hit test, not a fuzzy approximation.
@@ -1629,6 +1707,22 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
+    /// Whether `screen_pos` (physical pixels, winit's unit) falls within the always-drawn
+    /// command bar strip at the bottom of the viewport — used by `blueboard-app` to
+    /// decide whether a click is "for the bar" (the clickable tool-name/color-hex
+    /// labels) or should reach the active tool/canvas instead. Deliberately a cheap
+    /// geometry check, not an egui round-trip: egui's own `egui_wants_pointer_input`
+    /// only reflects *last* frame's layout (one frame stale), fine for deciding *which*
+    /// widget inside the bar was clicked, but not for the more consequential "does this
+    /// click reach the canvas at all" decision, where staleness would mean an occasional
+    /// wrong frame draws a stroke it shouldn't (or vice versa). Ignores the completions
+    /// row's extra height while a command is being typed — clicking there while also
+    /// trying to draw is enough of an edge case not to track precisely.
+    pub fn point_in_command_bar(&self, screen_pos: DVec2, scale_factor: f32) -> bool {
+        let bar_height_px = COMMAND_BAR_HEIGHT * scale_factor;
+        screen_pos.y >= self.config.height as f64 - bar_height_px as f64
+    }
+
     /// Decodes-and-uploads `rgba` (already-decoded pixels — `blueboard-app` owns the
     /// `image` crate decode step via `:background image <path>`, this just uploads) as
     /// the new background image, replacing whatever was uploaded before. Doesn't itself
@@ -1788,7 +1882,11 @@ impl Renderer {
             grid,
             background,
             text_input,
-            color_picker,
+            color,
+            color_picker_open,
+            tool_names,
+            tool_picker_open,
+            tool_picked,
             scale_factor,
         } = frame;
         // `get_current_texture` returns an enum rather than a `Result` as of wgpu 30 — the
@@ -1921,13 +2019,15 @@ impl Renderer {
                         image_draw_ranges.push((start, quad.len() as u32, element.id));
                     }
                 }
-                ElementKind::Stroke => {
+                ElementKind::Stroke { width } => {
+                    let width = *width;
                     let cache_hit =
                         self.tessellation_cache
                             .get(&element.id)
                             .is_some_and(|cached| {
                                 cached.tolerance_bits == tolerance_bits
                                     && cached.color == element.color
+                                    && cached.width == width
                                     && cached.path == element.path
                             });
                     if !cache_hit {
@@ -1935,7 +2035,7 @@ impl Renderer {
                         tessellate_colored_stroke(
                             &element.path,
                             element.color,
-                            STROKE_WIDTH,
+                            width,
                             tessellation_tolerance,
                             &mut vertices,
                         );
@@ -1944,6 +2044,7 @@ impl Renderer {
                             CachedTessellation {
                                 path: element.path.clone(),
                                 color: element.color,
+                                width,
                                 tolerance_bits,
                                 vertices,
                             },
@@ -2016,11 +2117,11 @@ impl Renderer {
                 colored_preview_vertices = colored_preview_line_vertices(points, color);
                 colored_preview_pipeline = &self.colored_preview_pipeline;
             }
-            ScenePreview::Path { path, color } => {
+            ScenePreview::Path { path, color, width } => {
                 tessellate_colored_stroke(
                     path,
                     color,
-                    STROKE_WIDTH,
+                    width,
                     tessellation_tolerance,
                     &mut colored_preview_vertices,
                 );
@@ -2258,9 +2359,15 @@ impl Renderer {
                 content: &command_bar,
                 active_tool_name,
                 text_draws: &text_draws,
+                tool_names,
             },
             std::mem::take(&mut self.egui_pending_events),
-            color_picker,
+            CommandBarOutputs {
+                color,
+                color_picker_open,
+                tool_picker_open,
+                tool_picked,
+            },
         );
         let clipped_primitives = self
             .egui_ctx

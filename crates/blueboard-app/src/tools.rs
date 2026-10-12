@@ -62,6 +62,10 @@ pub struct ToolContext<'a> {
     /// since `:color` could change mid-drag and `Tool::preview` has no `ctx` to re-read it
     /// from — see `PenTool`/`ShapeTool`'s own `color` fields.
     pub color: [f32; 3],
+    /// The board-space stroke width whatever's drawn next should use — `App::
+    /// current_stroke_width`, set by `:width`. Same "captured at pointer-down, held for
+    /// the gesture" shape as `color` above, and for the same reason.
+    pub stroke_width: f32,
 }
 
 impl ToolContext<'_> {
@@ -193,6 +197,8 @@ pub struct PenTool {
     /// and held here for the rest of the gesture, since `preview` has no `ctx` to read it
     /// from directly (see `ToolContext::color`'s doc comment).
     color: [f32; 3],
+    /// Same capture-at-pointer-down shape as `color`, for `ctx.stroke_width`.
+    width: f32,
 }
 
 impl Tool for PenTool {
@@ -203,6 +209,7 @@ impl Tool for PenTool {
     fn on_pointer_down(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
         self.drawing = true;
         self.color = ctx.color;
+        self.width = ctx.stroke_width;
         self.smoothed_cursor = screen_pos;
         self.last_sample_screen = screen_pos;
         self.current_stroke.clear();
@@ -227,7 +234,9 @@ impl Tool for PenTool {
             let accuracy = PEN_FIT_TOLERANCE_PX / ctx.camera.zoom;
             let raw_points = self.current_stroke.len();
             if let Some(path) = fit_stroke(&self.current_stroke, accuracy) {
-                let id = ctx.scene.add_element_with_color(path, self.color);
+                let id = ctx
+                    .scene
+                    .add_element_with_color_and_width(path, self.color, self.width);
                 log::info!("stroke {id} committed from {raw_points} raw samples");
             } else {
                 log::warn!("fit_stroke returned None for {raw_points} raw samples");
@@ -265,6 +274,8 @@ pub struct ShapeTool {
     /// The color this shape is being drawn in — same "captured at pointer-down, since
     /// `preview` has no `ctx`" reasoning as `PenTool::color`.
     color: [f32; 3],
+    /// Same capture-at-pointer-down shape as `color`, for `ctx.stroke_width`.
+    width: f32,
 }
 
 impl ShapeTool {
@@ -275,6 +286,7 @@ impl ShapeTool {
             start: None,
             current: None,
             color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+            width: blueboard_core::scene::DEFAULT_STROKE_WIDTH,
         }
     }
 
@@ -285,6 +297,7 @@ impl ShapeTool {
             start: None,
             current: None,
             color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+            width: blueboard_core::scene::DEFAULT_STROKE_WIDTH,
         }
     }
 
@@ -295,6 +308,7 @@ impl ShapeTool {
             start: None,
             current: None,
             color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+            width: blueboard_core::scene::DEFAULT_STROKE_WIDTH,
         }
     }
 
@@ -325,6 +339,7 @@ impl Tool for ShapeTool {
         let board = ctx.screen_to_board(screen_pos);
         self.start = Some(board);
         self.color = ctx.color;
+        self.width = ctx.stroke_width;
         self.current = Some(self.build_path(board, board));
     }
 
@@ -343,8 +358,11 @@ impl Tool for ShapeTool {
         // distance, not bounding-box area, since a perfectly horizontal/vertical *line*
         // legitimately has zero height/width and shouldn't be rejected for it.
         if (board - start).length() > f64::EPSILON {
-            ctx.scene
-                .add_element_with_color(self.build_path(start, board), self.color);
+            ctx.scene.add_element_with_color_and_width(
+                self.build_path(start, board),
+                self.color,
+                self.width,
+            );
         }
         self.current = None;
     }
@@ -354,6 +372,7 @@ impl Tool for ShapeTool {
             Some(path) => ScenePreview::Path {
                 path,
                 color: self.color,
+                width: self.width,
             },
             None => ScenePreview::None,
         }
@@ -384,6 +403,11 @@ struct ResizeDrag {
     /// it by the drag's geometric-mean scale factor alongside the bounding box; `None` for
     /// every other kind, which only resizes geometrically.
     original_font_size: Option<f32>,
+    /// Same shape as `original_font_size`, for `ElementKind::Stroke`'s `width` — a
+    /// resized rect/ellipse/line/pen-stroke scales its stroke width the same way a
+    /// resized text element scales its font size, rather than staying a fixed thickness
+    /// while its outline grows/shrinks around it.
+    original_stroke_width: Option<f32>,
 }
 
 /// Click-to-select, drag-to-move. Unlike `ShapeTool`, a drag here never creates anything —
@@ -414,6 +438,8 @@ pub struct SelectionTool {
     /// `Some`) — mirrors `dragging_path`'s "recomputed fresh each move, committed on up"
     /// shape.
     dragging_font_size: Option<f32>,
+    /// Same shape as `dragging_font_size`, for `resize.original_stroke_width`.
+    dragging_stroke_width: Option<f32>,
 }
 
 impl Tool for SelectionTool {
@@ -433,20 +459,28 @@ impl Tool for SelectionTool {
                 .into_iter()
                 .find(|(_, point)| (board - DVec2::new(point.x, point.y)).length() <= tolerance);
             if let Some((handle, _)) = handle {
-                let original_font_size = self
+                let selected_kind = self
                     .selected
                     .and_then(|id| ctx.scene.element(id))
-                    .and_then(|element| match &element.kind {
-                        ElementKind::Text { font_size, .. } => Some(*font_size),
-                        ElementKind::Stroke | ElementKind::Image(_) | ElementKind::MagicWindow => {
-                            None
-                        }
-                    });
+                    .map(|element| &element.kind);
+                let original_font_size = selected_kind.and_then(|kind| match kind {
+                    ElementKind::Text { font_size, .. } => Some(*font_size),
+                    ElementKind::Stroke { .. }
+                    | ElementKind::Image(_)
+                    | ElementKind::MagicWindow => None,
+                });
+                let original_stroke_width = selected_kind.and_then(|kind| match kind {
+                    ElementKind::Stroke { width } => Some(*width),
+                    ElementKind::Text { .. } | ElementKind::Image(_) | ElementKind::MagicWindow => {
+                        None
+                    }
+                });
                 self.resize = Some(ResizeDrag {
                     handle,
                     original_path: path.clone(),
                     original_bbox: bbox,
                     original_font_size,
+                    original_stroke_width,
                 });
                 self.drag = None;
                 self.dragging_path = None;
@@ -461,6 +495,7 @@ impl Tool for SelectionTool {
                 self.dragging_path = None;
                 self.resize = None;
                 self.dragging_font_size = None;
+                self.dragging_stroke_width = None;
                 return;
             }
         }
@@ -487,6 +522,7 @@ impl Tool for SelectionTool {
         self.dragging_path = None;
         self.resize = None;
         self.dragging_font_size = None;
+        self.dragging_stroke_width = None;
     }
 
     fn on_pointer_move(&mut self, ctx: &mut ToolContext, screen_pos: DVec2) {
@@ -499,10 +535,13 @@ impl Tool for SelectionTool {
             );
             let affine = resize::scale_affine(resize.original_bbox, new_bbox);
             self.dragging_path = Some(affine * &resize.original_path);
-            self.dragging_font_size = resize.original_font_size.map(|original| {
-                let factor = resize::uniform_scale_factor(resize.original_bbox, new_bbox);
-                (original as f64 * factor) as f32
-            });
+            let factor = resize::uniform_scale_factor(resize.original_bbox, new_bbox);
+            self.dragging_font_size = resize
+                .original_font_size
+                .map(|original| (original as f64 * factor) as f32);
+            self.dragging_stroke_width = resize
+                .original_stroke_width
+                .map(|original| (original as f64 * factor) as f32);
             return;
         }
         let Some((original, grabbed_at)) = &self.drag else {
@@ -524,12 +563,18 @@ impl Tool for SelectionTool {
                                     content: content.clone(),
                                     font_size,
                                 }),
-                                ElementKind::Stroke
+                                ElementKind::Stroke { .. }
                                 | ElementKind::Image(_)
                                 | ElementKind::MagicWindow => None,
                             })
                     }
-                    _ => None,
+                    _ => match (
+                        resize.original_stroke_width,
+                        self.dragging_stroke_width.take(),
+                    ) {
+                        (Some(_), Some(width)) => Some(ElementKind::Stroke { width }),
+                        _ => None,
+                    },
                 };
                 match kind {
                     Some(kind) => ctx.scene.set_element_path_and_kind(id, path.clone(), kind),
@@ -562,6 +607,7 @@ impl Tool for SelectionTool {
         self.dragging_path = None;
         self.resize = None;
         self.dragging_font_size = None;
+        self.dragging_stroke_width = None;
         scene.remove_element(id)
     }
 
@@ -583,6 +629,7 @@ impl Tool for SelectionTool {
         self.dragging_path = None;
         self.resize = None;
         self.dragging_font_size = None;
+        self.dragging_stroke_width = None;
     }
 }
 
@@ -671,8 +718,8 @@ impl Tool for TextTool {
 }
 
 /// Default board-space font size for a newly placed text element (`:tool text`'s click) —
-/// comparable in scale to `STROKE_WIDTH` being a few board units, 24 reads as a normal
-/// body-text size at 100% zoom.
+/// comparable in scale to `DEFAULT_STROKE_WIDTH` being a few board units, 24 reads as a
+/// normal body-text size at 100% zoom.
 pub const DEFAULT_TEXT_FONT_SIZE: f64 = 24.0;
 
 /// Drag-to-draw a magic-window rect, same gesture shape as `ShapeTool`'s rect — commits an

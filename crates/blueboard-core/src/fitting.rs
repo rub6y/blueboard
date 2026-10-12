@@ -95,11 +95,44 @@ impl ParamCurveFit for Polyline {
         (p, deriv)
     }
 
-    fn break_cusp(&self, _range: Range<f64>) -> Option<f64> {
-        // Freehand pen strokes essentially never have a true cusp (zero-derivative point);
-        // omitting detection just costs a couple of extra segments at a sharp corner
-        // instead of splitting exactly there, which kurbo's own docs call an accepted
-        // fallback rather than a correctness problem.
+    fn break_cusp(&self, range: Range<f64>) -> Option<f64> {
+        // A fast, sharp reversal *does* happen in real freehand input (doubling back over
+        // the same stroke almost instantly) — confirmed the hard way: left unreported, a
+        // reversal like this made `fit_to_cubic`'s single-smooth-cubic attempt produce a
+        // wildly-overshooting candidate curve whose `CubicBez::arclen` quadrature never
+        // converged, hanging the whole app on that one stroke (NaN visible in its
+        // accumulator in a debugger backtrace). kurbo's own docs call exactly this out:
+        // "might be useful to report near-cusps ... where curvature is large but still
+        // mathematically finite" — so detect a strong direction reversal between
+        // consecutive segments and report it, rather than relying on kurbo to recover
+        // from a cusp it was never told about.
+        const REVERSAL_DOT_THRESHOLD: f64 = -0.8;
+
+        let total_length = self.total_length();
+        let s_start = range.start * total_length;
+        let s_end = range.end * total_length;
+        // Strictly inside the range, mirroring the "never at the endpoints" requirement
+        // — a tiny margin rather than exact inequality, since `s_start`/`s_end` are
+        // themselves earlier-reported (or range-boundary) arc lengths and binary-exact
+        // equality isn't guaranteed to survive the multiplication above.
+        let margin = total_length * 1e-9;
+
+        for i in 1..self.points.len() - 1 {
+            let s = self.cumulative[i];
+            if s <= s_start + margin || s >= s_end - margin {
+                continue;
+            }
+            let incoming = self.points[i] - self.points[i - 1];
+            let outgoing = self.points[i + 1] - self.points[i];
+            if incoming.hypot() <= f64::EPSILON || outgoing.hypot() <= f64::EPSILON {
+                continue;
+            }
+            let (a, b) = (incoming.normalize(), outgoing.normalize());
+            let cos_angle = a.x * b.x + a.y * b.y;
+            if cos_angle < REVERSAL_DOT_THRESHOLD {
+                return Some(s / total_length);
+            }
+        }
         None
     }
 }
@@ -113,4 +146,69 @@ pub fn fit_stroke(points: &[DVec2], accuracy: f64) -> Option<BezPath> {
     }
     let polyline = Polyline::new(points)?;
     Some(fit_to_bezpath(&polyline, accuracy.max(1e-6)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn break_cusp_reports_a_sharp_reversal_strictly_inside_the_range() {
+        let points = vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(10.0, 0.0),
+            DVec2::new(0.0, 0.0),
+        ];
+        let polyline = Polyline::new(&points).expect("non-degenerate");
+        let t = polyline
+            .break_cusp(0.0..1.0)
+            .expect("a near-180 reversal should be reported");
+        assert!(t > 0.0 && t < 1.0);
+    }
+
+    #[test]
+    fn break_cusp_ignores_a_gentle_turn() {
+        let points = vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(10.0, 0.0),
+            DVec2::new(20.0, 2.0),
+        ];
+        let polyline = Polyline::new(&points).expect("non-degenerate");
+        assert!(polyline.break_cusp(0.0..1.0).is_none());
+    }
+
+    #[test]
+    fn break_cusp_never_reports_the_ranges_own_endpoints() {
+        // A reversal sitting exactly at cumulative length 0 (the range start) must not
+        // be reported — kurbo's own doc comment warns this can cause infinite
+        // subdivision (report a cusp at a boundary, get called again on a sub-range
+        // bounded by that same point, report it again, forever).
+        let points = vec![
+            DVec2::new(10.0, 0.0),
+            DVec2::new(0.0, 0.0),
+            DVec2::new(10.0, 0.0),
+        ];
+        let polyline = Polyline::new(&points).expect("non-degenerate");
+        // The only reversal vertex is at t=0.5, so narrowing the range to start exactly
+        // there must not report it again.
+        assert!(polyline.break_cusp(0.5..1.0).is_none());
+    }
+
+    /// A stroke that shoots out then immediately doubles back almost exactly over
+    /// itself — the shape that, before `break_cusp` detected it, made kurbo's
+    /// single-smooth-cubic fit attempt produce a wildly-overshooting candidate curve
+    /// whose arc-length computation never converged (confirmed via a debugger backtrace
+    /// showing NaN in its accumulator, hanging the whole app on this one stroke).
+    #[test]
+    fn sharp_reversal_fits_successfully_instead_of_hanging() {
+        let points = vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(10.0, 0.0),
+            DVec2::new(20.0, 0.0),
+            DVec2::new(19.9, 0.01),
+            DVec2::new(10.0, 0.02),
+            DVec2::new(0.0, 0.03),
+        ];
+        assert!(fit_stroke(&points, 0.5).is_some());
+    }
 }

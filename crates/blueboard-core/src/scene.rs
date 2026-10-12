@@ -32,8 +32,10 @@ pub struct ImageData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum ElementKind {
     /// A pen stroke or shape (rect/ellipse/line) — `path` *is* the visible stroke outline,
-    /// same as before this enum existed.
-    Stroke,
+    /// same as before this enum existed. `width` is board-space (scales with zoom, like
+    /// the path itself) — lives here, not as a sibling `Element` field like `color`, since
+    /// (mirroring `Text`'s `font_size`) it's only ever meaningful for this one kind.
+    Stroke { width: f32 },
     /// `content` is the raw markdown/math source (parsed into `text_markup::MathToken`s
     /// lazily — by `blueboard-render` at paint time and by `text_markup::estimate_size`
     /// only at placement time — not stored pre-parsed). `path` is just this element's
@@ -72,6 +74,11 @@ pub struct Element {
 /// stroke color every element used before per-element color existed.
 pub const DEFAULT_ELEMENT_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 
+/// What a new `ElementKind::Stroke` gets if nothing more specific is given — matches
+/// `blueboard-render`'s old fixed `STROKE_WIDTH` constant, back when every stroke shared
+/// one width.
+pub const DEFAULT_STROKE_WIDTH: f32 = 2.5;
+
 /// What's actually indexed by the R-tree: just an id and a bounding box, not the element
 /// itself — elements live in `Scene::elements`, looked up by id after a spatial query.
 #[derive(PartialEq)]
@@ -108,7 +115,19 @@ impl Scene {
     }
 
     pub fn add_element_with_color(&mut self, path: BezPath, color: [f32; 3]) -> u64 {
-        self.add_element_with_kind(path, color, ElementKind::Stroke)
+        self.add_element_with_color_and_width(path, color, DEFAULT_STROKE_WIDTH)
+    }
+
+    /// Like [`Scene::add_element_with_color`], but with an explicit stroke width instead
+    /// of [`DEFAULT_STROKE_WIDTH`] — used by the pen/shape tools, which read the user's
+    /// current width (`:width`) the same way they already read `color`.
+    pub fn add_element_with_color_and_width(
+        &mut self,
+        path: BezPath,
+        color: [f32; 3],
+        width: f32,
+    ) -> u64 {
+        self.add_element_with_kind(path, color, ElementKind::Stroke { width })
     }
 
     /// Like [`Scene::add_element_with_color`], but for any `kind` — used by `:yank`/paste
@@ -246,7 +265,9 @@ impl Scene {
             .elements
             .get(&id)
             .map(|element| element.kind.clone())
-            .unwrap_or(ElementKind::Stroke);
+            .unwrap_or(ElementKind::Stroke {
+                width: DEFAULT_STROKE_WIDTH,
+            });
         self.set_element_path_and_kind(id, path, kind);
     }
 

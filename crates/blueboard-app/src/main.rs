@@ -47,6 +47,10 @@ struct App {
     history: History,
     panning: bool,
     last_cursor: DVec2,
+    /// Current Ctrl/Shift/Alt/Super state, updated from `WindowEvent::ModifiersChanged`
+    /// — only consulted for Ctrl+V (clipboard paste) so far; `winit`'s `ModifiersState`
+    /// already defaults to "nothing held".
+    modifiers: winit::keyboard::ModifiersState,
 
     config: config::Config,
     registry: commands::CommandRegistry,
@@ -55,12 +59,15 @@ struct App {
     command_line_active: bool,
     /// Everything typed after `:` so far.
     command_line_text: String,
-    /// Which Tab-completion candidate (from `command_line_completions`, below) is
-    /// currently highlighted, if any. Reset to `None` whenever the user types or
-    /// backspaces directly, so a fresh prefix always starts unselected — a stale index
-    /// would otherwise point at an unrelated candidate once the match set changes
-    /// underneath it.
-    command_completion_index: Option<usize>,
+    /// An in-progress Tab/arrow-key completion cycle, if any: `(base_text, index)`.
+    /// `base_text` is what `command_line_text` held the moment cycling *started* —
+    /// candidates are always recomputed against that, never against the current
+    /// (possibly already-candidate-filled) `command_line_text`, or a second cycle step
+    /// would recompute a narrower candidate set from the just-inserted full candidate
+    /// text (which typically matches only itself) and appear to "stick" instead of
+    /// continuing to cycle. Reset to `None` whenever the user types or backspaces
+    /// directly, so a fresh prefix always starts a new cycle from scratch.
+    command_completion: Option<(String, usize)>,
     /// The last command's result, shown in the command bar until the next command
     /// replaces it. `bool` is "is this an error" (picks the display color).
     status: Option<(String, bool)>,
@@ -71,11 +78,20 @@ struct App {
     /// because this does). Overridden to white in `main()`'s `App` literal, since
     /// `#[derive(Default)]` would otherwise zero it to black.
     current_color: [f32; 3],
+    /// What the pen and shape tools draw their *next* element's stroke width as — set by
+    /// `:width`, remembered per-element once drawn, same shape as `current_color`.
+    /// Overridden to `DEFAULT_STROKE_WIDTH` in `main()`'s `App` literal for the same
+    /// reason `current_color` is: `#[derive(Default)]` would otherwise zero it.
+    current_stroke_width: f32,
     /// Whether the `:color picker` toggle is currently showing the interactive color
     /// picker — see `handle_key_press`'s `Escape` arm (closes it in preference to
     /// quitting) and `window_event`'s pointer handlers (suppress tool dispatch and
     /// forward real input to egui while this is `true`).
     color_picker_open: bool,
+    /// Whether the tool-picker grid window is currently open — opened by clicking the
+    /// status bar's tool-name indicator, closed by picking a tool from the grid. Same
+    /// "suppress tool dispatch, forward to egui" shape as `color_picker_open`.
+    tool_picker_open: bool,
     grid: GridSettings,
     /// What to fill the board's background with — mutated by `:background`. See
     /// `BackgroundMode`'s doc comment for why `Image`'s pixel data lives in the renderer
@@ -182,6 +198,14 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // Tracked so `handle_key_press` can tell a plain `v` from Ctrl+V (clipboard
+        // paste, text tool) — winit delivers modifier state as its own event, not
+        // alongside each `KeyboardInput`.
+        if let WindowEvent::ModifiersChanged(modifiers) = &event {
+            self.modifiers = modifiers.state();
+            return;
+        }
+
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
             return;
         };
@@ -234,7 +258,7 @@ impl ApplicationHandler for App {
                     CommandBarContent::Editing {
                         text: &self.command_line_text,
                         completions: &completions,
-                        selected: self.command_completion_index,
+                        selected: self.command_completion.as_ref().map(|(_, index)| *index),
                     }
                 } else if let Some((message, is_error)) = &self.status {
                     CommandBarContent::Status {
@@ -247,10 +271,11 @@ impl ApplicationHandler for App {
                 let scale_factor = window.scale_factor() as f32;
                 let preview = self.tools.active_tool().preview();
                 let active_tool_name = self.tools.active_tool().name();
-                // Captured before `color_picker`'s mutable borrow of `current_color`
-                // below, since the text-input preview also needs to read it.
+                // Captured before `color`'s mutable borrow of `current_color` below,
+                // since the text-input preview also needs to read it.
                 let text_input_color = self.current_color;
-                let color_picker = self.color_picker_open.then_some(&mut self.current_color);
+                let tool_names: Vec<&'static str> = self.tools.completions("");
+                let mut tool_picked: Option<&'static str> = None;
 
                 match renderer.render(Frame {
                     camera: &self.camera,
@@ -270,7 +295,11 @@ impl ApplicationHandler for App {
                             editing_id: self.text_input_editing_id,
                         }
                     }),
-                    color_picker,
+                    color: &mut self.current_color,
+                    color_picker_open: &mut self.color_picker_open,
+                    tool_names: &tool_names,
+                    tool_picker_open: &mut self.tool_picker_open,
+                    tool_picked: &mut tool_picked,
                     scale_factor,
                 }) {
                     RenderOutcome::Rendered | RenderOutcome::Skipped => {}
@@ -279,6 +308,10 @@ impl ApplicationHandler for App {
                         renderer.resize((size.width, size.height));
                         window.request_redraw();
                     }
+                }
+                if let Some(name) = tool_picked {
+                    self.tools.set_active(name);
+                    self.status = Some((format!("tool: {name}"), false));
                 }
                 // Normally redraws only happen in response to input — fine for a static
                 // board, but a magic window's capture produces new frames on its *own*
@@ -299,10 +332,18 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                // While the color picker is open, a left click is for it, not the canvas
-                // — forwarded to egui below instead of dispatched to the active tool, so
-                // clicking the picker can't also draw underneath it.
-                if self.color_picker_open {
+                // A left click is for egui, not the canvas, whenever: the color or tool
+                // picker is open (so clicking either can't also draw underneath it,
+                // regardless of where on screen the click lands — a floating `egui::
+                // Window` can extend above the bar itself), or the click physically
+                // lands in the always-drawn status bar strip (its tool-name/color-hex
+                // indicators are clickable even when neither picker is open yet — that's
+                // what opens them). See `Renderer::point_in_command_bar`'s doc comment
+                // for why this is a geometry check, not an egui round-trip.
+                if self.color_picker_open
+                    || self.tool_picker_open
+                    || renderer.point_in_command_bar(self.last_cursor, window.scale_factor() as f32)
+                {
                     let pos = screen_to_egui_points(self.last_cursor, window.scale_factor());
                     renderer.push_egui_event(egui::Event::PointerButton {
                         pos,
@@ -350,6 +391,7 @@ impl ApplicationHandler for App {
                     scene: &mut self.scene,
                     viewport,
                     color: self.current_color,
+                    stroke_width: self.current_stroke_width,
                 };
                 match state {
                     ElementState::Pressed => self
@@ -367,7 +409,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput {
                 state,
-                button: MouseButton::Middle,
+                button: MouseButton::Middle | MouseButton::Right,
                 ..
             } => {
                 self.panning = state == ElementState::Pressed;
@@ -375,7 +417,10 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = DVec2::new(position.x, position.y);
-                if self.color_picker_open {
+                if self.color_picker_open
+                    || self.tool_picker_open
+                    || renderer.point_in_command_bar(cursor, window.scale_factor() as f32)
+                {
                     let pos = screen_to_egui_points(cursor, window.scale_factor());
                     renderer.push_egui_event(egui::Event::PointerMoved(pos));
                     window.request_redraw();
@@ -390,6 +435,7 @@ impl ApplicationHandler for App {
                         scene: &mut self.scene,
                         viewport,
                         color: self.current_color,
+                        stroke_width: self.current_stroke_width,
                     };
                     self.tools
                         .active_tool_mut()
@@ -486,18 +532,29 @@ fn command_line_completions<'a>(
     text: &'a str,
     registry: &'a commands::CommandRegistry,
     tools: &'a tools::ToolRegistry,
-) -> (&'static str, Vec<(&'static str, &'static str)>) {
+) -> (String, Vec<(&'static str, &'static str)>) {
     match text.split_once(' ') {
-        None => ("", registry.completions(text)),
+        None => (String::new(), registry.completions(text)),
         Some(("tool", rest)) if !rest.contains(' ') => (
-            "tool ",
+            "tool ".to_string(),
             tools
                 .completions(rest)
                 .into_iter()
                 .map(|name| (name, ""))
                 .collect(),
         ),
-        _ => ("", Vec::new()),
+        // Any other command delegates to its own `Command::complete` for its argument
+        // string — `:grid style ho<Tab>`, `:color re<Tab>`, etc. (see that trait method's
+        // doc comment for the `(fixed_suffix, candidates)` shape being threaded through
+        // here as `(name, args)`).
+        Some((name, args)) => {
+            let (suffix, candidates) = registry.complete_args(name, args);
+            if candidates.is_empty() {
+                (String::new(), Vec::new())
+            } else {
+                (format!("{name} {suffix}"), candidates)
+            }
+        }
     }
 }
 
@@ -666,6 +723,22 @@ impl App {
                 Key::Named(NamedKey::End) => {
                     self.text_input_cursor = self.text_input_text.chars().count();
                 }
+                Key::Character(c)
+                    if self.modifiers.control_key() && c.eq_ignore_ascii_case("v") =>
+                {
+                    // Clipboard *text* paste, scoped to the text tool's own composing
+                    // input — distinct from `:paste`/`Y`'s clipboard *image* fallback
+                    // (`commands.rs`'s `paste_external_image`), which only ever runs
+                    // outside any active composition.
+                    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                        Ok(text) => text_edit::insert(
+                            &mut self.text_input_text,
+                            &mut self.text_input_cursor,
+                            &text,
+                        ),
+                        Err(err) => log::warn!("clipboard text paste failed: {err}"),
+                    }
+                }
                 _ => {
                     if let Some(text) = &event.text {
                         let typed: String = text.chars().filter(|c| !c.is_control()).collect();
@@ -697,29 +770,19 @@ impl App {
                 }
                 Key::Named(NamedKey::Backspace) => {
                     self.command_line_text.pop();
-                    self.command_completion_index = None;
+                    self.command_completion = None;
                 }
-                Key::Named(NamedKey::Tab) => {
-                    let (fixed_prefix, candidates) = command_line_completions(
-                        &self.command_line_text,
-                        &self.registry,
-                        &self.tools,
-                    );
-                    if !candidates.is_empty() {
-                        let next = match self.command_completion_index {
-                            Some(i) => (i + 1) % candidates.len(),
-                            None => 0,
-                        };
-                        self.command_completion_index = Some(next);
-                        self.command_line_text = format!("{fixed_prefix}{}", candidates[next].0);
-                    }
-                }
+                Key::Named(NamedKey::Tab) => self.cycle_command_completion(1),
+                // Left/right rather than up/down (ruba's preference) — cycles the same
+                // candidate list Tab does, just either direction.
+                Key::Named(NamedKey::ArrowRight) => self.cycle_command_completion(1),
+                Key::Named(NamedKey::ArrowLeft) => self.cycle_command_completion(-1),
                 _ => {
                     if let Some(text) = &event.text {
                         let typed: String = text.chars().filter(|c| !c.is_control()).collect();
                         if !typed.is_empty() {
                             self.command_line_text.push_str(&typed);
-                            self.command_completion_index = None;
+                            self.command_completion = None;
                         }
                     }
                 }
@@ -754,6 +817,14 @@ impl App {
                 }
             }
             window.request_redraw();
+        } else if self.tool_picker_open {
+            // Same shape as the `color_picker_open` branch above — Escape closes the
+            // grid instead of quitting, everything else is just a click target (no text
+            // entry/keyboard nav inside it), so no event forwarding needed.
+            if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                self.tool_picker_open = false;
+            }
+            window.request_redraw();
         } else {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => event_loop.exit(),
@@ -780,7 +851,7 @@ impl App {
                 Key::Character(text) if text.as_str() == ":" => {
                     self.command_line_active = true;
                     self.command_line_text.clear();
-                    self.command_completion_index = None;
+                    self.command_completion = None;
                     window.request_redraw();
                 }
                 Key::Character(text)
@@ -853,6 +924,38 @@ impl App {
         self.status = Some((format!("camera macro {key}: restored"), false));
     }
 
+    /// Cycles the command line's current completion candidate by `step` (+1 for Tab/Right,
+    /// -1 for Left) and writes the result straight into `command_line_text` — shared by
+    /// all three keys rather than duplicating the "ask `command_line_completions`, index
+    /// into it, format the result" dance per key. No selection yet (`None`) starts at the
+    /// first candidate for a forward step, or the *last* for a backward one (so Left from
+    /// nothing selected reaches the end of the list, not some arbitrary middle index an
+    /// arithmetic-only wraparound would land on).
+    ///
+    /// Candidates are recomputed against `command_completion`'s stored *base* text, not
+    /// `command_line_text` itself — see that field's doc comment for why reusing the
+    /// live (already-cycled-into) text would make a second cycle step compute a
+    /// narrower, usually single-candidate match and appear to commit instead of cycling.
+    fn cycle_command_completion(&mut self, step: isize) {
+        let base = match &self.command_completion {
+            Some((base, _)) => base.clone(),
+            None => self.command_line_text.clone(),
+        };
+        let (fixed_prefix, candidates) =
+            command_line_completions(&base, &self.registry, &self.tools);
+        if candidates.is_empty() {
+            return;
+        }
+        let len = candidates.len() as isize;
+        let next = match self.command_completion {
+            Some((_, i)) => (i as isize + step).rem_euclid(len) as usize,
+            None if step < 0 => candidates.len() - 1,
+            None => 0,
+        };
+        self.command_completion = Some((base, next));
+        self.command_line_text = format!("{fixed_prefix}{}", candidates[next].0);
+    }
+
     /// Runs a command by name (from the command line or a keybinding) and records the
     /// result as the next status message.
     fn run_command(&mut self, name: &str, args: &str) {
@@ -895,6 +998,7 @@ fn main() {
         // `#[derive(Default)]` would otherwise zero this to black — see the field's doc
         // comment.
         current_color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+        current_stroke_width: blueboard_core::scene::DEFAULT_STROKE_WIDTH,
         // `BackgroundMode` has no `Default` impl (deliberately — see its doc comment: an
         // arbitrary default color would be the wrong kind of silent), so it's set here
         // from the loaded theme, same as `current_color` above.

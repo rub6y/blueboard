@@ -34,7 +34,10 @@ use crate::scene::{ElementKind, Scene};
 /// unit variant, see its own doc comment on the shell-vs-screencast pivot) — a v5 file's
 /// `MagicWindow` encodes a string nothing in v6 expects, rejected outright per this
 /// format's existing policy rather than special-cased away.
-const FORMAT_VERSION: u32 = 6;
+///
+/// Bumped to 7 for `ElementKind::Stroke` gaining a `width: f32` field (`:width`) — same
+/// policy again: a v6 file's `Stroke` has no such field to read.
+const FORMAT_VERSION: u32 = 7;
 
 #[derive(Serialize, Deserialize)]
 struct ElementDocument {

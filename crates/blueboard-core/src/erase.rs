@@ -16,7 +16,7 @@ use glam::DVec2;
 use kurbo::{BezPath, Point};
 
 use crate::geometry::flatten_to_points;
-use crate::scene::Scene;
+use crate::scene::{ElementKind, Scene, DEFAULT_STROKE_WIDTH};
 
 /// Flattening tolerance (board-space) for turning an element's Bezier path into a polyline
 /// before clipping it against the eraser circle. Not zoom-scaled, same reasoning as
@@ -41,19 +41,22 @@ pub fn erase_circle(scene: &mut Scene, center: DVec2, radius: f64) -> bool {
 
     let mut changed = false;
     for id in candidate_ids {
-        let Some((path, color)) = scene
-            .element(id)
-            .map(|element| (element.path.clone(), element.color))
-        else {
+        let Some((path, color, width)) = scene.element(id).map(|element| {
+            let width = match element.kind {
+                ElementKind::Stroke { width } => width,
+                _ => DEFAULT_STROKE_WIDTH,
+            };
+            (element.path.clone(), element.color, width)
+        }) else {
             continue;
         };
         if let Some(remaining) = clip_path_outside_circle(&path, center, radius) {
             changed = true;
             scene.remove_element(id);
-            // Surviving pieces of an erased element keep its color — erasing part of a
-            // red stroke shouldn't turn the rest of it white.
+            // Surviving pieces of an erased element keep its color and width — erasing
+            // part of a red, thick stroke shouldn't turn the rest of it white and thin.
             for piece in remaining {
-                scene.add_element_with_color(piece, color);
+                scene.add_element_with_color_and_width(piece, color, width);
             }
         }
     }

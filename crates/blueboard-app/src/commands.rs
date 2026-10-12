@@ -32,6 +32,22 @@ pub trait Command {
     /// whitespace) as `args`. `Ok` is a status message to show in the command bar; `Err`
     /// is an error message, shown in the command bar's error color.
     fn run(&self, app: &mut App, args: &str) -> Result<String, String>;
+
+    /// Completions for this command's *own* argument string — `args` is everything typed
+    /// after the command name and its separating space so far, which may itself include
+    /// an already-settled sub-command token (e.g. `"style "` for `:grid style <Tab>`, or
+    /// `"sty"` for `:grid sty<Tab>`). Returns `(fixed_suffix, candidates)`: `fixed_suffix`
+    /// is appended right after `"<command name> "` to build the completed line's fixed
+    /// part (e.g. `"style "` once the user's past that token), and each candidate's own
+    /// text goes after that — the same `(fixed_prefix, candidates)` shape
+    /// `main.rs`'s `command_line_completions` already uses for the top-level "which
+    /// command" case, recursed one level into a specific command's own arguments.
+    /// Default empty: most commands' arguments are freeform (a path, a number, raw hex)
+    /// and not meaningfully completable — only enum-like arguments (grid style, a named
+    /// color, background's color/gradient/image subcommand, …) implement this.
+    fn complete(&self, _args: &str) -> (&'static str, Vec<(&'static str, &'static str)>) {
+        ("", Vec::new())
+    }
 }
 
 #[derive(Default)]
@@ -51,6 +67,7 @@ impl CommandRegistry {
         registry.register(YankCommand);
         registry.register(PasteCommand);
         registry.register(ColorCommand);
+        registry.register(WidthCommand);
         registry.register(GridCommand);
         registry.register(BackgroundCommand);
         registry.register(GifCommand);
@@ -107,6 +124,22 @@ impl CommandRegistry {
             .filter(|command| command.name().starts_with(prefix))
             .map(|command| (command.name(), command.usage()))
             .collect()
+    }
+
+    /// Delegates to `name`'s own [`Command::complete`] — the command-line's "what comes
+    /// after the command name" completion path, one level deeper than `completions`'s
+    /// "which command" path above. Empty (no completions, and no fixed suffix) for an
+    /// unknown command name.
+    pub fn complete_args(
+        &self,
+        name: &str,
+        args: &str,
+    ) -> (&'static str, Vec<(&'static str, &'static str)>) {
+        self.commands
+            .iter()
+            .find(|command| command.name() == name)
+            .map(|command| command.complete(args))
+            .unwrap_or(("", Vec::new()))
     }
 
     pub fn run(&self, app: &mut App, name: &str, args: &str) -> Result<String, String> {
@@ -452,6 +485,49 @@ impl Command for ColorCommand {
             None => Err(format!("unknown color: {arg}")),
         }
     }
+
+    fn complete(&self, args: &str) -> (&'static str, Vec<(&'static str, &'static str)>) {
+        // Unifies the named-color list and the interactive picker into one completable
+        // list — arrow/Tab onto "picker" and Enter opens it, same as typing it by hand.
+        let mut candidates = crate::color::name_completions(args);
+        if "picker".starts_with(args) {
+            candidates.push(("picker", ""));
+        }
+        ("", candidates)
+    }
+}
+
+/// Board-space bounds `:width` clamps to — prevents a degenerate zero/negative width (would
+/// tessellate to nothing) or an absurdly thick one. Mirrors `GridCommand`'s own
+/// `GRID_MIN_SPACING`/`GRID_MAX_SPACING` pair in shape and purpose.
+const WIDTH_MIN: f32 = 0.5;
+const WIDTH_MAX: f32 = 50.0;
+
+/// Sets the stroke width the pen and shape tools draw their next element with —
+/// `blueboard_core::scene::ElementKind::Stroke`'s own `width` field, board-space (scales
+/// with zoom like the path itself). Remembered per-element once drawn, same "current_*
+/// setting, baked in at commit time" shape `:color` already has.
+struct WidthCommand;
+impl Command for WidthCommand {
+    fn name(&self) -> &'static str {
+        "width"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<number>"
+    }
+
+    fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
+        let width: f32 = args
+            .trim()
+            .parse()
+            .map_err(|_| format!("width must be a number, not {:?}", args.trim()))?;
+        if width <= 0.0 {
+            return Err("width must be positive".to_string());
+        }
+        app.current_stroke_width = width.clamp(WIDTH_MIN, WIDTH_MAX);
+        Ok(format!("width: {}", app.current_stroke_width))
+    }
 }
 
 /// Multiplicative step `:grid bigger`/`:grid smaller` scale the spacing by each press.
@@ -516,6 +592,29 @@ impl Command for GridCommand {
                 _ => Err(format!("unknown grid command: {arg}")),
             },
         }
+    }
+
+    fn complete(&self, args: &str) -> (&'static str, Vec<(&'static str, &'static str)>) {
+        const TOP_LEVEL: &[&str] = &["show", "hide", "bigger", "smaller", "style"];
+        const STYLES: &[&str] = &["lines", "horizontal", "hex", "dots"];
+        if let Some(style_arg) = args.strip_prefix("style ") {
+            return (
+                "style ",
+                STYLES
+                    .iter()
+                    .filter(|s| s.starts_with(style_arg))
+                    .map(|&s| (s, ""))
+                    .collect(),
+            );
+        }
+        (
+            "",
+            TOP_LEVEL
+                .iter()
+                .filter(|s| s.starts_with(args))
+                .map(|&s| (s, ""))
+                .collect(),
+        )
     }
 }
 
@@ -596,6 +695,30 @@ impl Command for BackgroundCommand {
                 "unknown background command: {other:?} (color|gradient|image)"
             )),
         }
+    }
+
+    fn complete(&self, args: &str) -> (&'static str, Vec<(&'static str, &'static str)>) {
+        const TOP_LEVEL: &[&str] = &["color", "gradient", "image"];
+        if let Some(rest) = args.strip_prefix("color ") {
+            return ("color ", crate::color::name_completions(rest));
+        }
+        // Only the gradient's *first* hex color is completable as a named color —
+        // the second color, angle, and the image subcommand's path/fit args are all
+        // freeform, same "enum-like only" scope `Command::complete`'s doc comment sets.
+        if let Some(rest) = args.strip_prefix("gradient ") {
+            if !rest.contains(' ') {
+                return ("gradient ", crate::color::name_completions(rest));
+            }
+            return ("", Vec::new());
+        }
+        (
+            "",
+            TOP_LEVEL
+                .iter()
+                .filter(|s| s.starts_with(args))
+                .map(|&s| (s, ""))
+                .collect(),
+        )
     }
 }
 
