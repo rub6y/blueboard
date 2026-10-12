@@ -185,7 +185,8 @@ impl Command for SaveCommand {
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
         let path = resolve_board_path(args);
-        file_format::save(&app.scene, &path)
+        let config = app.config_snapshot();
+        file_format::save(&app.scene, &config, &path)
             .map(|()| format!("saved {} element(s) to {path}", app.scene.len()))
             .map_err(|err| format!("save to {path} failed: {err}"))
     }
@@ -204,9 +205,10 @@ impl Command for OpenCommand {
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
         let path = resolve_board_path(args);
         match file_format::load(&path) {
-            Ok(scene) => {
+            Ok((scene, config)) => {
                 let count = scene.len();
                 app.scene = scene;
+                app.apply_config(config);
                 Ok(format!("loaded {count} element(s) from {path}"))
             }
             Err(err) => Err(format!("open {path} failed: {err}")),
@@ -227,9 +229,10 @@ impl Command for ClearCommand {
     }
 }
 
-/// Same effect as `clear` — there's no concept of multiple distinct boards/files yet to
-/// make `:new` meaningfully different. Kept as its own command (not just an alias
-/// dispatched earlier) so it shows up in the registry under its own name.
+/// Unlike `clear`, also resets the active config (keybindings/theme/grid/background/
+/// macros) back to `default_config.toml`'s settings — a genuinely *new* board, not just
+/// an emptied one, which keeps whatever config it already had (the same way `clear`
+/// doesn't undo a `:color`/`:width` change either).
 struct NewCommand;
 impl Command for NewCommand {
     fn name(&self) -> &'static str {
@@ -237,7 +240,9 @@ impl Command for NewCommand {
     }
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
-        ClearCommand.run(app, args)
+        let message = ClearCommand.run(app, args)?;
+        app.apply_config(app.default_config.clone());
+        Ok(message)
     }
 }
 
@@ -618,12 +623,40 @@ impl Command for GridCommand {
     }
 }
 
+/// Imports `path` into [`crate::config::background_images_dir`] (copying it there if it
+/// isn't already resident) and makes it the active background — shared by `:background
+/// image` and the config window's own background-image setter, so a config entry always
+/// points at a managed copy regardless of which route set it (see that function's doc
+/// comment on why). Takes its pieces separately rather than `app: &mut App`: the
+/// `WindowEvent::RedrawRequested` call site already holds `self.window`/`self.renderer`
+/// borrowed out of a partially-destructured `&mut App`, which a whole-`App` param would
+/// conflict with.
+pub(crate) fn set_background_image(
+    renderer: &mut blueboard_render::Renderer,
+    background: &mut blueboard_render::BackgroundMode,
+    background_image_path: &mut Option<String>,
+    path: &str,
+    fit: blueboard_render::ImageFit,
+) -> Result<String, String> {
+    let filename = crate::config::import_background_image(std::path::Path::new(path))
+        .map_err(|err| format!("failed to import {path}: {err}"))?;
+    let full_path = crate::config::background_images_dir().join(&filename);
+    let decoded = image::open(&full_path)
+        .map_err(|err| format!("failed to open {}: {err}", full_path.display()))?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    renderer.set_background_image(rgba.as_raw(), width, height);
+    *background = blueboard_render::BackgroundMode::Image(fit);
+    *background_image_path = Some(filename.clone());
+    Ok(format!("background: image {filename} ({width}x{height})"))
+}
+
 /// Sets the board's background fill — a solid color, a two-color gradient, or an image
 /// file (PNG/JPEG/etc, decoded via the `image` crate) with a chosen fit mode. Subcommand
 /// style mirrors `:grid`. Solid/gradient settings live entirely in `app.background`
 /// (cheap to recompute every frame — see `BackgroundMode`'s doc comment); an image is
-/// decoded and uploaded to the GPU once, here, via `Renderer::set_background_image`, since
-/// redoing that every frame would be wasteful.
+/// imported into a managed directory and uploaded to the GPU once, here, via
+/// `Renderer::set_background_image`, since redoing that every frame would be wasteful.
 struct BackgroundCommand;
 impl Command for BackgroundCommand {
     fn name(&self) -> &'static str {
@@ -643,6 +676,7 @@ impl Command for BackgroundCommand {
                 let color = crate::color::parse_color(rest)
                     .ok_or_else(|| format!("unknown color {rest:?}"))?;
                 app.background = blueboard_render::BackgroundMode::Solid(color);
+                app.background_image_path = None;
                 Ok(format!(
                     "background: solid {}",
                     crate::color::color_to_hex(color)
@@ -667,6 +701,7 @@ impl Command for BackgroundCommand {
                     to,
                     angle_deg,
                 };
+                app.background_image_path = None;
                 Ok(format!("background: gradient, {angle_deg} deg"))
             }
             "image" => {
@@ -679,17 +714,17 @@ impl Command for BackgroundCommand {
                     "tile" => blueboard_render::ImageFit::Tile,
                     other => return Err(format!("unknown fit {other:?} (zoom|tile)")),
                 };
-                let decoded =
-                    image::open(path).map_err(|err| format!("failed to open {path}: {err}"))?;
-                let rgba = decoded.to_rgba8();
-                let (width, height) = rgba.dimensions();
                 let renderer = app
                     .renderer
                     .as_mut()
                     .ok_or("renderer not ready yet".to_string())?;
-                renderer.set_background_image(rgba.as_raw(), width, height);
-                app.background = blueboard_render::BackgroundMode::Image(fit);
-                Ok(format!("background: image {path} ({width}x{height})"))
+                set_background_image(
+                    renderer,
+                    &mut app.background,
+                    &mut app.background_image_path,
+                    path,
+                    fit,
+                )
             }
             other => Err(format!(
                 "unknown background command: {other:?} (color|gradient|image)"
@@ -723,8 +758,9 @@ impl Command for BackgroundCommand {
 }
 
 /// Binds the active tool and current drawing color to a number key — pressing that digit
-/// afterward (outside the command line) switches both at once. Persisted to
-/// `macros.toml` (`crate::macros`) right when set, so it survives a restart.
+/// afterward (outside the command line) switches both at once. Part of the active config
+/// now (see `blueboard_core::config`) — persisted via `:save`/"save as default", not
+/// written to disk the instant this runs anymore.
 struct MacroCommand;
 impl Command for MacroCommand {
     fn name(&self) -> &'static str {
@@ -736,30 +772,46 @@ impl Command for MacroCommand {
     }
 
     fn run(&self, app: &mut App, args: &str) -> Result<String, String> {
-        let digit = args.trim();
-        if digit.len() != 1 || !digit.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            return Err(format!(
-                "macro key must be a single digit 0-9, not {digit:?}"
-            ));
-        }
-        let tool = app.tools.active_tool().name().to_string();
-        let color = crate::color::color_to_hex(app.current_color);
-        app.macros.insert(
-            digit.to_string(),
-            crate::macros::Macro {
-                tool: tool.clone(),
-                color: color.clone(),
-            },
-        );
-        crate::macros::save(&app.macros);
-        Ok(format!("macro {digit}: {tool} / {color}"))
+        set_macro(
+            app.tools.active_tool().name(),
+            app.current_color,
+            &mut app.macros,
+            args.trim(),
+        )
     }
+}
+
+/// Binds `active_tool`/`current_color` to `digit` (a single character `"0"`-`"9"`) —
+/// shared by `:m` and the config window's own "set to current" button. Takes its pieces
+/// separately rather than `app: &mut App`, same reasoning as `set_background_image`'s doc
+/// comment.
+pub(crate) fn set_macro(
+    active_tool: &str,
+    current_color: [f32; 3],
+    macros: &mut blueboard_core::config::Macros,
+    digit: &str,
+) -> Result<String, String> {
+    if digit.len() != 1 || !digit.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "macro key must be a single digit 0-9, not {digit:?}"
+        ));
+    }
+    let tool = active_tool.to_string();
+    let color = crate::color::color_to_hex(current_color);
+    macros.insert(
+        digit.to_string(),
+        blueboard_core::config::Macro {
+            tool: tool.clone(),
+            color: color.clone(),
+        },
+    );
+    Ok(format!("macro {digit}: {tool} / {color}"))
 }
 
 /// Binds the camera's current pan+zoom to a function key (`F1`-`F12`) — pressing that
 /// key afterward (outside the command line) jumps the camera straight back, no tool/color
-/// change (that's `:m`'s job). Persisted to `camera_macros.toml`
-/// (`crate::camera_macros`) right when set, so it survives a restart.
+/// change (that's `:m`'s job). Same "part of the active config now" shape as
+/// `MacroCommand`.
 struct CameraMacroCommand;
 impl Command for CameraMacroCommand {
     fn name(&self) -> &'static str {
@@ -775,20 +827,33 @@ impl Command for CameraMacroCommand {
             .trim()
             .parse()
             .map_err(|_| format!("camera macro key must be 1-12, not {:?}", args.trim()))?;
-        if !(1..=12).contains(&number) {
-            return Err(format!("camera macro key must be 1-12, not {number}"));
-        }
-        let key = format!("F{number}");
-        app.camera_macros.insert(
-            key.clone(),
-            crate::camera_macros::CameraMacro {
-                pan: app.camera.pan.to_array(),
-                zoom: app.camera.zoom,
-            },
-        );
-        crate::camera_macros::save(&app.camera_macros);
-        Ok(format!("camera macro {key}: saved"))
+        set_camera_macro(
+            app.camera.pan.to_array(),
+            app.camera.zoom,
+            &mut app.camera_macros,
+            number,
+        )
     }
+}
+
+/// Binds `pan`/`zoom` to function key `number` (`1`-`12`) — shared by `:fm` and the
+/// config window's own "set to current" button. Takes its pieces separately rather than
+/// `app: &mut App`, same reasoning as `set_background_image`'s doc comment.
+pub(crate) fn set_camera_macro(
+    pan: [f64; 2],
+    zoom: f64,
+    camera_macros: &mut blueboard_core::config::CameraMacros,
+    number: u32,
+) -> Result<String, String> {
+    if !(1..=12).contains(&number) {
+        return Err(format!("camera macro key must be 1-12, not {number}"));
+    }
+    let key = format!("F{number}");
+    camera_macros.insert(
+        key.clone(),
+        blueboard_core::config::CameraMacro { pan, zoom },
+    );
+    Ok(format!("camera macro {key}: set"))
 }
 
 struct UndoCommand;

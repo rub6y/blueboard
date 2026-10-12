@@ -5,6 +5,7 @@
 //! Usage: `cargo run -p blueboard-core --example gen_stress_board -- <path> [count]`
 //! (count defaults to 5000).
 
+use blueboard_core::config::Config;
 use blueboard_core::file_format;
 use blueboard_core::scene::Scene;
 use kurbo::BezPath;
@@ -64,6 +65,6 @@ fn main() {
         scene.add_element_with_color(random_stroke(&mut rng, cx, cy), random_color(&mut rng));
     }
 
-    file_format::save(&scene, &path).expect("save should succeed");
+    file_format::save(&scene, &Config::default(), &path).expect("save should succeed");
     println!("wrote {count} elements to {path} (board extent ~{extent:.0} units)");
 }

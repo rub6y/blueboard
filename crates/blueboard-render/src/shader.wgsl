@@ -10,7 +10,7 @@ var<uniform> camera: CameraUniform;
 // the Rust-side struct for free.
 struct ThemeUniform {
     grid_color: vec4<f32>,
-    stroke_color: vec4<f32>,
+    selection_color: vec4<f32>,
 };
 
 @group(1) @binding(0)
@@ -37,14 +37,14 @@ fn fs_grid(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 @fragment
-fn fs_stroke(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Also used for the live stroke-preview pipeline — both are "pen" colored.
-    return theme.stroke_color;
+fn fs_selection(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Selection-box outlines and the eraser cursor — never a drawn stroke's color.
+    return theme.selection_color;
 }
 
 // Separate vertex/fragment pair for per-element colored content (committed strokes/shapes
 // and their live preview): each vertex carries its own color instead of reading the fixed
-// theme uniform `fs_stroke` does — grid lines and UI-only overlays (selection boxes, the
+// theme uniform `fs_selection` does — grid lines and UI-only overlays (selection boxes, the
 // eraser cursor) stay on the uniform-colored path above, since those aren't board content
 // and shouldn't follow whatever color the user's currently drawing with.
 struct ColoredVertexInput {

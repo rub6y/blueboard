@@ -43,7 +43,10 @@ const SAMPLE_COUNT: u32 = 4;
 pub struct ThemeColors {
     pub board: [f32; 3],
     pub grid: [f32; 3],
-    pub stroke: [f32; 3],
+    /// Selection-box outline and eraser-cursor color — *not* a drawn stroke's color (that's
+    /// per-element, see `blueboard_core::scene::ElementKind::Stroke`'s own color). Named
+    /// `selection` rather than `stroke` specifically to avoid that confusion.
+    pub selection: [f32; 3],
 }
 
 impl Default for ThemeColors {
@@ -51,7 +54,7 @@ impl Default for ThemeColors {
         Self {
             board: [0.05, 0.08, 0.20],
             grid: [0.3, 0.38, 0.58],
-            stroke: [1.0, 1.0, 1.0],
+            selection: [1.0, 1.0, 1.0],
         }
     }
 }
@@ -138,7 +141,7 @@ impl Default for BackgroundMode {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ThemeUniform {
     grid_color: [f32; 4],
-    stroke_color: [f32; 4],
+    selection_color: [f32; 4],
 }
 
 impl From<ThemeColors> for ThemeUniform {
@@ -146,7 +149,7 @@ impl From<ThemeColors> for ThemeUniform {
         let to_vec4 = |c: [f32; 3]| [c[0], c[1], c[2], 1.0];
         Self {
             grid_color: to_vec4(theme.grid),
-            stroke_color: to_vec4(theme.stroke),
+            selection_color: to_vec4(theme.selection),
         }
     }
 }
@@ -287,6 +290,63 @@ pub struct Frame<'a> {
     /// reads it right after `Renderer::render` returns and switches the active tool,
     /// then it's done (not persisted; a fresh `None` each frame otherwise).
     pub tool_picked: &'a mut Option<&'static str>,
+    /// Whether the config window (status bar's gear icon) is open this frame.
+    pub config_window_open: &'a mut bool,
+    /// Live-editable theme colors — board-space config window's one *live* editor this
+    /// first pass has (grid/background still only change via `:grid`/`:background`;
+    /// shown read-only here). `blueboard-app` calls `Renderer::set_theme` with this right
+    /// after `render` returns whenever the window's open, so dragging a swatch previews
+    /// immediately, same as the color picker already does for `current_color`.
+    pub theme: &'a mut blueboard_core::config::Theme,
+    pub macros: &'a blueboard_core::config::Macros,
+    pub camera_macros: &'a blueboard_core::config::CameraMacros,
+    /// `Some(key)` if the config window's delete button for that tool/color macro was
+    /// clicked this frame — `blueboard-app` removes it right after `render` returns.
+    pub macro_to_delete: &'a mut Option<String>,
+    /// Same shape as `macro_to_delete`, for camera macros.
+    pub camera_macro_to_delete: &'a mut Option<String>,
+    /// Set to `true` if the config window's "save as default" button was clicked this
+    /// frame — `blueboard-app` writes `default_config.toml` right after `render` returns.
+    pub save_as_default_requested: &'a mut bool,
+    /// `Some(color)` if the config window's "Board" swatch changed this frame — see
+    /// that swatch's own inline comment for why this out-param exists at all.
+    pub board_color_changed: &'a mut Option<[f32; 3]>,
+    /// `Some(color)` if the config window's "Stroke" (default drawing color) swatch
+    /// changed this frame — like `board_color_changed`, this isn't part of the GPU theme
+    /// uniform at all, it's `blueboard-app`'s `current_color`, so editing it has to write
+    /// through via this out-param rather than `theme` directly.
+    pub stroke_color_changed: &'a mut Option<[f32; 3]>,
+    /// The current drawing stroke width, always live — the status bar's width indicator
+    /// reads/edits it every frame, same shape as `color`.
+    pub stroke_width: &'a mut f32,
+    /// Whether the width-picker popup is open this frame — toggled by clicking the
+    /// status bar's width indicator, same shape as `color_picker_open`.
+    pub width_picker_open: &'a mut bool,
+    /// The config window's background-image path text field, persisted across frames so
+    /// typing survives redraws (an egui `TextEdit` needs somewhere stable to write into).
+    pub background_image_input: &'a mut String,
+    /// `Some(path)` if the config window's background-image "Set" button was clicked this
+    /// frame — `blueboard-app` imports and applies it right after `render` returns (needs
+    /// the `Renderer` to decode/upload, which this crate's own UI closure doesn't have).
+    pub background_image_requested: &'a mut Option<String>,
+    /// The config window's "digit to bind" field for a new tool/color macro, persisted
+    /// across frames like `background_image_input`.
+    pub macro_digit_input: &'a mut u8,
+    /// `Some(digit)` if the config window's "set to current" button for a tool/color
+    /// macro was clicked this frame — `blueboard-app` captures the active tool+color
+    /// right after `render` returns, same as `:m <digit>`.
+    pub macro_set_requested: &'a mut Option<u8>,
+    /// Same shape as `macro_digit_input`, for camera macros (`F1`-`F12`).
+    pub camera_macro_number_input: &'a mut u32,
+    /// Same shape as `macro_set_requested`, for camera macros.
+    pub camera_macro_set_requested: &'a mut Option<u32>,
+    /// The config window's keybinding editor rows, kept as a `Vec` (not the live
+    /// `HashMap<String, String>` itself) so a key can be retyped in place without the
+    /// "which entry does this row even correspond to anymore" problem renaming a
+    /// `HashMap` key mid-iteration would raise. `blueboard-app` rebuilds its keybindings
+    /// map from this every frame the config window is open (see `App::apply_config`'s
+    /// doc comment on why that's cheap enough to just always do).
+    pub keybinding_rows: &'a mut Vec<(String, String)>,
     pub scale_factor: f32,
 }
 
@@ -838,6 +898,10 @@ struct CommandBarInput<'a> {
     active_tool_name: &'a str,
     text_draws: &'a [SceneTextDraw],
     tool_names: &'a [&'static str],
+    grid: GridSettings,
+    background: BackgroundMode,
+    macros: &'a blueboard_core::config::Macros,
+    camera_macros: &'a blueboard_core::config::CameraMacros,
 }
 
 /// `run_command_bar_ui`'s mutable out-params, bundled for the same `too_many_arguments`
@@ -849,6 +913,22 @@ struct CommandBarOutputs<'a> {
     color_picker_open: &'a mut bool,
     tool_picker_open: &'a mut bool,
     tool_picked: &'a mut Option<&'static str>,
+    config_window_open: &'a mut bool,
+    theme: &'a mut blueboard_core::config::Theme,
+    macro_to_delete: &'a mut Option<String>,
+    camera_macro_to_delete: &'a mut Option<String>,
+    save_as_default_requested: &'a mut bool,
+    board_color_changed: &'a mut Option<[f32; 3]>,
+    stroke_color_changed: &'a mut Option<[f32; 3]>,
+    stroke_width: &'a mut f32,
+    width_picker_open: &'a mut bool,
+    background_image_input: &'a mut String,
+    background_image_requested: &'a mut Option<String>,
+    macro_digit_input: &'a mut u8,
+    macro_set_requested: &'a mut Option<u8>,
+    camera_macro_number_input: &'a mut u32,
+    camera_macro_set_requested: &'a mut Option<u32>,
+    keybinding_rows: &'a mut Vec<(String, String)>,
 }
 
 fn run_command_bar_ui(
@@ -864,12 +944,32 @@ fn run_command_bar_ui(
         color_picker_open,
         tool_picker_open,
         tool_picked,
+        config_window_open,
+        theme,
+        macro_to_delete,
+        camera_macro_to_delete,
+        save_as_default_requested,
+        board_color_changed,
+        stroke_color_changed,
+        stroke_width,
+        width_picker_open,
+        background_image_input,
+        background_image_requested,
+        macro_digit_input,
+        macro_set_requested,
+        camera_macro_number_input,
+        camera_macro_set_requested,
+        keybinding_rows,
     } = outputs;
     let CommandBarInput {
         content,
         active_tool_name,
         text_draws,
         tool_names,
+        grid,
+        background,
+        macros,
+        camera_macros,
     } = input;
     let screen_size_points = egui::vec2(
         viewport_size.0 as f32 / scale_factor,
@@ -959,6 +1059,13 @@ fn run_command_bar_ui(
                             *color_picker_open = !*color_picker_open;
                         }
                         ui.separator();
+                        if ui
+                            .selectable_label(false, format!("{stroke_width:.1}px"))
+                            .clicked()
+                        {
+                            *width_picker_open = !*width_picker_open;
+                        }
+                        ui.separator();
                         match content {
                             CommandBarContent::Hidden => {}
                             CommandBarContent::Editing { text, .. } => {
@@ -973,6 +1080,18 @@ fn run_command_bar_ui(
                                 ui.colored_label(color, *message);
                             }
                         }
+                        // Right-aligned within the same row (not a separate floating
+                        // element) so it falls under the exact same `point_in_command_bar`
+                        // click-gating the rest of the bar already has — see that
+                        // method's doc comment. Added *after* the variable-width content
+                        // above, not before: `with_layout`'s child claims the row's whole
+                        // *remaining* width for itself, so anything added after it would
+                        // get squeezed into zero space left in the row.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("\u{2699}").clicked() {
+                                *config_window_open = !*config_window_open;
+                            }
+                        });
                     });
                 });
             });
@@ -1001,6 +1120,133 @@ fn run_command_bar_ui(
                 });
         }
 
+        // The config window: theme/background-image/macros/keybindings are all live-edited
+        // here now; grid still only changes via `:grid` (shown read-only — no in-window
+        // editor for it yet). "Save as default" writes `default_config.toml` from
+        // whatever's currently active, read back by `blueboard-app` right after `render`
+        // returns.
+        if *config_window_open {
+            egui::Window::new("Config")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.heading("Theme");
+                    ui.horizontal(|ui| {
+                        ui.label("Board");
+                        // `board_color` isn't part of the GPU theme uniform at all (only
+                        // `grid_color`/`selection_color` are, see `ThemeUniform`) — it's
+                        // only ever read once, to seed `BackgroundMode::Solid` at
+                        // startup. Editing it here has to write through to the *actual*
+                        // live background color via this out-param, or it would just
+                        // silently do nothing whenever the background happens to be a
+                        // solid fill (the common case) — `blueboard-app` applies it
+                        // right after `render` returns.
+                        if ui.color_edit_button_rgb(&mut theme.board_color).changed() {
+                            *board_color_changed = Some(theme.board_color);
+                        }
+                        ui.label("Grid");
+                        ui.color_edit_button_rgb(&mut theme.grid_color);
+                        ui.label("Selection");
+                        ui.color_edit_button_rgb(&mut theme.selection_color);
+                        ui.label("Stroke");
+                        // `theme.stroke_color` is the *default drawing color for new
+                        // boards*, not a live GPU theme value — editing it here has to
+                        // write through to `blueboard-app`'s actual `current_color` via
+                        // this out-param, same reasoning as `board_color_changed` above.
+                        if ui.color_edit_button_rgb(&mut theme.stroke_color).changed() {
+                            *stroke_color_changed = Some(theme.stroke_color);
+                        }
+                    });
+
+                    ui.separator();
+                    ui.heading("Grid");
+                    ui.label(format!(
+                        "{} — spacing {:.0}, style {:?} (change via :grid)",
+                        if grid.visible { "visible" } else { "hidden" },
+                        grid.spacing,
+                        grid.style
+                    ));
+
+                    ui.separator();
+                    ui.heading("Background");
+                    ui.label(format!("{background:?} (change via :background)"));
+                    ui.horizontal(|ui| {
+                        ui.label("Image path:");
+                        ui.text_edit_singleline(background_image_input);
+                        if ui.button("Set").clicked() && !background_image_input.is_empty() {
+                            *background_image_requested = Some(background_image_input.clone());
+                        }
+                    });
+
+                    ui.separator();
+                    ui.heading("Macros");
+                    if macros.is_empty() {
+                        ui.label("none set");
+                    }
+                    for (key, macro_) in macros {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{key}: {} / {}", macro_.tool, macro_.color));
+                            if ui.small_button("x").clicked() {
+                                *macro_to_delete = Some(key.clone());
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(macro_digit_input).range(0..=9));
+                        if ui.button("Set to current tool/color").clicked() {
+                            *macro_set_requested = Some(*macro_digit_input);
+                        }
+                    });
+
+                    ui.separator();
+                    ui.heading("Camera macros");
+                    if camera_macros.is_empty() {
+                        ui.label("none set");
+                    }
+                    for (key, camera_macro) in camera_macros {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{key}: pan ({:.0}, {:.0}), zoom {:.2}",
+                                camera_macro.pan[0], camera_macro.pan[1], camera_macro.zoom
+                            ));
+                            if ui.small_button("x").clicked() {
+                                *camera_macro_to_delete = Some(key.clone());
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(camera_macro_number_input).range(1..=12));
+                        if ui.button("Set to current camera").clicked() {
+                            *camera_macro_set_requested = Some(*camera_macro_number_input);
+                        }
+                    });
+
+                    ui.separator();
+                    ui.heading("Keybindings");
+                    let mut row_to_delete = None;
+                    for (i, (key, command)) in keybinding_rows.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(key).desired_width(24.0));
+                            ui.text_edit_singleline(command);
+                            if ui.small_button("x").clicked() {
+                                row_to_delete = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = row_to_delete {
+                        keybinding_rows.remove(i);
+                    }
+                    if ui.button("Add binding").clicked() {
+                        keybinding_rows.push((String::new(), String::new()));
+                    }
+
+                    ui.separator();
+                    if ui.button("Save as default").clicked() {
+                        *save_as_default_requested = true;
+                    }
+                });
+        }
+
         if *color_picker_open {
             let mut color32 = color_to_color32(*color);
             egui::Window::new("Color")
@@ -1014,6 +1260,20 @@ fn run_command_bar_ui(
                     );
                 });
             *color = color32_to_color(color32);
+        }
+
+        if *width_picker_open {
+            // Matches `commands::WidthCommand`'s own clamp range (`:width`) — kept as a
+            // local duplicate rather than shared since `blueboard-app` isn't a dependency
+            // this crate can reach for it.
+            const WIDTH_MIN: f32 = 0.5;
+            const WIDTH_MAX: f32 = 50.0;
+            egui::Window::new("Width")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.add(egui::Slider::new(stroke_width, WIDTH_MIN..=WIDTH_MAX).text("px"));
+                });
         }
     })
 }
@@ -1143,7 +1403,7 @@ pub struct Renderer {
     grid_pipeline: wgpu::RenderPipeline,
     /// Uniform theme-colored `LineList` — the UI-only overlays (selection boxes, the
     /// eraser cursor), not board content.
-    preview_pipeline: wgpu::RenderPipeline,
+    selection_pipeline: wgpu::RenderPipeline,
     /// Per-vertex colored `TriangleList` — committed strokes/shapes and the shape tools'
     /// live preview.
     colored_stroke_pipeline: wgpu::RenderPipeline,
@@ -1188,6 +1448,7 @@ pub struct Renderer {
     image_quad_buffer: DynamicVertexBuffer,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    theme_buffer: wgpu::Buffer,
     theme_bind_group: wgpu::BindGroup,
     egui_ctx: egui::Context,
     egui_renderer: egui_wgpu::Renderer,
@@ -1345,13 +1606,14 @@ impl Renderer {
             }],
         });
 
-        // Theme colors are fixed for the process's lifetime (no live reload yet), so the
-        // uniform buffer is written once here and never again.
+        // `COPY_DST` (not just `UNIFORM`) since a board's embedded theme can now change
+        // on `:open` — `set_theme` rewrites this buffer in place rather than it being
+        // write-once.
         let theme_uniform: ThemeUniform = theme.into();
         let theme_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("theme uniform"),
             contents: bytemuck::bytes_of(&theme_uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let theme_bind_group_layout =
@@ -1442,12 +1704,12 @@ impl Renderer {
             wgpu::PrimitiveTopology::LineList,
             "fs_grid",
         );
-        let preview_pipeline = build_pipeline(
-            "stroke preview pipeline",
+        let selection_pipeline = build_pipeline(
+            "selection/eraser pipeline",
             "vs_main",
             Vertex::layout(),
             wgpu::PrimitiveTopology::LineList,
-            "fs_stroke",
+            "fs_selection",
         );
         let colored_stroke_pipeline = build_pipeline(
             "colored stroke pipeline",
@@ -1659,7 +1921,7 @@ impl Renderer {
                 a: 1.0,
             },
             grid_pipeline,
-            preview_pipeline,
+            selection_pipeline,
             colored_stroke_pipeline,
             colored_preview_pipeline,
             background_gradient_pipeline,
@@ -1676,6 +1938,7 @@ impl Renderer {
             background_quad_buffer,
             camera_buffer,
             camera_bind_group,
+            theme_buffer,
             theme_bind_group,
             egui_ctx,
             egui_renderer,
@@ -1705,6 +1968,16 @@ impl Renderer {
 
     pub fn viewport_size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// Re-theme the board — a board's theme is now part of its embedded `Config`
+    /// (`blueboard-core::config::Theme`), so opening a different board can mean a
+    /// different theme, not just at startup. Rewrites the existing uniform buffer in
+    /// place rather than recreating the bind group.
+    pub fn set_theme(&mut self, theme: ThemeColors) {
+        let theme_uniform: ThemeUniform = theme.into();
+        self.queue
+            .write_buffer(&self.theme_buffer, 0, bytemuck::bytes_of(&theme_uniform));
     }
 
     /// Whether `screen_pos` (physical pixels, winit's unit) falls within the always-drawn
@@ -1887,6 +2160,24 @@ impl Renderer {
             tool_names,
             tool_picker_open,
             tool_picked,
+            config_window_open,
+            theme: live_theme,
+            macros,
+            camera_macros,
+            macro_to_delete,
+            camera_macro_to_delete,
+            save_as_default_requested,
+            board_color_changed,
+            stroke_color_changed,
+            stroke_width,
+            width_picker_open,
+            background_image_input,
+            background_image_requested,
+            macro_digit_input,
+            macro_set_requested,
+            camera_macro_number_input,
+            camera_macro_set_requested,
+            keybinding_rows,
             scale_factor,
         } = frame;
         // `get_current_texture` returns an enum rather than a `Result` as of wgpu 30 — the
@@ -2342,7 +2633,7 @@ impl Renderer {
             }
 
             if uniform_preview_count > 0 {
-                pass.set_pipeline(&self.preview_pipeline);
+                pass.set_pipeline(&self.selection_pipeline);
                 pass.set_vertex_buffer(0, self.uniform_preview_buffer.buffer.slice(..));
                 pass.draw(0..uniform_preview_count, 0..1);
             }
@@ -2360,6 +2651,10 @@ impl Renderer {
                 active_tool_name,
                 text_draws: &text_draws,
                 tool_names,
+                grid,
+                background,
+                macros,
+                camera_macros,
             },
             std::mem::take(&mut self.egui_pending_events),
             CommandBarOutputs {
@@ -2367,6 +2662,22 @@ impl Renderer {
                 color_picker_open,
                 tool_picker_open,
                 tool_picked,
+                config_window_open,
+                theme: live_theme,
+                macro_to_delete,
+                camera_macro_to_delete,
+                save_as_default_requested,
+                board_color_changed,
+                stroke_color_changed,
+                stroke_width,
+                width_picker_open,
+                background_image_input,
+                background_image_requested,
+                macro_digit_input,
+                macro_set_requested,
+                camera_macro_number_input,
+                camera_macro_set_requested,
+                keybinding_rows,
             },
         );
         let clipped_primitives = self

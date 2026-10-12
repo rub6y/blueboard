@@ -20,14 +20,12 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-mod camera_macros;
 mod color;
 mod commands;
 mod config;
 mod gif;
 mod latex;
 mod logging;
-mod macros;
 mod screencast;
 mod text_edit;
 mod tools;
@@ -52,7 +50,29 @@ struct App {
     /// already defaults to "nothing held".
     modifiers: winit::keyboard::ModifiersState,
 
-    config: config::Config,
+    /// Single-character key -> command text — see `blueboard_core::config::Config::
+    /// keybindings`'s doc comment.
+    keybindings: std::collections::HashMap<String, String>,
+    /// The board/theme/grid/background/macro config loaded (or defaulted) right before
+    /// this board — `:new` resets back to it, "save as default" in the config window
+    /// overwrites `default_config.toml` with the *current* live settings instead (see
+    /// `App::config_snapshot`), not this stale copy.
+    default_config: blueboard_core::config::Config,
+    /// Live, editable (via the config window) theme colors — unlike before, not fixed
+    /// for the process's lifetime: a board's embedded config can carry a different theme,
+    /// applied via `Renderer::set_theme` on `:open`/`:new`, or edited live in the config
+    /// window the same way the color picker already edits `current_color` live.
+    theme: blueboard_core::config::Theme,
+    /// Set together with `background` whenever it becomes `BackgroundMode::Image` (only
+    /// by `:background image <path>` or loading a config with an `Image` background) —
+    /// `BackgroundMode::Image` itself has no path (see its own doc comment), but a saved
+    /// config needs one to re-decode from, so it's tracked here instead. `None` whenever
+    /// `background` isn't `Image`.
+    background_image_path: Option<String>,
+    /// Whether the config window (opened via the status bar's gear icon) is open —
+    /// same "suppress tool dispatch, forward to egui" shape as `color_picker_open`/
+    /// `tool_picker_open`.
+    config_window_open: bool,
     registry: commands::CommandRegistry,
     tools: tools::ToolRegistry,
     /// `true` while composing a `:`-command (between pressing `:` and Enter/Escape).
@@ -144,14 +164,29 @@ struct App {
     /// GIF elements' frame-timer state, keyed by element id — see `gif.rs`'s doc comment
     /// on why this lives here rather than in `Scene` (mirrors `live_screencasts` above).
     gif_players: std::collections::HashMap<u64, gif::GifPlayer>,
-    /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
-    /// their own file — see `macros.rs`'s doc comment for why that's separate from
-    /// `config.toml`. Loaded once at startup in `main()`.
-    macros: macros::Macros,
-    /// Camera (pan+zoom) macros bound to function keys, set by `:fm <number>` and
-    /// persisted to their own file — see `camera_macros.rs`'s doc comment. Loaded once at
-    /// startup in `main()`.
-    camera_macros: camera_macros::CameraMacros,
+    /// Tool+color macros bound to number keys, set by `:m <number>` — part of the active
+    /// `Config` now (see `blueboard_core::config`), persisted via `:save`/"save as
+    /// default", not written to disk the instant `:m` sets one anymore.
+    macros: blueboard_core::config::Macros,
+    /// Camera (pan+zoom) macros bound to function keys, set by `:fm <number>` — same
+    /// "part of the active `Config`" shape as `macros` above.
+    camera_macros: blueboard_core::config::CameraMacros,
+    /// Whether the width-picker popup is currently open — opened by clicking the status
+    /// bar's width indicator, same "suppress tool dispatch, forward to egui" shape as
+    /// `color_picker_open`.
+    width_picker_open: bool,
+    /// The config window's background-image path text field — see `blueboard_render::
+    /// Frame::background_image_input`'s doc comment.
+    background_image_input: String,
+    /// The config window's "digit to bind" field for a new tool/color macro.
+    macro_digit_input: u8,
+    /// Same shape as `macro_digit_input`, for camera macros.
+    camera_macro_number_input: u32,
+    /// The config window's keybinding editor rows — see `blueboard_render::Frame::
+    /// keybinding_rows`'s doc comment on why this is a `Vec`, not `keybindings` itself.
+    /// Repopulated from `keybindings` whenever the config window transitions closed ->
+    /// open, so edits made elsewhere (loading a board) aren't clobbered by a stale copy.
+    keybinding_rows: Vec<(String, String)>,
 }
 
 impl ApplicationHandler for App {
@@ -171,12 +206,20 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
         log::info!("window created at {}x{}", size.width, size.height);
-        let renderer = pollster::block_on(Renderer::new(
+        let mut renderer = pollster::block_on(Renderer::new(
             window.clone(),
             (size.width, size.height),
-            self.config.theme.into(),
+            config::theme_to_colors(self.theme),
         ));
         log::info!("renderer initialized");
+
+        // Deferred from `main()`'s initial `default_config` apply: an `Image`
+        // background needs the renderer (to decode-and-upload) to exist, which it
+        // doesn't until right now.
+        let (background, background_image_path) =
+            config::apply_background(self.default_config.background.clone(), &mut renderer);
+        self.background = background;
+        self.background_image_path = background_image_path;
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -276,6 +319,34 @@ impl ApplicationHandler for App {
                 let text_input_color = self.current_color;
                 let tool_names: Vec<&'static str> = self.tools.completions("");
                 let mut tool_picked: Option<&'static str> = None;
+                let mut macro_to_delete: Option<String> = None;
+                let mut camera_macro_to_delete: Option<String> = None;
+                let mut save_as_default_requested = false;
+                let mut board_color_changed: Option<[f32; 3]> = None;
+                let mut stroke_color_changed: Option<[f32; 3]> = None;
+                let mut background_image_requested: Option<String> = None;
+                let mut macro_set_requested: Option<u8> = None;
+                let mut camera_macro_set_requested: Option<u32> = None;
+                // Refreshed from the live `keybindings` map right before every frame the
+                // config window *isn't yet* open — so if this frame's click opens it (the
+                // gear toggle happens inside `render`, same frame), it already shows
+                // current bindings rather than a stale leftover from last time it was
+                // open. Not resynced while already open: that would stomp on in-progress
+                // edits every single frame.
+                if !self.config_window_open {
+                    let mut rows: Vec<(String, String)> = self
+                        .keybindings
+                        .iter()
+                        .map(|(key, command)| (key.clone(), command.clone()))
+                        .collect();
+                    rows.sort();
+                    self.keybinding_rows = rows;
+                }
+                // `theme.stroke_color` isn't itself the drawing color, just a config
+                // default — but the config window's "Stroke" swatch edits it directly,
+                // so it has to track `current_color` whenever that changes some other
+                // way (`:color`, a macro) or the swatch would show a stale value.
+                self.theme.stroke_color = self.current_color;
 
                 match renderer.render(Frame {
                     camera: &self.camera,
@@ -300,6 +371,24 @@ impl ApplicationHandler for App {
                     tool_names: &tool_names,
                     tool_picker_open: &mut self.tool_picker_open,
                     tool_picked: &mut tool_picked,
+                    config_window_open: &mut self.config_window_open,
+                    theme: &mut self.theme,
+                    macros: &self.macros,
+                    camera_macros: &self.camera_macros,
+                    macro_to_delete: &mut macro_to_delete,
+                    camera_macro_to_delete: &mut camera_macro_to_delete,
+                    save_as_default_requested: &mut save_as_default_requested,
+                    board_color_changed: &mut board_color_changed,
+                    stroke_color_changed: &mut stroke_color_changed,
+                    stroke_width: &mut self.current_stroke_width,
+                    width_picker_open: &mut self.width_picker_open,
+                    background_image_input: &mut self.background_image_input,
+                    background_image_requested: &mut background_image_requested,
+                    macro_digit_input: &mut self.macro_digit_input,
+                    macro_set_requested: &mut macro_set_requested,
+                    camera_macro_number_input: &mut self.camera_macro_number_input,
+                    camera_macro_set_requested: &mut camera_macro_set_requested,
+                    keybinding_rows: &mut self.keybinding_rows,
                     scale_factor,
                 }) {
                     RenderOutcome::Rendered | RenderOutcome::Skipped => {}
@@ -312,6 +401,85 @@ impl ApplicationHandler for App {
                 if let Some(name) = tool_picked {
                     self.tools.set_active(name);
                     self.status = Some((format!("tool: {name}"), false));
+                }
+                if let Some(key) = macro_to_delete {
+                    self.macros.remove(&key);
+                }
+                if let Some(key) = camera_macro_to_delete {
+                    self.camera_macros.remove(&key);
+                }
+                if self.config_window_open {
+                    // Cheap enough to just always resync rather than track a separate
+                    // "did a theme color actually change this frame" dirty flag — see
+                    // `Frame::theme`'s doc comment on why this is the one live editor
+                    // this first pass has.
+                    renderer.set_theme(config::theme_to_colors(self.theme));
+                }
+                if let Some(color) = board_color_changed {
+                    // Only meaningful while the background is actually a solid fill —
+                    // a gradient/image background has its own distinct colors, not one
+                    // "board color" this swatch could sensibly stand in for.
+                    if matches!(self.background, blueboard_render::BackgroundMode::Solid(_)) {
+                        self.background = blueboard_render::BackgroundMode::Solid(color);
+                        self.background_image_path = None;
+                    }
+                }
+                if let Some(color) = stroke_color_changed {
+                    self.current_color = color;
+                }
+                if let Some(path) = background_image_requested {
+                    match commands::set_background_image(
+                        renderer,
+                        &mut self.background,
+                        &mut self.background_image_path,
+                        &path,
+                        blueboard_render::ImageFit::ZoomWithCamera,
+                    ) {
+                        Ok(message) => self.status = Some((message, false)),
+                        Err(message) => self.status = Some((message, true)),
+                    }
+                }
+                if let Some(digit) = macro_set_requested {
+                    match commands::set_macro(
+                        self.tools.active_tool().name(),
+                        self.current_color,
+                        &mut self.macros,
+                        &digit.to_string(),
+                    ) {
+                        Ok(message) => self.status = Some((message, false)),
+                        Err(message) => self.status = Some((message, true)),
+                    }
+                }
+                if let Some(number) = camera_macro_set_requested {
+                    match commands::set_camera_macro(
+                        self.camera.pan.to_array(),
+                        self.camera.zoom,
+                        &mut self.camera_macros,
+                        number,
+                    ) {
+                        Ok(message) => self.status = Some((message, false)),
+                        Err(message) => self.status = Some((message, true)),
+                    }
+                }
+                if self.config_window_open {
+                    // Same "cheap enough to always resync" stance as the theme resync
+                    // above — rows with an invalid (not exactly one character) key are
+                    // left out of the live map but keep showing in the editor, so a
+                    // still-being-typed key doesn't vanish or take effect early.
+                    self.keybindings = self
+                        .keybinding_rows
+                        .iter()
+                        .filter(|(key, _)| key.chars().count() == 1)
+                        .map(|(key, command)| (key.clone(), command.clone()))
+                        .collect();
+                }
+                // After every other out-param's been applied, and `renderer`'s last use
+                // above — `config_snapshot` takes `&self` as a whole, which can't coexist
+                // with `renderer`'s still-outstanding `&mut self.renderer` borrow.
+                if save_as_default_requested {
+                    let snapshot = self.config_snapshot();
+                    config::save_as_default(&snapshot);
+                    self.status = Some(("saved as default config".to_string(), false));
                 }
                 // Normally redraws only happen in response to input — fine for a static
                 // board, but a magic window's capture produces new frames on its *own*
@@ -342,6 +510,8 @@ impl ApplicationHandler for App {
                 // for why this is a geometry check, not an egui round-trip.
                 if self.color_picker_open
                     || self.tool_picker_open
+                    || self.config_window_open
+                    || self.width_picker_open
                     || renderer.point_in_command_bar(self.last_cursor, window.scale_factor() as f32)
                 {
                     let pos = screen_to_egui_points(self.last_cursor, window.scale_factor());
@@ -419,6 +589,8 @@ impl ApplicationHandler for App {
                 let cursor = DVec2::new(position.x, position.y);
                 if self.color_picker_open
                     || self.tool_picker_open
+                    || self.config_window_open
+                    || self.width_picker_open
                     || renderer.point_in_command_bar(cursor, window.scale_factor() as f32)
                 {
                     let pos = screen_to_egui_points(cursor, window.scale_factor());
@@ -825,6 +997,42 @@ impl App {
                 self.tool_picker_open = false;
             }
             window.request_redraw();
+        } else if self.config_window_open {
+            // Same shape as the `color_picker_open` branch above — the window now has
+            // its own text fields (background-image path, keybinding key/command), so
+            // keyboard input has to reach egui, not just clicks.
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.config_window_open = false;
+                }
+                _ => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        if let Some(egui_key) = winit_key_to_egui(&event.logical_key) {
+                            renderer.push_egui_event(egui::Event::Key {
+                                key: egui_key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::default(),
+                            });
+                        }
+                        if let Some(text) = &event.text {
+                            let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                            if !typed.is_empty() {
+                                renderer.push_egui_event(egui::Event::Text(typed));
+                            }
+                        }
+                    }
+                }
+            }
+            window.request_redraw();
+        } else if self.width_picker_open {
+            // Same shape as `tool_picker_open` — a slider is a click/drag target only,
+            // no keyboard nav needed inside it.
+            if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                self.width_picker_open = false;
+            }
+            window.request_redraw();
         } else {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => event_loop.exit(),
@@ -867,7 +1075,7 @@ impl App {
                     window.request_redraw();
                 }
                 Key::Character(text) => {
-                    let binding = self.config.keybindings.get(text.as_str()).cloned();
+                    let binding = self.keybindings.get(text.as_str()).cloned();
                     if let Some(binding) = binding {
                         let (name, args) = binding.split_once(' ').unwrap_or((&binding, ""));
                         self.run_command(name, args);
@@ -956,6 +1164,51 @@ impl App {
         self.command_line_text = format!("{fixed_prefix}{}", candidates[next].0);
     }
 
+    /// Builds a [`blueboard_core::config::Config`] from whatever's currently active —
+    /// used by `:save` (embedded in the `.bbd`) and the config window's "save as
+    /// default" action.
+    fn config_snapshot(&self) -> blueboard_core::config::Config {
+        // `theme.stroke_color` (the default drawing color for a *new* board) can go
+        // stale relative to `current_color` (which also changes via `:color`/macros,
+        // not just the config window's swatch) — captured fresh here rather than read
+        // off `self.theme` directly, same "capture current state" stance
+        // `background_to_config` already takes for the background.
+        let mut theme = self.theme;
+        theme.stroke_color = self.current_color;
+        blueboard_core::config::Config {
+            keybindings: self.keybindings.clone(),
+            theme,
+            grid: config::grid_to_config(self.grid),
+            background: config::background_to_config(
+                self.background,
+                self.background_image_path.as_deref(),
+            ),
+            macros: self.macros.clone(),
+            camera_macros: self.camera_macros.clone(),
+        }
+    }
+
+    /// Replaces the whole active config with `config` — used by `:open` (the board's
+    /// embedded config) and `:new` (resets to `self.default_config`). Needs the renderer
+    /// (to re-theme and to decode-and-upload an `Image` background), which by the time
+    /// either of those commands can run always exists — unlike `resumed`'s own deferred
+    /// apply at startup, before the renderer exists yet.
+    fn apply_config(&mut self, config: blueboard_core::config::Config) {
+        self.keybindings = config.keybindings;
+        self.theme = config.theme;
+        self.current_color = config.theme.stroke_color;
+        self.grid = config::grid_to_runtime(config.grid);
+        self.macros = config.macros;
+        self.camera_macros = config.camera_macros;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_theme(config::theme_to_colors(self.theme));
+            let (background, background_image_path) =
+                config::apply_background(config.background, renderer);
+            self.background = background;
+            self.background_image_path = background_image_path;
+        }
+    }
+
     /// Runs a command by name (from the command line or a keybinding) and records the
     /// result as the next status message.
     fn run_command(&mut self, name: &str, args: &str) {
@@ -983,26 +1236,28 @@ fn main() {
     let log_path = logging::init();
     log::info!("blueboard starting, logging to {}", log_path.display());
 
-    let config = config::load();
-    let board_color = config.theme.board_color;
+    let default_config = config::load_default();
     let registry = commands::CommandRegistry::with_builtin_commands();
-    let macros = macros::load();
-    let camera_macros = camera_macros::load();
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App {
-        config,
-        registry,
-        macros,
-        camera_macros,
+        keybindings: default_config.keybindings.clone(),
+        theme: default_config.theme,
+        grid: config::grid_to_runtime(default_config.grid),
+        macros: default_config.macros.clone(),
+        camera_macros: default_config.camera_macros.clone(),
+        // `BackgroundMode` has no `Default` impl (deliberately — see its doc comment: an
+        // arbitrary default color would be the wrong kind of silent); a real value is
+        // set in `resumed`, once the renderer needed to decode-and-upload a possible
+        // `Image` background actually exists — this is just enough to satisfy
+        // `#[derive(Default)]` until then.
+        background: blueboard_render::BackgroundMode::Solid(default_config.theme.board_color),
         // `#[derive(Default)]` would otherwise zero this to black — see the field's doc
         // comment.
-        current_color: blueboard_core::scene::DEFAULT_ELEMENT_COLOR,
+        current_color: default_config.theme.stroke_color,
         current_stroke_width: blueboard_core::scene::DEFAULT_STROKE_WIDTH,
-        // `BackgroundMode` has no `Default` impl (deliberately — see its doc comment: an
-        // arbitrary default color would be the wrong kind of silent), so it's set here
-        // from the loaded theme, same as `current_color` above.
-        background: blueboard_render::BackgroundMode::Solid(board_color),
+        default_config,
+        registry,
         ..Default::default()
     };
     event_loop.run_app(&mut app).expect("event loop error");

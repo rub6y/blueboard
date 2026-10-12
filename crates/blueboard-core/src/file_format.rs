@@ -14,6 +14,7 @@ use std::path::Path;
 use kurbo::BezPath;
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
 use crate::scene::{ElementKind, Scene};
 
 /// On-disk format version. Bump this whenever `SceneDocument`'s shape changes in a way
@@ -37,7 +38,13 @@ use crate::scene::{ElementKind, Scene};
 ///
 /// Bumped to 7 for `ElementKind::Stroke` gaining a `width: f32` field (`:width`) — same
 /// policy again: a v6 file's `Stroke` has no such field to read.
-const FORMAT_VERSION: u32 = 7;
+///
+/// Bumped to 8 for `SceneDocument` gaining a `config: Config` field — a board now embeds
+/// its own keybindings/theme/grid/background/macros, so opening it can restore all of
+/// that alongside the elements, not just reset to whatever `default_config.toml` (or a
+/// previous board) left active. A v7 file has no such field; rejected outright, same
+/// policy as every bump above.
+const FORMAT_VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize)]
 struct ElementDocument {
@@ -51,6 +58,7 @@ struct ElementDocument {
 struct SceneDocument {
     version: u32,
     elements: Vec<ElementDocument>,
+    config: Config,
 }
 
 #[derive(Debug)]
@@ -96,8 +104,9 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// Save every element in `scene` (not just what's currently visible) to `path`.
-pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), SaveError> {
+/// Save every element in `scene` (not just what's currently visible), plus `config` (this
+/// board's own keybindings/theme/grid/background/macros snapshot), to `path`.
+pub fn save(scene: &Scene, config: &Config, path: impl AsRef<Path>) -> Result<(), SaveError> {
     let mut elements: Vec<ElementDocument> = scene
         .all_elements()
         .map(|element| ElementDocument {
@@ -114,6 +123,7 @@ pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), SaveError> {
     let document = SceneDocument {
         version: FORMAT_VERSION,
         elements,
+        config: config.clone(),
     };
 
     let encoded = bincode::serde::encode_to_vec(&document, bincode::config::standard())
@@ -123,8 +133,8 @@ pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), SaveError> {
     std::fs::write(path, compressed).map_err(SaveError::Io)
 }
 
-/// Load a scene previously written by [`save`].
-pub fn load(path: impl AsRef<Path>) -> Result<Scene, LoadError> {
+/// Load a scene (and its embedded config) previously written by [`save`].
+pub fn load(path: impl AsRef<Path>) -> Result<(Scene, Config), LoadError> {
     let compressed = std::fs::read(path).map_err(LoadError::Io)?;
     let encoded = zstd::decode_all(&compressed[..]).map_err(LoadError::Decompress)?;
     let (document, _): (SceneDocument, usize) =
@@ -139,7 +149,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Scene, LoadError> {
     for element in document.elements {
         scene.insert_loaded_element(element.id, element.path, element.color, element.kind);
     }
-    Ok(scene)
+    Ok((scene, document.config))
 }
 
 #[cfg(test)]
@@ -174,8 +184,8 @@ mod tests {
         scene.add_element_with_color(sample_path(10.0), [0.9, 0.2, 0.2]);
 
         let path = temp_bbd_path("round-trips-scene");
-        save(&scene, &path).expect("save should succeed");
-        let loaded = load(&path).expect("load should succeed");
+        save(&scene, &Config::default(), &path).expect("save should succeed");
+        let (loaded, _config) = load(&path).expect("load should succeed");
         std::fs::remove_file(&path).ok();
 
         assert_eq!(loaded.len(), scene.len());
@@ -210,8 +220,8 @@ mod tests {
         );
 
         let path = temp_bbd_path("image-element-round-trips");
-        save(&scene, &path).expect("save should succeed");
-        let loaded = load(&path).expect("load should succeed");
+        save(&scene, &Config::default(), &path).expect("save should succeed");
+        let (loaded, _config) = load(&path).expect("load should succeed");
         std::fs::remove_file(&path).ok();
 
         let element = loaded.element(id).expect("image element should round-trip");
@@ -239,8 +249,8 @@ mod tests {
         );
 
         let path = temp_bbd_path("text-element-round-trips");
-        save(&scene, &path).expect("save should succeed");
-        let loaded = load(&path).expect("load should succeed");
+        save(&scene, &Config::default(), &path).expect("save should succeed");
+        let (loaded, _config) = load(&path).expect("load should succeed");
         std::fs::remove_file(&path).ok();
 
         let element = loaded.element(id).expect("text element should round-trip");
@@ -258,8 +268,8 @@ mod tests {
         scene.add_element(sample_path(10.0)); // id 1
 
         let path = temp_bbd_path("continues-ids");
-        save(&scene, &path).expect("save should succeed");
-        let mut loaded = load(&path).expect("load should succeed");
+        save(&scene, &Config::default(), &path).expect("save should succeed");
+        let (mut loaded, _config) = load(&path).expect("load should succeed");
         std::fs::remove_file(&path).ok();
 
         let new_id = loaded.add_element(sample_path(20.0));
@@ -270,8 +280,8 @@ mod tests {
     fn empty_scene_round_trips() {
         let scene = Scene::new();
         let path = temp_bbd_path("empty-scene");
-        save(&scene, &path).expect("save should succeed");
-        let loaded = load(&path).expect("load should succeed");
+        save(&scene, &Config::default(), &path).expect("save should succeed");
+        let (loaded, _config) = load(&path).expect("load should succeed");
         std::fs::remove_file(&path).ok();
 
         assert!(loaded.is_empty());
@@ -282,6 +292,7 @@ mod tests {
         let document = SceneDocument {
             version: FORMAT_VERSION + 1,
             elements: vec![],
+            config: Config::default(),
         };
         let encoded =
             bincode::serde::encode_to_vec(&document, bincode::config::standard()).unwrap();
