@@ -40,6 +40,14 @@
               pkgs.libxcursor
               pkgs.libxi
               pkgs.libxrandr
+              # `pipewire` crate (magic-window screen capture, `blueboard-app/src/
+              # screencast.rs`) needs libpipewire's dev headers (found via pkg-config,
+              # already in `packages`) and a working bindgen setup for its build step —
+              # `bindgenHook` wires up `LIBCLANG_PATH`/`BINDGEN_EXTRA_CLANG_ARGS` so
+              # libclang can still find glibc's own headers (plain `llvmPackages.libclang`
+              # isn't enough on its own, see the ledger).
+              pkgs.pipewire
+              pkgs.rustPlatform.bindgenHook
               (pkgs.texlive.combine {
                 inherit (pkgs.texlive)
                   scheme-small
@@ -64,6 +72,7 @@
               pkgs.libxcursor
               pkgs.libxi
               pkgs.libxrandr
+              pkgs.pipewire
             ];
           };
         }

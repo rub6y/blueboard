@@ -15,6 +15,13 @@ path = "src/main.rs"
 # copied by a native Wayland app on a Wayland-native session (this machine's actual
 # desktop, per `nixos.md`'s own notes on needing `WAYLAND_DISPLAY` handling for winit).
 arboard = { version = "3", features = ["wayland-data-control"] }
+# Drives the `org.freedesktop.portal.ScreenCast` D-Bus portal behind a magic window
+# (`screencast.rs`): create session -> select sources -> start, which is also the await
+# that blocks on the compositor's own native picker dialog. Async-only API, hence `tokio`
+# below. Caches its D-Bus connection in its own process-wide `static` — see `screencast.rs`'s
+# `shared_runtime` doc comment for why that makes a *shared, never-dropped* tokio runtime
+# load-bearing, not just an optimization.
+ashpd = "0.11"
 blueboard-core = { path = "../blueboard-core" }
 blueboard-render = { path = "../blueboard-render" }
 # Only for constructing the handful of input events forwarded to the color picker (see
@@ -28,12 +35,17 @@ glam = "0.34.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 kurbo = "0.13.1"
 log = { version = "0.4.34", features = ["std"] }
+# Consumes the PipeWire video stream a ScreenCast portal session hands back (`screencast.
+# rs`) — synchronous, callback-driven `MainLoop`/`Stream` API, run on its own thread per
+# magic window (mirrors the shape `terminal.rs` used to have for its PTY reader thread).
+# Needs `libpipewire` dev headers + `libclang` (bindgen) at build time — see flake.nix.
+pipewire = "0.8"
 pollster = "1.0.1"
-# Spawns the real shell behind a magic window (`terminal.rs`); `vte` parses its output
-# (just the ANSI/VT escape-sequence state machine, not a full terminal emulator like
-# `alacritty_terminal` — deliberately minimal, see `terminal.rs`'s doc comment).
-portable-pty = "0.9"
 serde = { version = "1.0.229", features = ["derive"] }
+# Drives `ashpd`'s portal negotiation, as one runtime shared across every capture for the
+# whole process's life (`screencast.rs`'s `shared_runtime`) — "rt-multi-thread" (not plain
+# "rt"/current-thread) since multiple captures' `block_on` calls can be in flight
+# concurrently, each from its own capture thread. "net"/"time" for zbus's own D-Bus I/O.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
 toml = "1.1.7"
-vte = "0.15"
 winit = "0.30.13"

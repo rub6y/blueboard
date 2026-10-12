@@ -227,25 +227,6 @@ pub enum ScenePreview<'a> {
     MultiSelection(Vec<kurbo::Rect>),
 }
 
-/// One magic window's live content, board-space positioned — see `Frame::terminal_draws`.
-/// `lines` is already a plain `Vec<String>`, one per row: the ANSI/cursor-movement
-/// interpretation (`blueboard-app`'s `terminal.rs`) has already collapsed the shell's
-/// output into flat text by the time it reaches here — this crate just paints it, the
-/// same "parse elsewhere, paint here" split `text::TextRun` already has for math spans.
-/// Known limits: no per-cell color/bold/underline (every line paints in one flat color),
-/// no cursor glyph — both acceptable for a first magic-window step, see the ledger.
-pub struct TerminalDraw {
-    pub board_rect: kurbo::Rect,
-    pub lines: Vec<String>,
-}
-
-/// Board-space font size each terminal row paints at — fixed, not configurable yet (no
-/// PTY resize support either — see `TerminalDraw`'s doc comment).
-const TERMINAL_FONT_SIZE: f32 = 14.0;
-const TERMINAL_LINE_HEIGHT: f32 = TERMINAL_FONT_SIZE * 1.3;
-const TERMINAL_BG_COLOR: [f32; 3] = [0.02, 0.02, 0.02];
-const TERMINAL_TEXT_COLOR: [f32; 3] = [0.85, 0.85, 0.85];
-
 /// One committed `Text` element, ready to paint — built fresh each frame in `render` from
 /// whatever's currently visible (see `ElementKind::Text`), `runs` already parsed via
 /// `text_markup::parse` and resolved against `Renderer::math_textures` (cheap for the
@@ -290,12 +271,6 @@ pub struct Frame<'a> {
     pub grid: GridSettings,
     pub background: BackgroundMode,
     pub text_input: Option<TextInputPreview<'a>>,
-    /// Live magic-window terminal content, one entry per element currently showing a
-    /// shell — built in `blueboard-app` from its own `live_terminals` state each frame
-    /// (this crate never touches a PTY). Drawn as a dark filled rect plus monochrome
-    /// text rows; see `TerminalDraw`'s doc comment for the known limits (no colors/
-    /// attributes, no cursor glyph).
-    pub terminal_draws: &'a [TerminalDraw],
     /// `Some(color)` shows the color picker this frame, editing `color` in place; `None`
     /// keeps it closed. Only while open does real pointer/keyboard input reach egui at
     /// all — see `Renderer::egui_pending_events`.
@@ -1813,7 +1788,6 @@ impl Renderer {
             grid,
             background,
             text_input,
-            terminal_draws,
             color_picker,
             scale_factor,
         } = frame;
@@ -1926,10 +1900,16 @@ impl Renderer {
                         color: color_to_color32(element.color),
                     });
                 }
-                ElementKind::Image(_) => {
-                    // Not yet uploaded (just loaded from a saved board, this frame) —
-                    // `ensure_image_textures` (`blueboard-app`) closes this gap on the
-                    // next redraw; nothing to draw this one.
+                // A magic window draws exactly like a pasted image — a camera-transformed
+                // textured quad keyed by element id — since both are "whatever's currently
+                // in `element_textures` for this id" as far as this crate's concerned; the
+                // only difference is *how* that texture gets there (`blueboard-app`'s
+                // `ensure_live_screencasts` feeding PipeWire frames into `set_element_
+                // texture`, vs. a paste/load uploading once). Nothing to draw before the
+                // first frame arrives (just loaded, or still waiting on the compositor's
+                // source picker) — same "not yet uploaded" gap `ElementKind::Image` already
+                // has for a freshly loaded board.
+                ElementKind::Image(_) | ElementKind::MagicWindow => {
                     if self.element_textures.contains_key(&element.id) {
                         let bbox = element.path.bounding_box();
                         let top_left = DVec2::new(bbox.x0, bbox.y0);
@@ -1941,10 +1921,6 @@ impl Renderer {
                         image_draw_ranges.push((start, quad.len() as u32, element.id));
                     }
                 }
-                // Drawn separately from `Frame::terminal_draws` (built in `blueboard-app`
-                // from its own `live_terminals` state, which this crate has no visibility
-                // into) — `path` here is only its bbox/hit-test rect.
-                ElementKind::MagicWindow { .. } => {}
                 ElementKind::Stroke => {
                     let cache_hit =
                         self.tessellation_cache
@@ -1986,51 +1962,6 @@ impl Renderer {
             &image_quads,
         );
 
-        // Magic windows: a dark filled rect (two triangles appended straight into
-        // `stroke_vertices` — same `ColorVertex`/`TriangleList` shape `colored_stroke_
-        // pipeline` already draws strokes with, so no new pipeline is needed just for a
-        // flat-colored background quad) plus monochrome text rows through the same `egui`
-        // text path scene `Text` elements use.
-        for terminal in terminal_draws {
-            let rect = terminal.board_rect;
-            let corners = [
-                [rect.x0 as f32, rect.y0 as f32],
-                [rect.x1 as f32, rect.y0 as f32],
-                [rect.x1 as f32, rect.y1 as f32],
-                [rect.x0 as f32, rect.y1 as f32],
-            ];
-            let bg = TERMINAL_BG_COLOR;
-            for &(a, b, c) in &[(0, 1, 2), (0, 2, 3)] {
-                for i in [a, b, c] {
-                    stroke_vertices.push(ColorVertex {
-                        position: corners[i],
-                        color: bg,
-                    });
-                }
-            }
-            let top_left = DVec2::new(rect.x0, rect.y0);
-            let screen = camera.board_to_screen(top_left, viewport_f64);
-            let screen_pos = egui::pos2(
-                (screen.x / scale_factor as f64) as f32,
-                (screen.y / scale_factor as f64) as f32,
-            );
-            let font_size_px = TERMINAL_FONT_SIZE * camera.zoom as f32 / scale_factor;
-            let line_height_px = TERMINAL_LINE_HEIGHT * camera.zoom as f32 / scale_factor;
-            for (row, line) in terminal.lines.iter().enumerate() {
-                text_draws.push(SceneTextDraw {
-                    screen_pos: egui::pos2(
-                        screen_pos.x,
-                        screen_pos.y + row as f32 * line_height_px,
-                    ),
-                    runs: vec![text::TextRun::Text {
-                        text: line.clone(),
-                        bold: false,
-                    }],
-                    font_size_px,
-                    color: color_to_color32(TERMINAL_TEXT_COLOR),
-                });
-            }
-        }
         let stroke_count = upload_dynamic(
             &mut self.stroke_buffer,
             &self.device,

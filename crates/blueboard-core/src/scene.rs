@@ -45,13 +45,16 @@ pub enum ElementKind {
     /// separate "intrinsic size" field that also needs rescaling, since an image has no
     /// analog to font size — the bbox *is* its only size.
     Image(Arc<ImageData>),
-    /// A magic window: an embedded shell inside this rect. `shell` is just the command to
-    /// run (e.g. `"bash"`) — deliberately the *only* thing persisted. The live process/PTY
-    /// is runtime-only state owned by `blueboard-app` (`terminal.rs`'s `LiveTerminal`,
-    /// keyed by element id, outside `Scene` entirely), never saved and never
-    /// auto-respawned just because a saved board gets reopened — same "what's saved vs.
-    /// what's rebuilt" split the R-tree index already has.
-    MagicWindow { shell: String },
+    /// A magic window: this rect streams another window/screen's live pixels, captured via
+    /// the `org.freedesktop.portal.ScreenCast` portal + PipeWire (`blueboard-app`'s
+    /// `screencast.rs`). Deliberately field-less — *which* source is showing is never
+    /// persisted (there's nothing stable to save: a portal session and its PipeWire stream
+    /// are both runtime-only handles, re-negotiated, including the user re-picking a
+    /// source via the compositor's own picker, every time a saved board gets reopened).
+    /// The live capture state itself lives in `blueboard-app` (keyed by element id, outside
+    /// `Scene` entirely), same "what's saved vs. what's rebuilt" split the R-tree index
+    /// already has.
+    MagicWindow,
 }
 
 pub struct Element {
@@ -172,17 +175,16 @@ impl Scene {
     }
 
     /// Adds a magic-window placeholder rect — see `ElementKind::MagicWindow`'s doc
-    /// comment for why this is just the rect + shell command, no live process here.
+    /// comment for why this is just the rect, no live capture state here.
     pub fn add_magic_window_element(
         &mut self,
         top_left: DVec2,
         width: f64,
         height: f64,
-        shell: String,
         color: [f32; 3],
     ) -> u64 {
         let path = image_bbox_path(top_left, width, height);
-        self.add_element_with_kind(path, color, ElementKind::MagicWindow { shell })
+        self.add_element_with_kind(path, color, ElementKind::MagicWindow)
     }
 
     /// Inserts an element under a specific id rather than generating one — used when

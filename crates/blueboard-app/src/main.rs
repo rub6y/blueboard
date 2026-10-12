@@ -13,7 +13,7 @@ use blueboard_core::history::History;
 use blueboard_core::scene::{ElementKind, Scene};
 use blueboard_render::{CommandBarContent, Frame, GridSettings, RenderOutcome, Renderer};
 use glam::DVec2;
-use kurbo::{BezPath, Point, Shape as _};
+use kurbo::{BezPath, Shape as _};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -28,7 +28,7 @@ mod gif;
 mod latex;
 mod logging;
 mod macros;
-mod terminal;
+mod screencast;
 mod text_edit;
 mod tools;
 
@@ -119,18 +119,14 @@ struct App {
     /// triples, not ids: a paste creates fresh elements with new ids, the originals are
     /// untouched. Replaced wholesale by the next `:yank`, not merged into.
     clipboard: Vec<(BezPath, [f32; 3], ElementKind)>,
-    /// Magic windows' live process/PTY/parsed-grid state, keyed by element id — see
-    /// `ElementKind::MagicWindow`'s doc comment on why this lives here, not in `Scene`.
-    /// Populated by `ensure_live_terminals` (once per redraw) for any `MagicWindow`
-    /// element missing an entry; dropped (killing the child) when the element is deleted
-    /// — see `ensure_live_terminals`'s own doc comment.
-    live_terminals: std::collections::HashMap<u64, terminal::LiveTerminal>,
-    /// The magic window currently receiving keyboard input, if any — set by clicking
-    /// inside one, cleared by Escape or clicking elsewhere (`handle_key_press`'s
-    /// top-priority branch, and `MouseInput`'s focus-check, mirror this same shape).
-    focused_terminal: Option<u64>,
+    /// Magic windows' live portal-session/PipeWire-stream state, keyed by element id —
+    /// see `ElementKind::MagicWindow`'s doc comment on why this lives here, not in
+    /// `Scene`. Populated by `ensure_live_screencasts` (once per redraw) for any
+    /// `MagicWindow` element missing an entry; dropped (tearing down the capture) when
+    /// the element is deleted — see `ensure_live_screencasts`'s own doc comment.
+    live_screencasts: std::collections::HashMap<u64, screencast::LiveScreencast>,
     /// GIF elements' frame-timer state, keyed by element id — see `gif.rs`'s doc comment
-    /// on why this lives here rather than in `Scene` (mirrors `live_terminals` above).
+    /// on why this lives here rather than in `Scene` (mirrors `live_screencasts` above).
     gif_players: std::collections::HashMap<u64, gif::GifPlayer>,
     /// Tool+color macros bound to number keys, set by `:m <number>` and persisted to
     /// their own file — see `macros.rs`'s doc comment for why that's separate from
@@ -206,10 +202,19 @@ impl ApplicationHandler for App {
                     renderer,
                 );
                 ensure_image_textures(&self.scene, renderer);
-                ensure_live_terminals(&self.scene, &mut self.live_terminals, &mut self.status);
+                ensure_live_screencasts(&self.scene, &mut self.live_screencasts, &mut self.status);
                 for (&id, player) in self.gif_players.iter_mut() {
                     if let Some(frame) = player.tick() {
                         renderer.set_element_texture(id, &frame.rgba, frame.width, frame.height);
+                    }
+                }
+                for (&id, live) in self.live_screencasts.iter_mut() {
+                    if let Some(frame) = live.pump() {
+                        renderer.set_element_texture(id, &frame.rgba, frame.width, frame.height);
+                    }
+                    if let Some(err) = live.take_error() {
+                        log::warn!("magic window capture failed: {err}");
+                        self.status = Some((format!("magic window: {err}"), true));
                     }
                 }
                 let completions: Vec<blueboard_render::Completion> = if self.command_line_active {
@@ -244,21 +249,6 @@ impl ApplicationHandler for App {
                 let active_tool_name = self.tools.active_tool().name();
                 // Captured before `color_picker`'s mutable borrow of `current_color`
                 // below, since the text-input preview also needs to read it.
-                let terminal_draws: Vec<blueboard_render::TerminalDraw> = self
-                    .scene
-                    .all_elements()
-                    .filter_map(|element| {
-                        if !matches!(element.kind, ElementKind::MagicWindow { .. }) {
-                            return None;
-                        }
-                        let live = self.live_terminals.get(&element.id)?;
-                        let bbox = element.path.bounding_box();
-                        Some(blueboard_render::TerminalDraw {
-                            board_rect: bbox,
-                            lines: live.lines(),
-                        })
-                    })
-                    .collect();
                 let text_input_color = self.current_color;
                 let color_picker = self.color_picker_open.then_some(&mut self.current_color);
 
@@ -280,7 +270,6 @@ impl ApplicationHandler for App {
                             editing_id: self.text_input_editing_id,
                         }
                     }),
-                    terminal_draws: &terminal_draws,
                     color_picker,
                     scale_factor,
                 }) {
@@ -292,16 +281,15 @@ impl ApplicationHandler for App {
                     }
                 }
                 // Normally redraws only happen in response to input — fine for a static
-                // board, but a magic window's shell produces output on its *own* schedule
-                // (a background reader thread feeding `ensure_live_terminals`'s channel),
-                // not in response to anything the user does here. Without this, that
-                // output only ever rendered on the user's *next* keystroke (whatever
-                // triggered that redraw), which read as output lagging a full keystroke
-                // behind — this keeps redrawing every frame for as long as any magic
-                // window exists, so output shows up within a frame instead. No effect at
-                // all on a board with none (the common case), since this is gated on
-                // `live_terminals` being non-empty.
-                if !self.live_terminals.is_empty() || !self.gif_players.is_empty() {
+                // board, but a magic window's capture produces new frames on its *own*
+                // schedule (a background thread feeding `ensure_live_screencasts`'s
+                // channel), not in response to anything the user does here. Without this,
+                // a captured frame only ever rendered on the user's *next* unrelated input,
+                // which read as the stream lagging behind — this keeps redrawing every
+                // frame for as long as any magic window exists, so new frames show up
+                // promptly instead. No effect at all on a board with none (the common
+                // case), since this is gated on `live_screencasts` being non-empty.
+                if !self.live_screencasts.is_empty() || !self.gif_players.is_empty() {
                     window.request_redraw();
                 }
             }
@@ -324,31 +312,6 @@ impl ApplicationHandler for App {
                     });
                     window.request_redraw();
                     return;
-                }
-
-                // Clicking inside a magic window focuses it (all further keystrokes route
-                // to its shell — see `handle_key_press`'s top-priority branch); clicking
-                // outside one while a magic window is focused un-focuses it and falls
-                // through to normal dispatch for this click, same as `tool text`'s
-                // one-mode-owns-input-at-a-time shape.
-                if state == ElementState::Pressed {
-                    let (width, height) = renderer.viewport_size();
-                    let viewport = DVec2::new(width as f64, height as f64);
-                    let board = self.camera.screen_to_board(self.last_cursor, viewport);
-                    let hit = self.scene.all_elements().find(|element| {
-                        matches!(element.kind, ElementKind::MagicWindow { .. })
-                            && element
-                                .path
-                                .bounding_box()
-                                .contains(Point::new(board.x, board.y))
-                    });
-                    if let Some(element) = hit {
-                        self.focused_terminal = Some(element.id);
-                        window.request_redraw();
-                        return;
-                    } else if self.focused_terminal.take().is_some() {
-                        window.request_redraw();
-                    }
                 }
 
                 // The text tool's only interaction is "click to place, then type" — see
@@ -590,37 +553,39 @@ fn ensure_math_textures(
 /// is a no-op for it by the time this next runs. Called once per `RedrawRequested`, cheap
 /// after the first pass since `Renderer::has_element_texture` makes every already-uploaded
 /// id a no-op `HashMap` lookup.
-/// Spawns a shell for any `MagicWindow` element without a `live_terminals` entry yet
-/// (freshly drawn, or — since the live process is never saved — reopened from a file) and
-/// pumps every live one's PTY output into its grid. Also drops any entry whose element no
-/// longer exists (deleted/erased/undone-away), which kills its child process via
-/// `LiveTerminal`'s `Drop`. Called once per `RedrawRequested`, mirroring `ensure_math_
+/// Starts a screen capture for any `MagicWindow` element without a `live_screencasts`
+/// entry yet (freshly drawn, or — since the live session is never saved — reopened from a
+/// file). Starting one spawns a background thread that negotiates the ScreenCast portal
+/// (popping the compositor's own source picker) and then streams decoded frames back; see
+/// `screencast::LiveScreencast::spawn`. Also drops any entry whose element no longer
+/// exists (deleted/erased/undone-away), which tears down its capture via
+/// `LiveScreencast`'s `Drop`. Called once per `RedrawRequested`, mirroring `ensure_math_
 /// textures`/`ensure_image_textures`'s own "catch up runtime-only state" shape.
-fn ensure_live_terminals(
+fn ensure_live_screencasts(
     scene: &Scene,
-    live_terminals: &mut std::collections::HashMap<u64, terminal::LiveTerminal>,
+    live_screencasts: &mut std::collections::HashMap<u64, screencast::LiveScreencast>,
     status: &mut Option<(String, bool)>,
 ) {
-    live_terminals.retain(|id, _| scene.element(*id).is_some());
+    live_screencasts.retain(|id, _| scene.element(*id).is_some());
     for element in scene.all_elements() {
-        if let blueboard_core::scene::ElementKind::MagicWindow { shell } = &element.kind {
+        if matches!(
+            element.kind,
+            blueboard_core::scene::ElementKind::MagicWindow
+        ) {
             if let std::collections::hash_map::Entry::Vacant(entry) =
-                live_terminals.entry(element.id)
+                live_screencasts.entry(element.id)
             {
-                match terminal::LiveTerminal::spawn(shell) {
+                match screencast::LiveScreencast::spawn() {
                     Ok(live) => {
                         entry.insert(live);
                     }
                     Err(err) => {
-                        log::warn!("failed to spawn magic window shell {shell:?}: {err}");
+                        log::warn!("failed to start magic window capture: {err}");
                         *status = Some((format!("magic window: {err}"), true));
                     }
                 }
             }
         }
-    }
-    for live in live_terminals.values_mut() {
-        live.pump();
     }
 }
 
@@ -641,36 +606,6 @@ impl App {
         let Some(window) = self.window.clone() else {
             return;
         };
-
-        if let Some(id) = self.focused_terminal {
-            if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
-                self.focused_terminal = None;
-            } else if let Some(live) = self.live_terminals.get_mut(&id) {
-                // A small, not remotely exhaustive key-to-bytes mapping — enough for
-                // ordinary shell use (typing, Enter, Backspace, arrows), not full
-                // terminal-input fidelity (no Ctrl-key combos, no function keys). Matches
-                // this module's own "basic subset" scope.
-                match &event.logical_key {
-                    Key::Named(NamedKey::Enter) => live.write_input(b"\r"),
-                    Key::Named(NamedKey::Backspace) => live.write_input(&[0x7f]),
-                    Key::Named(NamedKey::Tab) => live.write_input(b"\t"),
-                    Key::Named(NamedKey::ArrowUp) => live.write_input(b"\x1b[A"),
-                    Key::Named(NamedKey::ArrowDown) => live.write_input(b"\x1b[B"),
-                    Key::Named(NamedKey::ArrowRight) => live.write_input(b"\x1b[C"),
-                    Key::Named(NamedKey::ArrowLeft) => live.write_input(b"\x1b[D"),
-                    _ => {
-                        if let Some(text) = &event.text {
-                            let typed: String = text.chars().filter(|c| !c.is_control()).collect();
-                            if !typed.is_empty() {
-                                live.write_input(typed.as_bytes());
-                            }
-                        }
-                    }
-                }
-            }
-            window.request_redraw();
-            return;
-        }
 
         if self.text_input_active {
             match &event.logical_key {

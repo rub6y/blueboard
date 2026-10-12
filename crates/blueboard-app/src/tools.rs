@@ -438,9 +438,9 @@ impl Tool for SelectionTool {
                     .and_then(|id| ctx.scene.element(id))
                     .and_then(|element| match &element.kind {
                         ElementKind::Text { font_size, .. } => Some(*font_size),
-                        ElementKind::Stroke
-                        | ElementKind::Image(_)
-                        | ElementKind::MagicWindow { .. } => None,
+                        ElementKind::Stroke | ElementKind::Image(_) | ElementKind::MagicWindow => {
+                            None
+                        }
                     });
                 self.resize = Some(ResizeDrag {
                     handle,
@@ -526,7 +526,7 @@ impl Tool for SelectionTool {
                                 }),
                                 ElementKind::Stroke
                                 | ElementKind::Image(_)
-                                | ElementKind::MagicWindow { .. } => None,
+                                | ElementKind::MagicWindow => None,
                             })
                     }
                     _ => None,
@@ -675,15 +675,12 @@ impl Tool for TextTool {
 /// body-text size at 100% zoom.
 pub const DEFAULT_TEXT_FONT_SIZE: f64 = 24.0;
 
-/// Shell command a freshly drawn magic window spawns — see `ElementKind::MagicWindow`'s
-/// doc comment on why only this string, not a live process, lives in the scene.
-pub const DEFAULT_MAGIC_WINDOW_SHELL: &str = "bash";
-
 /// Drag-to-draw a magic-window rect, same gesture shape as `ShapeTool`'s rect — commits an
-/// `ElementKind::MagicWindow` placeholder on release; spawning the actual shell happens
-/// later, in `main.rs`'s `ensure_live_terminals` (same "commit the element, let a per-frame
-/// `ensure_*` step catch up the runtime-only state" split `ElementKind::Image` already
-/// uses for GPU textures).
+/// `ElementKind::MagicWindow` placeholder on release; starting the actual screen capture
+/// (popping the compositor's own source picker) happens later, in `main.rs`'s
+/// `ensure_live_screencasts` (same "commit the element, let a per-frame `ensure_*` step
+/// catch up the runtime-only state" split `ElementKind::Image` already uses for GPU
+/// textures).
 #[derive(Default)]
 pub struct MagicWindowTool {
     drag_start: Option<DVec2>,
@@ -718,13 +715,8 @@ impl Tool for MagicWindowTool {
         if size.x < 10.0 || size.y < 10.0 {
             return; // too small a drag to mean "place a window here"
         }
-        ctx.scene.add_magic_window_element(
-            top_left,
-            size.x,
-            size.y,
-            DEFAULT_MAGIC_WINDOW_SHELL.to_string(),
-            ctx.color,
-        );
+        ctx.scene
+            .add_magic_window_element(top_left, size.x, size.y, ctx.color);
     }
 
     fn preview(&self) -> ScenePreview<'_> {

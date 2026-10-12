@@ -2,6 +2,96 @@
 
 Running log of decisions and progress. Newest first.
 
+## 2026-10-12 — Magic window pivots to portal screen capture, shell/webview scratched
+Branch `feature/magic-window-screencast` (off `experiment/latex-text-rendering`, since
+`main` is 29 commits stale — all real work, this included, lives on the experiment branch).
+
+- **Scope change surfaced by ruba, not a planning mistake being corrected**: the original
+  plan (RESEARCH.md §5 / PLAN.md Phase 7+) called for embedding libraries — `portable-pty`
+  for a shell (already shipped, `413636b`), `wry` for a browser/PDF webview (planned next).
+  Researching the `wry` step surfaced a real blocker: its Linux child-webview embedding
+  (`build_as_child`) only works under X11, and this machine's desktop is Wayland-native.
+  Rather than force the whole app onto XWayland for one feature, ruba proposed scrapping
+  both embedding strategies in favor of `org.freedesktop.portal.ScreenCast` + PipeWire — the
+  same screen-share mechanism Discord/Zoom/OBS use, including the compositor's own native
+  source picker. Covers the brief's motivating PDF-reading use case and the shell case and
+  the "any arbitrary app" case (real VSCode included) with one mechanism, not three.
+- **`ElementKind::MagicWindow` went from `{ shell: String }` to a unit variant** — nothing
+  about *which* source is showing is persisted (a portal session + PipeWire stream are both
+  runtime-only handles; reopening a saved board re-prompts the picker same as a freshly
+  drawn one). Format version bumped 5->6, this format's existing "reject outright, no
+  migration" policy for any `ElementKind` shape change.
+- **Rendering needed zero new code in `blueboard-render`** — unlike the old shell's bespoke
+  `TerminalDraw` (dark rect + monochrome `egui` text rows, both deleted this commit), a
+  magic window now draws through the *exact same* per-element-texture quad path
+  `ElementKind::Image` already has: `blueboard-app`'s `screencast.rs` feeds decoded frames
+  into `Renderer::set_element_texture`, same call `gif.rs` already made, and the render-side
+  match arm is now `ElementKind::Image(_) | ElementKind::MagicWindow => { ...same quad... }`.
+  Strictly better fit than either scrapped strategy (both needed their own draw path).
+- **`screencast.rs`'s two-phase shape**: `ashpd` (async-only, needs a `tokio` runtime —
+  first one in this project) drives the one-shot portal handshake (create session -> select
+  sources -> `start()`, the call that blocks on the user's picker -> open PipeWire remote)
+  entirely on a background thread, *never* blocking `ensure_live_screencasts`/the render
+  loop — unlike the old shell's synchronous `LiveTerminal::spawn`, a capture's "ready" time
+  is however long the user takes at a system dialog, which must not stall rendering. Once
+  negotiated, the same thread drops into `pipewire`'s synchronous `MainLoop`/`Stream`,
+  converting whatever format got negotiated (RGBA/RGBx/BGRx/RGB only — no DMA-BUF, no YUV,
+  v1 scope) to tight RGBA8 and pushing frames over an `mpsc` channel, mirroring the PTY
+  reader thread shape `terminal.rs` used to have.
+- **Deliberately skipped DMA-BUF (zero-copy GPU import)** for v1 — the format pod offered
+  to PipeWire has no modifier, which keeps negotiation on the plain SHM/MemFd path (a CPU
+  copy per frame). Real perf option later, same "ship the simple thing, profile later" call
+  already made for Phase 6's tessellation caching.
+- **Build verified**: `cargo check`/`clippy --all-targets`/`fmt --check`/`test --workspace`
+  all clean on NixOS via `nix develop`. `libspa-sys`'s bindgen build needed `pkgs.
+  rustPlatform.bindgenHook` (plain `llvmPackages.libclang` alone hit "inttypes.h not found"
+  — libclang couldn't find glibc's own headers without the hook's `BINDGEN_EXTRA_CLANG_ARGS`
+  wiring).
+- **System gap, fixed in `configuration.nix`**: `xdg-desktop-portal-wlr`'s window/output
+  chooser only ever execs a binary literally named `wmenu` or `wofi` by default — `rofi`
+  being on its systemd service's `PATH` (already configured, for a different purpose) did
+  nothing, since it's never tried by that name. Added `pkgs.wofi` alongside it
+  (`modules/desktop.nix`), confirmed via `systemctl --user show -p Environment`.
+- **Three real bugs found and fixed via live testing**, each confirmed by reproducing
+  against `xdg-desktop-portal-wlr` run manually with `--loglevel=DEBUG` (its own trace
+  output, not guesswork) rather than assumed from source reading alone:
+  1. *Silent hang on a second capture.* `capture_thread` built a fresh `tokio::current_
+     thread` runtime per capture and dropped it when that capture ended. `ashpd` caches a
+     single process-wide D-Bus connection in its own `static OnceLock` (confirmed in its
+     source) — whose background I/O task ran on whatever runtime was active when first
+     created. Dropping that runtime killed the task; the *next* capture's `negotiate_
+     portal` reused the now-dead cached connection, and its `create_session()` call just
+     vanished — no response ever arrives, not an error. Fixed: one `multi_thread` runtime
+     (`shared_runtime`, a process-wide `OnceLock`), built once, never torn down.
+  2. *Zombie sessions accumulating server-side.* Closing our local PipeWire stream alone
+     never told the portal the session was done — `xdpw`'s own "active screencast
+     instances" counter only ever climbed (confirmed: 4 -> 5 -> 6 -> 7 -> 8 -> 9 across one
+     test run, never dropping even past clean element deletions) since nothing called the
+     portal's `Session::close()`. Enough zombies accumulated to degrade/break later
+     captures (`buffer constraint mismatch`, `Invalid session` errors, seen live). Fixed:
+     `negotiate_portal` now returns the `Session` alongside the node id/fd, and
+     `capture_thread` calls `session.close()` after the PipeWire side tears down —
+     confirmed via trace log (`dbus: session closed` / `destroying session`, one per
+     capture, count matching).
+  3. *Buffer pool starvation.* Continuous `out of buffers` / `unable to export buffer,
+     dropping frame` warnings from the very first capture, not just under concurrent load
+     — our stream never answered the exporter's separate `Buffers`-id `param_changed`
+     query (distinct from `Format`), so it fell back to some too-small default. Fixed:
+     `buffers_pod` answers that query via `stream.update_params`, requesting 2-8 buffers
+     (default 4) — `libspa` 0.8.0 has no typed `ParamBuffersProperties` enum (unlike
+     `FormatProperties`), so its key is the raw `SPA_PARAM_BUFFERS_buffers` `spa_sys`
+     constant used directly as `pod::Property`'s `u32` key. Confirmed working end-to-end
+     (ruba: "works like a charm") — minor follow-up noted below, not re-opened now.
+- **Known v1 gaps, not silently swept under** (see `Portal_capture.md`): no input
+  forwarding into the captured app ([[Remote_desktop_input]] researched, not built); no
+  re-pick command if a source is dismissed/cancelled; a magic window deleted while its
+  picker dialog is still open can leave that capture thread running until the dialog
+  resolves (the quit signal can't reach a thread still inside the async portal call);
+  calling `stream.update_params` from inside the `Buffers`-id `param_changed` branch
+  (bug 3 above) causes a brief pause/re-negotiate/streaming cycle rather than settling in
+  one pass — harmless (confirmed working end-to-end regardless) but worth a cleaner
+  one-shot answer later instead of reacting from inside the callback that triggered it.
+
 ## 2026-10-09 — Text tool: markdown bold + basic LaTeX math subset
 Third of the five post-Phase-5 features (see the entry below this one for the full list
 and plan).

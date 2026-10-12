@@ -29,7 +29,12 @@ use crate::scene::{ElementKind, Scene};
 /// variants the same way regardless of new ones added after them), but bumped anyway for
 /// consistency with this format's existing policy of treating every `ElementKind` change
 /// as a deliberate version checkpoint, not something to rely on happening to work.
-const FORMAT_VERSION: u32 = 5;
+///
+/// Bumped to 6 for `ElementKind::MagicWindow` losing its `shell: String` field (now a
+/// unit variant, see its own doc comment on the shell-vs-screencast pivot) — a v5 file's
+/// `MagicWindow` encodes a string nothing in v6 expects, rejected outright per this
+/// format's existing policy rather than special-cased away.
+const FORMAT_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize)]
 struct ElementDocument {
